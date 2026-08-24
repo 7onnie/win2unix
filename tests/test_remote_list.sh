@@ -17,7 +17,7 @@ echo x > "$_Src/datei.txt"
 echo y > "$_Src/ordner a/tief.txt"
 trap 'd_stop; rm -rf "$_Src"' EXIT
 if ! d_start "$_Src"; then
-    t_skip "rsync-Daemon konnte nicht binden (Port $D_Port evtl. von einem verwaisten Lauf belegt) - Test wird uebersprungen statt gegen den falschen Daemon zu laufen"
+    t_skip "rsync-Daemon konnte auf keinem der versuchten Ports binden - Test wird uebersprungen statt gegen den falschen Daemon zu laufen"
     t_summary
 fi
 

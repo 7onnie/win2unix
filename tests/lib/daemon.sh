@@ -2,7 +2,9 @@
 # Startet einen echten rsync-Daemon fuer Tests. Braucht ein rsync mit --daemon;
 # Apple-openrsync kann das NICHT, deshalb wird sauber geskippt statt zu scheitern.
 
-D_Port=8873
+D_Port=8873    # Fallback-Anzeige vor dem ersten d_start; d_start waehlt den
+               # tatsaechlich gebundenen Port neu (per $$ + Nachbarn-Fallback)
+               # und ueberschreibt diese Variable mit dem echten Wert.
 D_Url=""
 D_Dir=""
 D_Bin=""
@@ -32,14 +34,31 @@ d_available() {
 d_start() {
     D_Dir="$(mktemp -d)"
     local _Serve="$1"
-    cat > "$D_Dir/rsyncd.conf" <<EOF
+    local _Base _I _Cand
+    # Fester Port 8873 war die eigentliche Fehlerursache, nicht der
+    # sleep 1: bei schneller Wiederholung (mehrere Suite-Laeufe kurz
+    # hintereinander, oder mehrere Tasks/Testdateien, die diesen Harness
+    # nutzen) haelt TCP TIME_WAIT den zuletzt genutzten Port noch belegt,
+    # auch nachdem der Daemon-Prozess schon beendet ist - der naechste
+    # d_start auf demselben festen Port scheitert dann zuverlaessig am
+    # Bind. Deshalb: Startpunkt ueber $$ (PID dieses Testprozesses) auf
+    # einen Bereich verteilen, damit unabhaengige Laeufe selten denselben
+    # Port wollen, UND ein paar Nachbarports als Fallback durchprobieren,
+    # falls der gewaehlte trotzdem belegt ist (z.B. TIME_WAIT von einem
+    # ANDEREN Lauf, der zufaellig auf den gleichen Startpunkt kam).
+    _Base=$(( 8800 + ($$ % 150) ))
+    _I=0
+    while [ "$_I" -lt 10 ]; do
+        _Cand=$(( _Base + _I ))
+        rm -f "$D_Dir/rsyncd.pid"
+        cat > "$D_Dir/rsyncd.conf" <<EOF
 use chroot = false
 strict modes = false
 max connections = 32
 lock file = $D_Dir/rsyncd.lock
 pid file = $D_Dir/rsyncd.pid
 log file = $D_Dir/rsyncd.log
-port = $D_Port
+port = $_Cand
 address = 127.0.0.1
 
 [test]
@@ -47,19 +66,24 @@ address = 127.0.0.1
     read only = true
     list = yes
 EOF
-    "$D_Bin" --daemon --config="$D_Dir/rsyncd.conf"
-    sleep 1
-    # Ohne diese Pruefung wuerde ein verwaister Daemon aus einem
-    # abgestuerzten Lauf, der Port 8873 noch haelt, den neuen Start
-    # unbemerkt scheitern lassen (still kein Bind) - D_Url wuerde trotzdem
-    # gesetzt, und alle folgenden Tests liefen gegen den alten Daemon mit
-    # fremdem Datenbestand. Der Aufrufer muss bei rc 1 sauber skippen statt
-    # weiterzumachen.
-    if [ ! -f "$D_Dir/rsyncd.pid" ]; then
-        return 1
-    fi
-    D_Url="rsync://127.0.0.1:$D_Port/test"
-    return 0
+        "$D_Bin" --daemon --config="$D_Dir/rsyncd.conf"
+        sleep 1
+        # Bind-Check aus Ruling 2 bleibt unveraendert bestehen: ohne ihn
+        # wuerde ein verwaister Daemon aus einem abgestuerzten Lauf den
+        # neuen Start unbemerkt scheitern lassen (still kein Bind), D_Url
+        # waere trotzdem gesetzt, und alle folgenden Tests liefen gegen den
+        # alten Daemon mit fremdem Datenbestand. Hier entscheidet er
+        # zusaetzlich, ob der naechste Kandidatenport probiert wird.
+        if [ -f "$D_Dir/rsyncd.pid" ]; then
+            D_Port="$_Cand"
+            D_Url="rsync://127.0.0.1:$D_Port/test"
+            return 0
+        fi
+        _I=$((_I + 1))
+    done
+    # Alle Kandidaten belegt oder Bind sonst gescheitert - der Aufrufer muss
+    # sauber skippen statt weiterzumachen.
+    return 1
 }
 
 d_stop() {
