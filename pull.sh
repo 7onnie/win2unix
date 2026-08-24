@@ -106,19 +106,28 @@ w2u_find_rsync() {
 # unterscheiden. w2u_decompose (Task 4) wuerde "null Eintraege" sonst immer
 # als leeres Verzeichnis behandeln und den kompletten Unterbaum stillschweigend
 # aus der Arbeitsliste fallen lassen. Deshalb: rsync-Aufruf getrennt vom
-# Parsen ausfuehren (Ausgabe erst in eine Variable), rc separat prufen -
+# Parsen ausfuehren (Ausgabe erst in eine Variable), rc separat pruefen -
 # "cmd | parser" wuerde ohnehin nur den rc des Parsers liefern, weil pipefail
 # in gesourcten Test-Shells nicht aktiv ist.
+#
+# Fix (Review): "_Raw=$(...)" ist ein einfaches Kommando - unter set -e
+# (aktiv in main()) feuert errexit GENAU an dieser Zuweisung, wenn rsync
+# ungleich 0 endet, also bevor "_Rc=$?" gelesen und bevor w2u_die erreicht
+# wird. Da stderr in _Raw umgeleitet ist statt aufs Terminal, geht die
+# Diagnose mit der verworfenen Variable verloren, und der Aufrufer sieht nur
+# ein nacktes rsync-rc ohne Meldung - besonders in Nicht-Substitutions-Form
+# (Umleitung in eine Datei, Pipe), wie w2u_decompose (Task 4) sie
+# voraussichtlich nutzt. "|| _Rc=$?" ist die dokumentierte errexit-Ausnahme
+# und haelt den Aufruf am Leben, bis die rc-Pruefung unten laeuft.
 w2u_remote_list() {
-    local _Base="$1" _Rel="$2" _Url _Raw _Rc
+    local _Base="$1" _Rel="$2" _Url _Raw _Rc=0
     _Base="${_Base%/}"
     if [ -n "$_Rel" ]; then
         _Url="$_Base/$_Rel/"
     else
         _Url="$_Base/"
     fi
-    _Raw="$("$_RsyncBin" --list-only -d "$_Url" 2>&1)"
-    _Rc=$?
+    _Raw="$("$_RsyncBin" --list-only -d "$_Url" 2>&1)" || _Rc=$?
     if [ "$_Rc" -ne 0 ]; then
         w2u_die "rsync-Listing fehlgeschlagen fuer $_Url (rc $_Rc): $_Raw"
     fi
