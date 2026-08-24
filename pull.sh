@@ -58,6 +58,26 @@ Optionen:
 EOF
 }
 
+# Liest ein rsync-Listing von stdin, schreibt "TYP<TAB>NAME".
+# Format ist immer: perms size YYYY/MM/DD HH:MM:SS name
+# --out-format wird von openrsync im Listing-Modus ignoriert (Spec 2.2), deshalb
+# wird geparst statt formatiert. Der Name ist ALLES nach dem Zeitstempel, sonst
+# gehen Leerzeichen verloren. Keine Intervall-Quantoren: BSD-awk kann sie nicht.
+w2u_parse_listing() {
+    awk '
+    {
+        sub(/\r$/, "")
+        if (match($0, / [0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] /) == 0) next
+        _Name = substr($0, RSTART + RLENGTH)
+        if (_Name == "." || _Name == "") next
+        if (substr($0, 1, 1) == "d") {
+            printf "d\t%s\n", _Name
+        } else {
+            printf "f\t%s\n", _Name
+        }
+    }'
+}
+
 main() {
     set -euo pipefail
     if [ "$#" -eq 0 ]; then
