@@ -134,6 +134,104 @@ w2u_remote_list() {
     printf '%s\n' "$_Raw" | w2u_parse_listing
 }
 
+# Zerlegt den Quellbaum in Arbeitspakete (Spec 5.3).
+#
+# Aufruf: w2u_decompose <basis-url> <schwelle> <ausgabedatei>
+# Ergebnis: je Arbeitspaket eine Zeile (relativer Pfad, kein fuehrender Slash).
+#
+# Invariante: arbeit + queue ueberdecken zu jedem Zeitpunkt exakt den Baum.
+# Wird ein Ordner expandiert, ersetzt ihn die VOLLSTAENDIGE Liste seiner Kinder -
+# Dateien UND Ordner. Ein LEERER Ordner hat keine Kinder und muss deshalb selbst
+# Arbeitspaket bleiben, sonst verschwindet er (im Test nachgewiesen).
+#
+# Ein expandierter Ordner ist selbst KEIN Arbeitspaket mehr - rsync legt ihn beim
+# Uebertragen seiner Kinder implizit mit korrekter mtime an (Spec 2.6).
+#
+# CONTROLLER-RULING 2: das Listing wird ueber eine TEMP-DATEI gelesen, nicht ueber
+# eine Prozess-Substitution. In "done < <(w2u_remote_list ...)" liefe
+# w2u_remote_list in einem Kindprozess - dessen w2u_die beendete nur das Kind, die
+# Schleife hier laese null Zeilen, hielte das Verzeichnis fuer LEER, machte daraus
+# ein Arbeitspaket und liesse den gesamten Unterbaum still aus der Arbeitsliste
+# fallen. Genau der Fehler, gegen den Task 3 gehaertet wurde. Eine Umleitung
+# erzeugt keine Subshell, das exit aus w2u_die beendet damit den ganzen Lauf.
+w2u_decompose() {
+    local _Base="$1" _Threshold="$2" _OutFile="$3"
+    [ -n "$_TmpDir" ] || w2u_die "w2u_decompose ohne gesetztes _TmpDir aufgerufen"
+    # Bei Schwelle < 2 braeche die Schleife vor der ersten Expansion ab. Die Wurzel
+    # selbst ist als leere Zeile kein darstellbares Arbeitspaket und wuerde
+    # weggefiltert - das Ergebnis waere eine LEERE Arbeitsliste, also Totalverlust.
+    # Aus der Konfiguration (_ThresholdFactor * _PMax) nicht erreichbar, aber ein
+    # stiller Totalverlust darf hier unter keinen Umstaenden moeglich sein.
+    [ "$_Threshold" -ge 2 ] || w2u_die "Schwelle $_Threshold zu klein - die Wurzel wuerde nie expandiert"
+
+    local _Cur="$_TmpDir/lvl.cur" _Next="$_TmpDir/lvl.next" _ListFile="$_TmpDir/lvl.listing"
+    local _Tab
+    _Tab="$(printf '\t')"
+    : > "$_OutFile"
+    printf '\n' > "$_Cur"          # eine leere Zeile = die Wurzel selbst
+    local _CurCnt=1
+
+    while : ; do
+        local _WorkCnt
+        _WorkCnt="$(grep -c . "$_OutFile" 2>/dev/null || true)"
+        [ -n "$_WorkCnt" ] || _WorkCnt=0
+        if [ $((_WorkCnt + _CurCnt)) -ge "$_Threshold" ]; then
+            break
+        fi
+
+        : > "$_Next"
+        local _AnyDir=0 _Rel _Type _Name _Path _EntryCnt
+        while IFS= read -r _Rel; do
+            # "< /dev/null": stdin dieser Schleife ist $_Cur. Ohne die Umleitung
+            # erbte rsync diesen Deskriptor und koennte Verzeichniszeilen
+            # wegfressen - dieselbe Klasse Fehler, vor der der Skriptkopf warnt.
+            w2u_remote_list "$_Base" "$_Rel" > "$_ListFile" < /dev/null
+            _EntryCnt=0
+            while IFS="$_Tab" read -r _Type _Name; do
+                [ -n "$_Name" ] || continue
+                _EntryCnt=$((_EntryCnt + 1))
+                if [ -n "$_Rel" ]; then
+                    _Path="$_Rel/$_Name"
+                else
+                    _Path="$_Name"
+                fi
+                if [ "$_Type" = "d" ]; then
+                    printf '%s\n' "$_Path" >> "$_Next"
+                    _AnyDir=1
+                else
+                    printf '%s\n' "$_Path" >> "$_OutFile"
+                fi
+            done < "$_ListFile"
+
+            # Leerer Ordner: haette keine Kinder, muss selbst Arbeitspaket bleiben.
+            if [ "$_EntryCnt" -eq 0 ] && [ -n "$_Rel" ]; then
+                printf '%s\n' "$_Rel" >> "$_OutFile"
+            fi
+        done < "$_Cur"
+
+        if [ "$_AnyDir" -eq 0 ]; then
+            _CurCnt=0
+            : > "$_Cur"
+            break
+        fi
+
+        local _NextCnt
+        _NextCnt="$(grep -c . "$_Next" || true)"
+        mv "$_Next" "$_Cur"
+        _CurCnt="$_NextCnt"
+        if [ "$_NextCnt" -gt "$_MaxItems" ]; then
+            w2u_warn "Ebene mit $_NextCnt Eintraegen ueberschreitet _MaxItems=$_MaxItems - keine weitere Expansion"
+            break
+        fi
+    done
+
+    # Restliche, nicht expandierte Ordner sind Arbeitspakete.
+    grep -v '^$' "$_Cur" >> "$_OutFile" 2>/dev/null || true
+    # Duplikate koennen nicht auftreten, aber leere Zeilen schon.
+    grep -v '^$' "$_OutFile" > "$_OutFile.clean" || true
+    mv "$_OutFile.clean" "$_OutFile"
+}
+
 main() {
     set -euo pipefail
     if [ "$#" -eq 0 ]; then
