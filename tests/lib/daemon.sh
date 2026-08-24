@@ -66,7 +66,18 @@ address = 127.0.0.1
     read only = true
     list = yes
 EOF
-        "$D_Bin" --daemon --config="$D_Dir/rsyncd.conf"
+        # "< /dev/null" ist PFLICHT, nicht Kosmetik (Fund in Task 4, zweimal
+        # reproduziert): rsync --daemon prueft per getpeername(stdin), ob es aus
+        # inetd gestartet wurde. Ist stdin ein SOCKET, geht es NICHT in den
+        # Standalone-Modus, sondern bedient stdin als waere es eine eingehende
+        # Verbindung - es daemonisiert nie, schreibt nie rsyncd.pid, und d_start
+        # laeuft durch alle zehn Kandidatenports und HAENGT dann. Im Log steht
+        # dann "malformed address" plus "connect from UNKNOWN ()". Betroffen ist
+        # jede Aufrufumgebung mit Socket-stdin (Agenten-/CI-Runner, die die Suite
+        # nicht von einem Terminal starten). Ein haengender Harness ist teurer
+        # als ein fehlschlagender: er blockiert und liefert nicht mal ein
+        # Fehlerbild. Nicht entfernen.
+        "$D_Bin" --daemon --config="$D_Dir/rsyncd.conf" < /dev/null
         sleep 1
         # Bind-Check aus Ruling 2 bleibt unveraendert bestehen: ohne ihn
         # wuerde ein verwaister Daemon aus einem abgestuerzten Lauf den
