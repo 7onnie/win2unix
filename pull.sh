@@ -209,8 +209,14 @@ w2u_decompose() {
             fi
         done < "$_Cur"
 
+        # Keine Unterordner mehr auf dieser Ebene: alle Eintraege aus $_Cur sind
+        # oben vollstaendig expandiert worden. Die Trunkierung ist PFLICHT, nicht
+        # Aufraeumen - ohne sie stuenden die gerade expandierten Verzeichnisse
+        # beim Schluss-Flush ZUSAETZLICH zu ihren eigenen Dateien in der
+        # Arbeitsliste, und jede dieser Dateien wuerde doppelt uebertragen.
+        # Gepinnt durch Fall E samt exaktem Count-Assert (der Mengenvergleich
+        # allein wuerde die Ueberdeckung wegnormalisieren).
         if [ "$_AnyDir" -eq 0 ]; then
-            _CurCnt=0
             : > "$_Cur"
             break
         fi
@@ -220,16 +226,42 @@ w2u_decompose() {
         mv "$_Next" "$_Cur"
         _CurCnt="$_NextCnt"
         if [ "$_NextCnt" -gt "$_MaxItems" ]; then
-            w2u_warn "Ebene mit $_NextCnt Eintraegen ueberschreitet _MaxItems=$_MaxItems - keine weitere Expansion"
+            # Achtung fuer spaetere Tasks: _MaxItems bremst nur die WEITERE
+            # Expansion, es begrenzt NICHT das Ergebnis. Diese Ebene wandert
+            # gleich vollstaendig in die Arbeitsliste - die Vollstaendigkeit
+            # verlangt es. Die Arbeitsliste kann also mehr als _MaxItems
+            # Eintraege haben; wer damit rechnet, rechnet falsch.
+            w2u_warn "Ebene mit $_NextCnt Eintraegen ueberschreitet _MaxItems=$_MaxItems - keine weitere Expansion, diese Ebene wird aber VOLLSTAENDIG als Arbeitspakete uebernommen"
             break
         fi
     done
 
-    # Restliche, nicht expandierte Ordner sind Arbeitspakete.
-    grep -v '^$' "$_Cur" >> "$_OutFile" 2>/dev/null || true
-    # Duplikate koennen nicht auftreten, aber leere Zeilen schon.
-    grep -v '^$' "$_OutFile" > "$_OutFile.clean" || true
-    mv "$_OutFile.clean" "$_OutFile"
+    # Restliche, nicht expandierte Ordner sind Arbeitspakete. Das ist die Zeile,
+    # die den gesamten Rest des Baums in die Arbeitsliste bringt - ein
+    # verschluckter Fehler hier ergaebe eine Arbeitsliste ohne jedes verbliebene
+    # Verzeichnis, und zwar mit rc 0.
+    #
+    # Deshalb wird grep-rc 1 ("keine Treffer", hier legitim: $_Cur kann leer sein
+    # oder nur den Wurzel-Marker enthalten) NICHT mit rc >1 ("Fehler")
+    # verschmolzen, und stderr wird nicht nach /dev/null geworfen. Genau diese
+    # Verschmelzung ist der Fehler, gegen den Task 3 gehaertet wurde.
+    # w2u_die statt nur errexit, weil errexit in gesourcten Test-Shells nicht
+    # aktiv ist - ohne den expliziten Abbruch fiele der Fehler dort durch.
+    #
+    # Reichweite, an /usr/bin/grep (BSD) nachgemessen: fehlende Datei, unlesbare
+    # Datei und Verzeichnis liefern rc 2 und werden gefangen; "kein Treffer"
+    # liefert rc 1 und wird durchgelassen. NICHT unterscheidbar ist ein
+    # Fehlschlag der Umleitung selbst - die Shell meldet dafuer ebenfalls rc 1.
+    # Diesen Fall deckt "> $_OutFile" ganz oben ab: schlaegt es fehl, endet der
+    # Lauf unter dem set -e aus main() bereits dort, lange vor dieser Zeile.
+    grep -v '^$' "$_Cur" >> "$_OutFile" || [ $? -eq 1 ] || w2u_die "Schluss-Flush der Restqueue fehlgeschlagen - Arbeitsliste waere unvollstaendig"
+
+    # Kein nachtraeglicher "Clean"-Schritt: leere Zeilen koennen in $_OutFile gar
+    # nicht entstehen (jedes printf steht hinter -n-Pruefung auf _Name bzw. _Rel,
+    # und der Flush oben filtert '^$' bereits weg), Duplikate ebenso wenig (ein
+    # expandiertes Verzeichnis wird per mv/Trunkierung aus $_Cur entfernt).
+    # Ein No-Op, der das fertige Ergebnis per mv ueberschreibt und dabei hinter
+    # "|| true" Fehler verschluckt, waere reines Risiko ohne Funktionsgewinn.
 }
 
 main() {

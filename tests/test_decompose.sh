@@ -38,6 +38,40 @@ while [ "$_I" -le 40 ]; do
     _I=$((_I + 1))
 done
 echo direkt > "$_Src/fallB/Bildarchiv/direkt_datei.txt"
+# Ein Patientenordner bekommt Leerzeichen UND Umlaut im Namen. Er liegt auf
+# Ebene 2, laeuft also durch "_Path=$_Rel/$_Name", durch $_Next -> $_Cur, durch
+# den Schluss-Flush und durch den Roundtrip ueber die Arbeitsliste. Bewusst
+# anzahl-neutral (Umbenennung statt Zusatzeintrag), damit der vom Brief
+# vorgegebene Count-Assert von 41 unveraendert gilt.
+mv "$_Src/fallB/Bildarchiv/patient7" "$_Src/fallB/Bildarchiv/patient 7 Müller"
+echo befund > "$_Src/fallB/Bildarchiv/patient 7 Müller/Befund Ä.txt"
+
+# Fall E: eine Ebene OHNE Unterordner - trifft den _AnyDir=0-Zweig.
+# Ohne dieses Fixture wird der Zweig von keinem Test erreicht (Fall A bricht in
+# Iteration 2 auf der Schwelle ab, Fall B in 3, Fall D in 4, Fall C stirbt,
+# Schwelle-1 stirbt vor der Schleife). Fehlerbild ohne die Trunkierung dort:
+# "x" bliebe in $_Cur und wuerde ZUSAETZLICH zu seinen eigenen Dateien
+# Arbeitspaket - Doppeluebertragung, vom Mengenvergleich nicht erkennbar.
+mkdir -p "$_Src/fallE/x"
+echo e1 > "$_Src/fallE/x/datei1.txt"
+echo e2 > "$_Src/fallE/x/datei2.txt"
+echo e3 > "$_Src/fallE/x/datei3.txt"
+echo wurzel > "$_Src/fallE/wurzel.txt"
+
+# Fall F: pathologische Dateinamen (Brief-Anforderung).
+# Traegt zwei verschiedene Dinge:
+#  - Leerzeichen und Umlaute in Datei- UND Ordnernamen
+#  - fuehrendes bzw. nachgestelltes Leerzeichen: NUR daran unterscheidet sich
+#    IFS="$_Tab" vom Standard-IFS. Bei zwei Variablen wuerde "read -r _Type
+#    _Name" den Rest auch unter Standard-IFS komplett zuweisen, INTERNE
+#    Leerzeichen pinnen die IFS-Wahl also gerade nicht.
+mkdir -p "$_Src/fallF/Ebene 1 Ordner/Ünter Ordner Ä"
+echo tief > "$_Src/fallF/Ebene 1 Ordner/Ünter Ordner Ä/tief ö.txt"
+echo f1 > "$_Src/fallF/ fuehrend.txt"
+# Echtes NACHGESTELLTES Leerzeichen (am Zeilenende), nicht bloss ein internes:
+# ein interner Leerraum ueberlebt auch unter Standard-IFS und unterscheidet die
+# IFS-Wahl deshalb gar nicht. Nur fuehrender bzw. nachgestellter Leerraum tut es.
+echo f2 > "$_Src/fallF/nachgestellt.txt "
 
 # Fall D: ein LEERER Ordner, der tatsaechlich EXPANDIERT wird.
 # Notwendig, weil "leer_ordner" aus Fall A auf Ebene 1 liegt und dort nur
@@ -91,6 +125,15 @@ t_assert_contains "$(cat "$_TmpDir/workB")" "Bildarchiv/patient1" "Fall B: Ebene
 # Derselbe Beweis wird fuer BEIDE gemessenen Baumformen gefuehrt: Fall A ist die
 # Form, die den LEEREN Ordner enthaelt - genau den Fehlerfall, gegen den dieser
 # Task existiert. Ihn nur per t_assert_contains zu pruefen waere zu schwach.
+#
+# ★ GRENZE DIESES BEWEISES - die Count-Asserts sind KEINE Redundanz.
+# Der Mengenvergleich erkennt nur UNTERdeckung. "sort -u" normalisiert
+# UEBERdeckung weg: ein doppeltes Arbeitspaket, oder eines fuer ein Verzeichnis,
+# das ein Vorfahr ohnehin schon abdeckt, liefert exakt dieselbe Menge und laesst
+# den Assert gruen - waehrend rsync die betroffenen Dateien doppelt uebertraegt.
+# Duplikatfreiheit haengt deshalb allein an _CntA/_CntB/_CntD/_CntE/_CntF.
+# Diese Count-Asserts NICHT als "sagt der Union-Beweis doch auch" streichen, und
+# jedes neue Fixture bekommt seinen eigenen exakten Count-Assert.
 t_union_proof() {
     local _TreeRoot="$1" _WorkFile="$2"
     local _P _Parent
@@ -122,6 +165,43 @@ t_assert_contains "$(cat "$_TmpDir/workD")" "a/leer" "Fall D: expandierter leere
 _Expected="$(cd "$_Src/fallD" && find . -mindepth 1 | sed 's|^\./||' | sort)"
 _Actual="$(t_union_proof "$_Src/fallD" "$_TmpDir/workD")"
 t_assert_eq "$_Expected" "$_Actual" "Fall D: Arbeitspakete plus implizite Eltern ueberdecken den Baum exakt (expandierter Leerordner)"
+
+# --- Fall E: Ebene ohne Unterordner (_AnyDir=0-Zweig) ---
+# Der Count-Assert ist hier der eigentliche Test: faellt die Trunkierung von
+# $_Cur weg, steht "x" zusaetzlich zu seinen drei Dateien in der Liste (5 statt
+# 4) und alle drei Dateien werden doppelt uebertragen. Der Mengenvergleich
+# darunter bleibt dabei GRUEN - "x" deckt genau seine eigenen Dateien ab, und
+# "sort -u" macht aus der Ueberdeckung wieder dieselbe Menge.
+w2u_decompose "$D_Url/fallE" 32 "$_TmpDir/workE"
+_CntE="$(grep -c . "$_TmpDir/workE")"
+t_assert_eq "4" "$_CntE" "Fall E: genau 4 Arbeitspakete - der expandierte Ordner x ist KEINES davon"
+t_assert_eq "0" "$(grep -c '^x$' "$_TmpDir/workE" || true)" "Fall E: kein Arbeitspaket fuer den expandierten Ordner x (sonst Doppeluebertragung)"
+t_assert_contains "$(cat "$_TmpDir/workE")" "x/datei3.txt" "Fall E: die Dateien der letzten Ebene sind Arbeitspakete"
+_Expected="$(cd "$_Src/fallE" && find . -mindepth 1 | sed 's|^\./||' | sort)"
+_Actual="$(t_union_proof "$_Src/fallE" "$_TmpDir/workE")"
+t_assert_eq "$_Expected" "$_Actual" "Fall E: Arbeitspakete plus implizite Eltern ueberdecken den Baum exakt"
+
+# --- Fall F: Leerzeichen, Umlaute, fuehrende/nachgestellte Leerzeichen ---
+# Schwelle 3 statt 32, damit "Ebene 1 Ordner" unexpandiert ueber den
+# Schluss-Flush in die Arbeitsliste geht - so laeuft ein Name mit Leerzeichen
+# durch BEIDE Wege: Datei -> _OutFile und Ordner -> _Next -> _Cur -> Flush.
+w2u_decompose "$D_Url/fallF" 3 "$_TmpDir/workF"
+_CntF="$(grep -c . "$_TmpDir/workF")"
+t_assert_eq "3" "$_CntF" "Fall F: genau 3 Arbeitspakete"
+t_assert_contains "$(cat "$_TmpDir/workF")" " fuehrend.txt" "Fall F: fuehrendes Leerzeichen ueberlebt (nur IFS=TAB leistet das)"
+t_assert_contains "$(cat "$_TmpDir/workF")" "nachgestellt.txt " "Fall F: nachgestelltes Leerzeichen ueberlebt (nur IFS=TAB leistet das)"
+t_assert_contains "$(cat "$_TmpDir/workF")" "Ebene 1 Ordner" "Fall F: Ordnername mit Leerzeichen ueberlebt den Flush"
+# Zeilengenau statt per contains: beweist, dass der Name NICHT nachgespalten
+# und NICHT getrimmt wurde - " fuehrend.txt" waere sonst "fuehrend.txt".
+t_assert_eq "1" "$(grep -c '^ fuehrend\.txt$' "$_TmpDir/workF" || true)" "Fall F: der Name steht exakt so in der Zeile, ungetrimmt"
+t_assert_eq "1" "$(grep -c '^nachgestellt\.txt $' "$_TmpDir/workF" || true)" "Fall F: nachgestelltes Leerzeichen wurde nicht abgeschnitten"
+_Expected="$(cd "$_Src/fallF" && find . -mindepth 1 | sed 's|^\./||' | sort)"
+_Actual="$(t_union_proof "$_Src/fallF" "$_TmpDir/workF")"
+t_assert_eq "$_Expected" "$_Actual" "Fall F: Arbeitspakete plus implizite Eltern ueberdecken den Baum exakt (Umlaute, Leerzeichen)"
+
+# Fall B traegt zusaetzlich den Ebene-2-Ordner mit Leerzeichen und Umlaut -
+# dort laeuft der Name durch "_Path=$_Rel/$_Name".
+t_assert_contains "$(cat "$_TmpDir/workB")" "Bildarchiv/patient 7 Müller" "Fall B: Leerzeichen und Umlaut ueberleben die Pfad-Verkettung _Rel/_Name"
 
 # --- Fall C: unlesbares Verzeichnis MUSS hart fehlschlagen (CONTROLLER-RULING 2) ---
 #
@@ -156,12 +236,18 @@ else
     _ProbeErr="$(mktemp)"
     _ProbeScript="$(mktemp)"
     _ProbeWork="$_TmpDir/workC_probe"
+    # Das Arbeitsverzeichnis des Probe-Skripts wird HIER angelegt, nicht per
+    # "mktemp -d" im Skript selbst: das Skript stirbt planmaessig per w2u_die und
+    # kaeme nie zum Aufraeumen - jeder Testlauf liesse ein Temp-Verzeichnis
+    # zurueck. Unter $_TmpDir raeumt der EXIT-trap es mit ab.
+    _ProbeTmp="$_TmpDir/probe_tmp"
+    mkdir -p "$_ProbeTmp"
     cat > "$_ProbeScript" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 W2U_LIB_ONLY=1
 . "$_Root/pull.sh"
-_TmpDir="\$(mktemp -d)"
+_TmpDir="$_ProbeTmp"
 w2u_find_rsync
 w2u_decompose "$D_Url/fallC" 32 "$_ProbeWork"
 EOF
@@ -185,8 +271,33 @@ fi
 # Ergebnis waere eine leere Arbeitsliste, also Totalverlust. Aus der Konfiguration
 # (4 * _PMax, _PMax >= 1) ist das nicht erreichbar, muss aber laut fehlschlagen.
 _Rc=0
-_Err="$(w2u_decompose "$D_Url/fallA" 1 "$_TmpDir/workE" 2>&1)" || _Rc=$?
+_Err="$(w2u_decompose "$D_Url/fallA" 1 "$_TmpDir/workSchwelle" 2>&1)" || _Rc=$?
 t_assert_eq "1" "$_Rc" "Schwelle 1 schlaegt laut fehl statt still eine leere Arbeitsliste zu liefern"
 t_assert_contains "$_Err" "Schwelle" "Schwelle-Fehler nennt die Ursache"
+
+# --- Schluss-Flush darf nicht still fehlschlagen ---
+# Der Flush ist die Zeile, die JEDES verbliebene Verzeichnis zum Arbeitspaket
+# macht. Schluckt sie ihren Fehler, entsteht eine Arbeitsliste ohne diese
+# Verzeichnisse - mit rc 0, also unbemerkt. Genau deshalb wird grep-rc 1
+# ("keine Treffer", legitim) nicht mit rc 2 ("Fehler") verschmolzen.
+#
+# WEISSKASTEN-TEST, bewusst: er legt $_TmpDir/lvl.cur unlesbar an und koppelt
+# damit an einen internen Dateinamen. Anders ist ein Flush-Fehler nicht
+# herbeizufuehren. Wer lvl.cur umbenennt, muss diesen Test mitziehen.
+# rc-Verhalten nachgemessen und bei BSD-grep UND ugrep identisch:
+# unlesbare Datei -> rc 2, kein Treffer -> rc 1.
+# Als root wirkungslos (Rechte werden ignoriert), deshalb dort skippen.
+if [ "$(id -u)" -eq 0 ]; then
+    t_skip "laeuft als root - unlesbare lvl.cur ist wirkungslos"
+else
+    rm -f "$_TmpDir/lvl.cur"
+    printf 'irgendwas\n' > "$_TmpDir/lvl.cur"
+    chmod 000 "$_TmpDir/lvl.cur"
+    _Rc=0
+    _Err="$(w2u_decompose "$D_Url/fallE" 32 "$_TmpDir/workFlush" 2>&1)" || _Rc=$?
+    t_assert_eq "1" "$_Rc" "fehlgeschlagener Schluss-Flush bricht laut ab statt eine unvollstaendige Liste zu liefern"
+    t_assert_contains "$_Err" "ABBRUCH" "Flush-Fehler wird als ABBRUCH gemeldet"
+    chmod 644 "$_TmpDir/lvl.cur"
+fi
 
 t_summary
