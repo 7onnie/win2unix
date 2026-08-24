@@ -3,6 +3,7 @@
 
 _TestsRun=0
 _TestsFailed=0
+_TestsSkipped=0
 
 t_assert_eq() {
     local _Expected="$1" _Actual="$2" _Label="$3"
@@ -39,11 +40,12 @@ t_assert_rc() {
 }
 
 t_skip() {
+    _TestsSkipped=$((_TestsSkipped + 1))
     printf '  SKIP %s\n' "$1"
 }
 
 t_summary() {
-    printf '\n%s: %d Tests, %d Fehler\n' "${0##*/}" "$_TestsRun" "$_TestsFailed"
+    printf '\n%s: %d Tests, %d Fehler, %d uebersprungen\n' "${0##*/}" "$_TestsRun" "$_TestsFailed" "$_TestsSkipped"
     [ "$_TestsFailed" -eq 0 ] || exit 1
     exit 0
 }

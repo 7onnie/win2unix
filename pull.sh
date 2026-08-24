@@ -9,8 +9,6 @@
 # NICHT "curl | bash" verwenden: dabei ist stdin der Skript-Stream, und die
 # Datei-Listen wuerden den restlichen Skriptcode lesen.
 
-set -euo pipefail
-
 W2U_VERSION="0.1.0"
 
 # ---------- Konfiguration (Zero-Touch: alles hier, keine Rueckfragen) ----------
@@ -61,6 +59,7 @@ EOF
 }
 
 main() {
+    set -euo pipefail
     if [ "$#" -eq 0 ]; then
         w2u_usage
         exit 2
