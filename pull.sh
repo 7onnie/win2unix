@@ -78,6 +78,53 @@ w2u_parse_listing() {
     }'
 }
 
+# Sucht ein brauchbares rsync. Auf den Ziel-Macs ist das Apple-openrsync
+# (Protokoll 29) - das reicht als CLIENT vollstaendig aus (Spec 2.2).
+w2u_find_rsync() {
+    if [ -n "$_RsyncBin" ]; then
+        [ -x "$_RsyncBin" ] || w2u_die "kein ausfuehrbares rsync unter $_RsyncBin"
+        return 0
+    fi
+    local _C
+    for _C in /opt/homebrew/bin/rsync /usr/local/bin/rsync; do
+        if [ -x "$_C" ]; then
+            _RsyncBin="$_C"
+            return 0
+        fi
+    done
+    _RsyncBin="$(command -v rsync 2>/dev/null || true)"
+    [ -n "$_RsyncBin" ] || w2u_die "kein rsync gefunden"
+    return 0
+}
+
+# Listet GENAU EINE Ebene unterhalb von <basis>/<rel>.
+#
+# CONTROLLER-RULING: der rsync-Exit-Code darf nicht verworfen werden. Ein
+# nicht lesbares Verzeichnis (rc 23, Permission denied) und ein wirklich
+# leeres Verzeichnis (rc 0, Ausgabe nur der "."-Eintrag) erzeugen beide null
+# geparste Zeilen - ueber die Zeilenzahl allein sind sie nicht zu
+# unterscheiden. w2u_decompose (Task 4) wuerde "null Eintraege" sonst immer
+# als leeres Verzeichnis behandeln und den kompletten Unterbaum stillschweigend
+# aus der Arbeitsliste fallen lassen. Deshalb: rsync-Aufruf getrennt vom
+# Parsen ausfuehren (Ausgabe erst in eine Variable), rc separat prufen -
+# "cmd | parser" wuerde ohnehin nur den rc des Parsers liefern, weil pipefail
+# in gesourcten Test-Shells nicht aktiv ist.
+w2u_remote_list() {
+    local _Base="$1" _Rel="$2" _Url _Raw _Rc
+    _Base="${_Base%/}"
+    if [ -n "$_Rel" ]; then
+        _Url="$_Base/$_Rel/"
+    else
+        _Url="$_Base/"
+    fi
+    _Raw="$("$_RsyncBin" --list-only -d "$_Url" 2>&1)"
+    _Rc=$?
+    if [ "$_Rc" -ne 0 ]; then
+        w2u_die "rsync-Listing fehlgeschlagen fuer $_Url (rc $_Rc): $_Raw"
+    fi
+    printf '%s\n' "$_Raw" | w2u_parse_listing
+}
+
 main() {
     set -euo pipefail
     if [ "$#" -eq 0 ]; then
