@@ -299,6 +299,63 @@ w2u_chunk() {
     w2u_log "$_Total Arbeitspakete, $_Size je Chunk, $(grep -c . "$_ListOut") Chunks"
 }
 
+# Uebertraegt einen Chunk (Spec 5.5), mit Retry bis Exit 0 oder _MaxRetry.
+#  -W  : Erstkopie, jede Datei ist neu - Delta-Algorithmus kostet nur CPU
+#  -l  : Symlinks als Symlinks. NIEMALS -L, das folgt NTFS-Junctions in Schleifen
+#  kein -a: -a zieht -pog mit, und Cygwin-Rechte sind synthetisch
+#  kein -z: im LAN ist die CPU das Limit, nicht die Leitung
+#
+# CONTROLLER-RULING 1: kein "set +e" / "set -e" um den rsync-Aufruf. Ein
+# abschliessendes "set -e" schaltete errexit auch in einer Shell ein, die
+# pull.sh nur gesourct hat (W2U_LIB_ONLY=1) - unabhaengig vom vorherigen
+# Zustand. Genau diese Leck-Klasse wurde in Task 1 gefunden und ist der
+# Grund, warum "set -euo pipefail" heute die erste Anweisung in main() ist,
+# nicht im Dateikopf. Eine Funktion darf die Shell-Optionen ihres Aufrufers
+# nicht veraendern. Stattdessen dasselbe Muster wie in w2u_remote_list
+# (Task 3): "cmd || _Rc=$?" haelt den Aufruf unter set -e am Leben, ohne
+# irgendeine Shell-Option anzufassen. _Rc wird VOR jedem Versuch neu auf 0
+# gesetzt - sonst ueberlebte der rc eines fehlgeschlagenen Versuchs in die
+# Log-Zeile eines spaeter doch noch erfolgreichen Versuchs, weil
+# "cmd || _Rc=$?" bei Erfolg _Rc unangetastet laesst.
+#
+# CONTROLLER-RULING 2: ein rsync-Aufruf, nicht zwei fast identische in
+# if/else - genau die Art verbatim duplizierter Logik, die stillschweigend
+# auseinanderlaeuft, sobald spaeter nur ein Zweig eine Option dazubekommt.
+# Die Argumentliste wird einmal als Array aufgebaut (bash 3.2 kann Arrays)
+# und einmal aufgerufen. Das Array ist hier nie leer (mindestens die festen
+# Basis-Optionen stehen immer drin), die "${_Args[@]}"-bei-leerem-Array-Falle
+# unter set -u betrifft diese Funktion also nicht.
+#
+# Gibt IMMER 0 zurueck: ein einzelner fehlgeschlagener Chunk darf einen Lauf
+# von mehreren hundert GB nicht abbrechen. Der Fehler ist ausschliesslich ueber
+# die Ergebniszeile in $_ResultFile sichtbar (Name<TAB>rc<TAB>Versuche) - das
+# macht diese Zeile zum einzigen Sicherheitsnetz. rc 23/24 ("manche Dateien
+# konnten nicht uebertragen werden") sind auf der Windows-Seite die Signatur
+# gesperrter/unlesbarer Dateien und werden hier unveraendert durchgereicht,
+# nie verschluckt.
+w2u_run_chunk() {
+    local _ChunkFile="$1"
+    local _Name _Try=1 _Rc=0
+    _Name="$(basename "$_ChunkFile")"
+
+    local _Args
+    _Args=( -rlt -W --partial --numeric-ids --stats )
+    [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
+    _Args=( "${_Args[@]}" "--files-from=$_ChunkFile" )
+
+    while [ "$_Try" -le "$_MaxRetry" ]; do
+        _Rc=0
+        "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" "$_DstRoot/" > "$_LogDir/$_Name.log" 2>&1 || _Rc=$?
+        [ "$_Rc" -eq 0 ] && break
+        [ "$_Try" -lt "$_MaxRetry" ] && sleep $((_RetryPause * _Try))
+        _Try=$((_Try + 1))
+    done
+    [ "$_Try" -gt "$_MaxRetry" ] && _Try="$_MaxRetry"
+
+    printf '%s\t%s\t%s\n' "$_Name" "$_Rc" "$_Try" >> "$_ResultFile"
+    return 0
+}
+
 main() {
     set -euo pipefail
     if [ "$#" -eq 0 ]; then
