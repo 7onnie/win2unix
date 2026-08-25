@@ -272,6 +272,13 @@ del /q "w2u-probe.tmp" >nul 2>&1
 ::        macht diesen Test wertlos.
 ::        Geschrieben wird mit LF. Gemessen wurde, dass rsync auch CRLF frisst;
 ::        LF macht die Frage aber egal - auch nach einem Notepad-Speichern.
+::        Entfernt werden ALLE CR, nicht nur CRLF-Paare. Grund (Review-Fund):
+::        der WMI-Rueckfall oben schreibt seine Zeilen mit "echo", also mit
+::        CRLF, und aus dieser Datei liest for/f das letzte Feld MIT dem CR.
+::        Das landete als "comment = unbekannt (0<CR> GB)" in der Config - ein
+::        EINZELNES CR mitten in der Zeile, das eine Paar-Ersetzung nicht
+::        trifft. "alle CR weg" ist auf einem LF-Ergebnis dasselbe wie
+::        "CRLF -> LF" und faengt den Einzelgaenger mit.
 echo  [+] Erzeuge rsyncd.conf ^(!_DrvCnt! Laufwerk^(e^)^)...
 :: Die alte Datei MUSS vorher weg. WriteAllText ueberschreibt nur bei
 :: Erfolg: scheitert das ReadAllText auf dem Template (geloescht, vom
@@ -284,7 +291,7 @@ echo  [+] Erzeuge rsyncd.conf ^(!_DrvCnt! Laufwerk^(e^)^)...
 :: hat. Das Bundle wandert per USB-Stick ueber mehrere Kisten in
 :: verschiedenen Subnetzen; genau dieser Fall ist hier der Normalfall.
 del /q "rsyncd.conf" >nul 2>&1
-powershell -NoProfile -Command "$t = [IO.File]::ReadAllText('%~dp0rsyncd.head.template') -replace '@HOSTSALLOW@', '!_Allow!'; [IO.File]::WriteAllText('%~dp0rsyncd.conf', ($t -replace ([char]13 + [char]10), [string][char]10))"
+powershell -NoProfile -Command "$t = [IO.File]::ReadAllText('%~dp0rsyncd.head.template') -replace '@HOSTSALLOW@', '!_Allow!'; [IO.File]::WriteAllText('%~dp0rsyncd.conf', ($t -replace ([string][char]13), ''))"
 if not exist "rsyncd.conf" (
     echo  [!] rsyncd.conf konnte nicht erzeugt werden - fehlt rsyncd.head.template?
     echo.
@@ -298,7 +305,7 @@ if not exist "rsyncd.conf" (
 set "_ConfBad="
 for /f "usebackq tokens=1,2,3 delims=|" %%A in ("w2u-drives.tmp") do (
     echo  [+]   Laufwerk %%A: ^(%%B, %%C GB^) als Modul [%%A]
-    powershell -NoProfile -Command "$m = [IO.File]::ReadAllText('%~dp0rsyncd.module.template') -replace '@DRIVE@', '%%A' -replace '@PATH@', '/cygdrive/%%A/' -replace '@LABEL@', '%%B (%%C GB)'; [IO.File]::AppendAllText('%~dp0rsyncd.conf', [string][char]10 + ($m -replace ([char]13 + [char]10), [string][char]10))"
+    powershell -NoProfile -Command "$m = [IO.File]::ReadAllText('%~dp0rsyncd.module.template') -replace '@DRIVE@', '%%A' -replace '@PATH@', '/cygdrive/%%A/' -replace '@LABEL@', '%%B (%%C GB)'; [IO.File]::AppendAllText('%~dp0rsyncd.conf', [string][char]10 + ($m -replace ([string][char]13), ''))"
     rem Je Laufwerk nachsehen, ob der Block wirklich in der Datei steht. Sonst
     rem waere ein Fehlschlag beim dritten von vier Laufwerken ein stiller
     rem Teilerfolg: Server laeuft, ein Laufwerk fehlt einfach.

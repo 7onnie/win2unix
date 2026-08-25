@@ -123,7 +123,7 @@ Verifikation, die es beim blanken rsync nicht gibt.
 
 | Option | Wirkung |
 |---|---|
-| `--jobs N` | feste Parallelität, überspringt die Auto-Messung |
+| `--jobs N` | feste Parallelität, überspringt die Auto-Messung. Höchstens 64 — mehr wären keine Einstellung mehr, sondern ein Tippfehler mit 10000 rsync-Prozessen. Ein N über 8 hebt zugleich die Zerlegung an, damit es mehr Chunks als Worker gibt (sonst läuft mindestens einer leer) |
 | `--exclude-from DATEI` | Ausschlussmuster. Muster **ohne** führenden Schrägstrich gelten überall gleich und sind immer erlaubt. **Verankerte** Muster (mit führendem `/`) lehnt der Lauf ab, sobald die Quelle einen Unterpfad hat und parallel übertragen wird — dort meint ein `/x` je Phase eine andere Stelle. Gegen die Modulwurzel und im `--verify-only`-Lauf sind sie eindeutig und bleiben erlaubt; im Trockenlauf gibt es nur eine Warnung |
 | `--log-dir PFAD` | Logverzeichnis. Darf **nicht** unter dem Ziel liegen, sonst zählen die Logdateien als lokale Dateien mit |
 | `--rsync PFAD` | ein bestimmtes rsync benutzen statt selbst zu suchen |
@@ -145,8 +145,13 @@ weil sie strukturell kein tragfähiges Urteil erzeugen können: `--verify-only` 
 `--verify-only` mit `--exclude-from`, `--verify-only` mit `--dry-run`, und `--no-verify` mit
 `--checksum`.
 
-Ohne `--log-dir` legt der Lauf ein eigenes temporäres Logverzeichnis an. Nach einem PASS wird es
-weggeräumt, nach einem FAIL bleibt es liegen — der Bericht nennt den Pfad.
+Ohne `--log-dir` legt der Lauf ein eigenes temporäres Logverzeichnis an. Es **bleibt liegen** —
+nach einem FAIL, weil es die einzige Spur ist, und nach einem PASS, weil PASS die Freigabe zum
+Verschrotten der Quelle ist und der Nachweis dieser Freigabe danach das Einzige ist, was von der
+Maschine übrig bleibt. Darin: `verify.log`, `sweep.log`, ein Log je Chunk-Versuch und
+`report.txt` — der vollständige Abschlussbericht, wortgleich mit dem auf dem Bildschirm.
+Weggeräumt wird das Verzeichnis nur, wenn es leer geblieben ist (ein Abbruch vor der ersten
+Übertragung). Ein per `--log-dir` angegebenes Verzeichnis fasst der Lauf ohnehin nie an.
 
 ## Wann ist es fertig?
 
@@ -158,12 +163,26 @@ bekommt entsprechend weniger — das Werkzeug sagt in beiden Fällen, worauf das
 und verweigert es, wenn gar keine Schicht mehr trägt.
 
 **Worauf man sich dabei verlässt — und worauf nicht.** Der Vergleichslauf läuft mit `-rlt -W -n -i`,
-er vergleicht also **Größe und Zeitstempel**, nicht die Inhalte. Ein PASS heißt: jede Datei liegt
+er vergleicht also **Größe und Zeitstempel**, nicht die Inhalte. Der Bericht sagt in seiner
+Verify-Zeile ausdrücklich, welche der beiden Vergleiche gelaufen ist. Ein PASS heißt: jede Datei liegt
 mit passender Größe und passender Zeit am Ziel, und die Dateizahlen stimmen. Es heißt **nicht**:
 die Bytes sind nachweislich identisch. Wer das belegt haben will, nimmt `--checksum` — dieser Lauf
 liest den gesamten Bestand auf beiden Seiten erneut und braucht grob ein bis zwei Stunden pro
 Terabyte. Das ist die bewusste Vorgabe, kein Versehen: der Prüfsummenlauf kostet auf einem TB mehr
 Zeit als der Transfer selbst.
+
+**Wenn die Dateizahlen auseinandergehen**, nennt der Bericht nicht bloß zwei Zahlen, sondern die
+**Namen**: welche Datei am Ziel fehlt, und welche dort ohne Gegenstück in der Quelle liegt. Eine
+Ausnahme wird dabei entschuldigt, und nur diese eine: eine liegengebliebene rsync-Temp-Datei
+(`.name.XXXXXX`, deren Originaldatei in der Quelle existiert) — das ist der Rückstand eines hart
+abgebrochenen Laufs, sie wird namentlich genannt und zählt nicht gegen die Vollständigkeit. Ohne
+diese Ausnahme wäre jeder Lauf nach einem harten Abbruch dauerhaft ein FAIL. Eine Datei in
+derselben Form, deren Original es in der Quelle **nicht** gibt, bleibt ein Befund.
+
+Und ein Widerspruch bleibt ein FAIL: melden alle Chunks rc 0, während am Ziel keine einzige Datei
+liegt und nichts dazugekommen ist, endet der Lauf mit FAIL — auch unter `--no-verify`. Ein rc 0 ohne
+übertragene Daten ist in diesem Projekt gemessen worden. Eine Wiederaufnahme über einen bereits
+vollständigen Zielbaum überträgt dagegen legitim null Bytes und bleibt PASS.
 
 FAIL nennt die fehlgeschlagenen Chunks und den Pfad zu den Logs. Exit-Code 23 oder 24 bedeutet,
 dass Dateien nicht gelesen werden konnten — meist gesperrt durch ein laufendes Programm, oder

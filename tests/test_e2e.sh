@@ -33,11 +33,23 @@ if ! d_available; then
     t_summary
 fi
 
+# EIN Wurzelverzeichnis fuer alles, was dieser Test und die Laeufe darin
+# anlegen - und TMPDIR zeigt hinein. Das ist nicht Ordnungsliebe: seit dem
+# Abschluss-Review BLEIBEN die Logverzeichnisse auch nach einem PASS liegen (sie
+# sind der Nachweis der Vollstaendigkeit), und dieser Test faehrt sechs
+# vollstaendige Laeufe. Ohne die Umleitung liesse jeder Suite-Lauf sechs
+# Logverzeichnisse im echten TMPDIR des Entwicklers zurueck.
+_TmpRoot="$(mktemp -d)"
+export TMPDIR="$_TmpRoot"
 _Src="$(mktemp -d)"
 _Dst="$(mktemp -d)"
 _Dst2="$(mktemp -d)"
 _Dst3="$(mktemp -d)"
-trap 'd_stop; rm -rf "$_Src" "$_Dst" "$_Dst2" "$_Dst3"' EXIT
+_Dst4="$(mktemp -d)"
+_Dst5="$(mktemp -d)"
+# "chmod -R u+w" vor dem Loeschen: zwei Faelle unten setzen einen Vorfahren
+# absichtlich auf nur-lesen, und ein "rm -rf" kaeme dort nicht durch.
+trap 'd_stop; chmod -R u+w "$_TmpRoot" 2>/dev/null; rm -rf "$_TmpRoot"' EXIT
 
 # Prueft, dass eine Zeichenkette NICHT vorkommt. Bewusst hier und nicht in
 # testlib.sh: dieser Test braucht sie, die anderen zehn nicht, und eine
@@ -114,6 +126,26 @@ t_assert_eq "ja" "$_L" "leeres Verzeichnis existiert am Ziel"
 t_assert_eq "direkt" "$(cat "$_Dst/Daten/SonoGDT/Bildarchiv/direkt.txt")" "direkte Datei im expandierten Ordner"
 t_assert_eq "umlaut" "$(cat "$_Dst/Daten/BRIEFE/Größe & Maß.DOC")" "Umlaut-Datei lesbar"
 
+# ---- Der Nachweis muss den Lauf ueberleben ---------------------------------
+# Vorher loeschte das Werkzeug sein eigenes Logverzeichnis nach einem PASS -
+# verify.log, sweep.log, alle Chunk-Logs -, und der Bericht ging ohnehin nur
+# aufs Terminal. Genau der Lauf mit PASS ist aber der, dessen Aufzeichnung
+# jemand hinterher sehen will: PASS ist die Freigabe, die Quelle zu
+# verschrotten, und danach gibt es kein zweites Hinsehen.
+_LogPath="$(printf '%s\n' "$_Out" | sed -n 's/^\[[0-9:]*\] Logs: //p' | tail -1)"
+[ -n "$_LogPath" ] && _L=ja || _L=nein
+t_assert_eq "ja" "$_L" "Testaufbau: der Lauf hat sein Logverzeichnis genannt"
+[ -d "$_LogPath" ] && _L=ja || _L=nein
+t_assert_eq "ja" "$_L" "das Logverzeichnis existiert nach einem PASS noch"
+t_assert_contains "$(cat "$_LogPath/report.txt" 2>&1)" "ERGEBNIS: PASS" "der Abschlussbericht liegt als report.txt darin"
+[ -f "$_LogPath/verify.log" ] && _L=ja || _L=nein
+t_assert_eq "ja" "$_L" "verify.log liegt darin"
+[ -f "$_LogPath/sweep.log" ] && _L=ja || _L=nein
+t_assert_eq "ja" "$_L" "sweep.log liegt darin"
+[ -n "$(ls "$_LogPath"/chunk.* 2>/dev/null)" ] && _L=ja || _L=nein
+t_assert_eq "ja" "$_L" "und die Logs der einzelnen Chunks"
+t_assert_contains "$_Out" "Logs und Bericht bleiben liegen" "der Lauf sagt am Ende, wo der Nachweis liegt"
+
 # ---- Lauf 2: Wiederaufnahme, diesmal mit fester Parallelitaet ---------------
 # Ein zweiter Lauf ueber einen vollstaendigen Zielbaum uebertraegt nichts mehr
 # und muss trotzdem PASS melden - genau das tut ein Anwender nach einem Abbruch.
@@ -137,6 +169,29 @@ t_assert_eq "brief 1" "$(cat "$_Dst/Daten/BRIEFE/1/1 AC.DOC")" "geloeschte Datei
 [ -d "$_Dst/Daten/leer" ] && _L=ja || _L=nein
 t_assert_eq "ja" "$_L" "geloeschtes leeres Verzeichnis wurde wiederhergestellt"
 t_assert_eq "" "$(diff -r "$_Src/Daten" "$_Dst/Daten" 2>&1)" "nach der Reparatur wieder identisch"
+
+# ---- Lauf 3b: Wiederaufnahme nach einem HARTEN Abbruch (Spec 9.4, Test 4) ---
+# Der Zustand, den ein "pkill -9" auf den Empfaenger hinterlaesst, wurde an
+# einem echten Daemon nachgemessen: rsyncs Temp-Datei ".<name>.XXXXXX" bleibt im
+# Ziel liegen (bei einem gewoehnlichen TERM wird sie umbenannt, bei -9 nicht).
+# Genau dieser Zustand wird hier hergestellt - nicht der Kill selbst: der
+# braeuchte ein Zeitfenster im Transfer, und ein Test, der manchmal nicht
+# zuschlaegt, ist kein Test.
+#
+# Der Fehler, den dieser Lauf pinnt: der naechste, VOLLSTAENDIGE Lauf zaehlte
+# die Waise als lokale Datei ohne entferntes Gegenstueck und meldete dauerhaft
+# "ABWEICHUNG in der Dateizahl" - bei jeder Wiederholung, mit einer nackten
+# Zahl. Wiederaufnahme ist aber eine harte Zusage (Spec 1.3), und ein FAIL, das
+# niemand mehr wegbekommt, ist genau das Signal, dem danach keiner mehr glaubt.
+printf 'halbe datei\n' > "$_Dst/Daten/BRIEFE/1/.1 AC.DOC.jccefG"
+_Out="$(bash "$_Root/pull.sh" --jobs 4 "$D_Url/Daten" "$_Dst" 2>&1)"
+_Rc=$?
+t_assert_rc 0 "$_Rc" "Lauf ueber eine liegengebliebene rsync-Temp-Datei endet mit rc 0"
+t_assert_contains "$_Out" "ERGEBNIS: PASS" "und meldet PASS - die Waise ist kein Grund fuer ein FAIL"
+t_assert_contains "$_Out" "rsync-Temp-Datei" "der Bericht nennt die Ausnahme, statt sie stillschweigend zu nehmen"
+t_assert_contains "$_Out" "BRIEFE/1/.1 AC.DOC.jccefG" "und die Waise mit Namen - eine nackte Zahl waere als Diagnose nutzlos"
+rm -f "$_Dst/Daten/BRIEFE/1/.1 AC.DOC.jccefG"
+t_assert_eq "" "$(diff -r "$_Src/Daten" "$_Dst/Daten" 2>&1)" "nach dem Entfernen der Waise wieder identisch"
 
 # ---- Lauf 4: Trockenlauf uebertraegt nichts --------------------------------
 # Pinnt die README-Zusage "--dry-run zeigt die Arbeitspakete, uebertraegt
@@ -199,5 +254,56 @@ t_assert_eq "" "$(diff -r "$_Src/Daten/SonoGDT" "$_Dst3/Daten/SonoGDT" 2>&1)" "t
 # Zahlen verschieden - waehrend diff -r trotzdem sauber waere.
 t_assert_eq "31" "$(find "$_Dst3/Daten/SonoGDT" -type f | wc -l | tr -d ' ')" "tiefer Praefix: 31 Dateien im erwarteten Unterbaum"
 t_assert_eq "31" "$(find "$_Dst3" -type f | wc -l | tr -d ' ')" "tiefer Praefix: KEINE Datei ausserhalb des erwarteten Unterbaums"
+
+# ---- Lauf 7: nicht beschreibbarer VORFAHRE, beschreibbares Ziel -------------
+# Die Worker schreiben nach "_ParDst/<praefix>", und das IST das
+# Zielverzeichnis. Auf den VORFAHREN _ParDst brauchen sie kein Schreibrecht,
+# solange die Praefix-Kette schon existiert. Der Preflight pruefte trotzdem den
+# Vorfahren und lehnte damit einen Lauf ab, der funktioniert haette - mit
+# --no-verify nicht als Warnung, sondern per Abbruch (w2u_einstroemig stirbt
+# dort, weil ohne Zerlegung keine bindende Beweisschicht bleibt).
+#
+# Aufbau: Quelle 'Daten/SonoGDT' (zweisegmentiger Praefix, also _ParDst = die
+# Wurzel des Zielbaums und NICHT das genannte Zielverzeichnis - nur so ist der
+# Fall ueberhaupt erreichbar; bei einsegmentigem Praefix faengt ihn die
+# "-w $_DstDir"-Pruefung schon vorher ab). Vorfahre nur-lesen, Ziel schreibbar.
+#
+# Als root wirkungslos (Rechte werden ignoriert) - dieselbe Ausnahme wie in
+# tests/test_chunk.sh.
+if [ "$(id -u)" -eq 0 ]; then
+    t_skip "laeuft als root - ein nicht beschreibbarer Vorfahre ist wirkungslos"
+else
+    mkdir -p "$_Dst4/Daten/SonoGDT"
+    chmod 555 "$_Dst4"
+    _Out="$(bash "$_Root/pull.sh" --jobs 4 "$D_Url/Daten/SonoGDT" "$_Dst4/Daten" 2>&1)"
+    _Rc=$?
+    chmod 755 "$_Dst4"
+    t_assert_rc 0 "$_Rc" "nur-lesbarer Vorfahre, beschreibbares Ziel: Lauf endet mit rc 0"
+    t_assert_contains "$_Out" "ERGEBNIS: PASS" "und meldet PASS"
+    t_assert_contains "$_Out" "parallele Phase:" "die parallele Phase laeuft wirklich - der Vorfahre ist nicht ihr Schreibziel"
+    e_assert_absent "$_Out" "EINSTROEMIG" "kein Rueckfall auf einen Strom wegen eines Vorfahren, in den niemand schreibt"
+    t_assert_eq "31" "$(find "$_Dst4/Daten/SonoGDT" -type f | wc -l | tr -d ' ')" "alle 31 Dateien im Unterbaum angekommen"
+
+    # Dieselbe Aufrufform mit --no-verify: vorher war das ein ABBRUCH im
+    # Preflight, nicht bloss eine Warnung. Ein Lauf, der parallel geht, darf
+    # daran nicht sterben.
+    mkdir -p "$_Dst5/Daten/SonoGDT"
+    chmod 555 "$_Dst5"
+    _Out="$(bash "$_Root/pull.sh" --no-verify --jobs 4 "$D_Url/Daten/SonoGDT" "$_Dst5/Daten" 2>&1)"
+    _Rc=$?
+    chmod 755 "$_Dst5"
+    t_assert_rc 0 "$_Rc" "dieselbe Form mit --no-verify laeuft durch (vorher: Abbruch im Preflight)"
+    t_assert_contains "$_Out" "parallele Phase:" "--no-verify: die parallele Phase laeuft"
+    t_assert_eq "31" "$(find "$_Dst5/Daten/SonoGDT" -type f | wc -l | tr -d ' ')" "--no-verify: alle 31 Dateien angekommen"
+
+    # Gegenprobe, damit die gelockerte Pruefung nicht einfach alles durchlaesst:
+    # ist das ZIEL SELBST nicht beschreibbar, muss der Rueckfall weiterhin
+    # kommen - dort schreiben die Worker wirklich hinein.
+    mkdir -p "$_Dst4/nurlesen/Daten/SonoGDT"
+    chmod 555 "$_Dst4/nurlesen/Daten/SonoGDT"
+    _Out="$(bash "$_Root/pull.sh" --jobs 4 "$D_Url/Daten/SonoGDT" "$_Dst4/nurlesen/Daten" 2>&1)"
+    chmod 755 "$_Dst4/nurlesen/Daten/SonoGDT"
+    t_assert_contains "$_Out" "EINSTROEMIG" "nicht beschreibbares ZIEL: der Rueckfall kommt weiterhin - und wird angesagt"
+fi
 
 t_summary

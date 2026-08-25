@@ -414,6 +414,10 @@ mv "$_DstRoot/Bildarchiv/direkt_datei.txt" "$_TmpDir/beiseite.txt"
 _Out="$(w2u_report 2>&1)"; _Rc=$?
 t_assert_rc 1 "$_Rc" "abweichende Dateizahl -> FAIL"
 t_assert_contains "$_Out" "ABWEICHUNG" "die Abweichung wird benannt"
+# Eine nackte Zahl ist als Diagnose nutzlos: "remote 3 / lokal 2" sagt nicht,
+# WELCHE Datei fehlt - und danach wird die Quelle verschrottet.
+t_assert_contains "$_Out" "FEHLEN am Ziel" "der Bericht sagt, dass Dateien fehlen (nicht nur, dass eine Zahl abweicht)"
+t_assert_contains "$_Out" "Bildarchiv/direkt_datei.txt" "und nennt die fehlende Datei mit Namen"
 
 # Bei aktiven Ausschluessen sind die Zahlen nur orientierend - sonst waere
 # jeder Lauf mit --exclude-from ein garantiertes falsches FAIL.
@@ -431,12 +435,137 @@ t_assert_contains "$_Out" "uebersprungen" "der Bericht benennt die uebersprungen
 _DoVerify=1
 mv "$_TmpDir/beiseite.txt" "$_DstRoot/Bildarchiv/direkt_datei.txt"
 
+# --- Waisen eines hart abgebrochenen Laufs (Spec 9.4, Test 4) ---------------
+# Nachgemessen an einem echten Daemon: "pkill -9" auf den Empfaenger laesst
+# rsyncs Temp-Datei ".<name>.XXXXXX" im Ziel liegen (bei einem gewoehnlichen
+# TERM wird sie umbenannt, bei -9 nicht). Der naechste, VOLLSTAENDIGE Lauf holt
+# die echte Datei und laesst die Waise daneben stehen - vorher meldete der
+# Bericht dann dauerhaft "ABWEICHUNG in der Dateizahl", bei jeder Wiederholung,
+# mit einer nackten Zahl und ohne Hinweis auf den Namen. Ein falsches FAIL auf
+# genau dem Weg, den Spec 1.3 als harte Zusage fuehrt.
+#
+# Drei Faelle, weil die Ausnahme nur so bewiesen ist. Ohne Fall 2 und 3 waere
+# "Zahlendifferenz plus eine Datei in Temp-Form" ein Freibrief.
+_Orph="$_DstRoot/Bildarchiv/.direkt_datei.txt.jccefG"
+printf 'halb\n' > "$_Orph"
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "Fall 1: eine abgebrochene rsync-Temp-Datei macht aus einem VOLLSTAENDIGEN Transfer kein FAIL"
+t_assert_contains "$_Out" "rsync-Temp-Datei" "Fall 1: die Ausnahme wird benannt, nicht stillschweigend genommen"
+t_assert_contains "$_Out" "Bildarchiv/.direkt_datei.txt.jccefG" "Fall 1: die Waise steht namentlich im Bericht"
+case "$_Out" in
+    *ABWEICHUNG*) _Has=ja ;;
+    *)            _Has=nein ;;
+esac
+t_assert_eq "nein" "$_Has" "Fall 1: der Bericht ruft nicht 'ABWEICHUNG', was er zwei Zeilen weiter selbst entkraeftet"
+
+# ---------------------------------------------------------------------------
+# REGRESSION: leeres Feld in einer der drei Zaehl-awks darf NICHT als "nur
+# Ziffern" durchgehen. Der Guard verglich frueher "$_NdMiss$_NdOrph$_NdExtra"
+# ohne Trenner - ein leeres Feld liefert keine Zeichen, also wurde aus
+# "0" + "" + "0" die Kette "00", rein numerisch, und der Guard blieb stumm.
+# Derselbe Zustand (Waise wie in Fall 1, also eine Abweichung liegt vor) wird
+# hier erzwungen, indem genau der Zaehl-awk fuer die Waisen (_NdOrph, Muster
+# $1 == "T") kuenstlich fehlschlaegt und "" statt "1" liefert, waehrend die
+# beiden anderen echten Zaehlungen "0" ergeben - exakt die Kombination, die
+# die Konkatenation nicht von einem sauberen Fall unterscheiden konnte.
+# ---------------------------------------------------------------------------
+awk() {
+    case "$*" in
+        *'$1 == "T" { _N++ } END { print _N + 0 }'*) return 1 ;;
+        *) command awk "$@" ;;
+    esac
+}
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+unset -f awk
+t_assert_rc 1 "$_Rc" "REGRESSION: leeres _NdOrph bei den anderen beiden Zaehlungen auf 0 -> FAIL, nicht PASS"
+case "$_Out" in
+    *"ERGEBNIS: PASS"*) _HasPass=ja ;;
+    *)                  _HasPass=nein ;;
+esac
+t_assert_eq "nein" "$_HasPass" "REGRESSION: der Bericht druckt in diesem Fall kein PASS"
+t_assert_contains "$_Out" "ABWEICHUNG" "REGRESSION: die nicht auswertbare Zaehlung wird als Abweichung gemeldet, nicht verschwiegen"
+
+# Fall 2: dieselbe Waise UND eine wirklich fehlende Datei. Zwei Waisen, damit
+# die ZAHLEN auseinandergehen - eine fehlende Datei plus eine Waise heben sich
+# in der Zahl gegenseitig auf, und dann kommt dieser Vergleich nie zum Zug (das
+# ist die bekannte Blindheit des Zahlenvergleichs, gegen die der Verify steht).
+printf 'halb\n' > "$_DstRoot/Bildarchiv/1/tag/.f1.jpg.aB3xY9"
+mv "$_DstRoot/Bildarchiv/2/tag/f2.jpg" "$_TmpDir/beiseite2.jpg"
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 1 "$_Rc" "Fall 2: Waisen entschuldigen KEINE wirklich fehlende Datei -> FAIL"
+t_assert_contains "$_Out" "FEHLEN am Ziel" "Fall 2: die Fehlstelle wird als solche gemeldet"
+t_assert_contains "$_Out" "Bildarchiv/2/tag/f2.jpg" "Fall 2: und namentlich genannt"
+t_assert_contains "$_Out" "ABWEICHUNG" "Fall 2: hier ruft der Bericht sehr wohl ABWEICHUNG"
+mv "$_TmpDir/beiseite2.jpg" "$_DstRoot/Bildarchiv/2/tag/f2.jpg"
+rm -f "$_DstRoot/Bildarchiv/1/tag/.f1.jpg.aB3xY9"
+
+# Fall 3: die FORM einer Temp-Datei genuegt nicht - die Originaldatei muss in
+# der Quelle stehen. Sonst waere jede Nutzerdatei ".irgendwas.abcdef" ein
+# Freibrief fuer eine ueberzaehlige Datei am Ziel.
+printf 'fremd\n' > "$_DstRoot/Bildarchiv/.gibtsnicht.abcdef"
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 1 "$_Rc" "Fall 3: Temp-FORM ohne Originaldatei in der Quelle wird NICHT entschuldigt -> FAIL"
+t_assert_contains "$_Out" "OHNE Gegenstueck in der Quelle" "Fall 3: die ueberzaehlige Datei wird als solche gemeldet"
+t_assert_contains "$_Out" "Bildarchiv/.gibtsnicht.abcdef" "Fall 3: und namentlich genannt"
+rm -f "$_DstRoot/Bildarchiv/.gibtsnicht.abcdef"
+rm -f "$_Orph"
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "nach dem Aufraeumen ist der Bericht wieder sauber (die Faelle oben haben nichts liegengelassen)"
+
 # Eine Zahl, die nicht ermittelt werden konnte, darf nicht als "gleich" gelten.
 _SrcUrl="rsync://127.0.0.1:1/test"
 _Out="$(w2u_report 2>&1)"; _Rc=$?
 t_assert_rc 1 "$_Rc" "nicht ermittelbare Dateizahl -> FAIL"
 t_assert_contains "$_Out" "nicht ermittelbar" "der Grund wird benannt"
 _SrcUrl="$_SaveUrl"
+
+# --- Widerspruch: alle Chunks melden Erfolg, am Ziel liegt nichts ----------
+# Die letzte Tuer, die --no-verify offen laesst: dort traegt die
+# Chunk-Buchfuehrung das Urteil allein, und "jeder Chunk hat rc 0 gemeldet" ist
+# ein Signal, das in diesem Projekt nachweislich gelogen hat (openrsync liefert
+# rc 0 und uebertraegt nichts). Ein Widerspruch ist kein PASS.
+#
+# Drei Faelle, und die letzten zwei sind der Beweis, dass die Regel nicht
+# einfach jeden Lauf ohne Zuwachs rot faerbt - denn genau so sieht eine
+# WIEDERAUFNAHME aus, und die ist eine harte Zusage (Spec 1.3).
+_SaveDstRoot="$_DstRoot"
+_SaveVerify="$_DoVerify"
+_DoVerify=0
+mkdir -p "$_TmpDir/leer-ziel"
+_DstRoot="$_TmpDir/leer-ziel"
+_ParKbBefore=100
+_ParKbAfter=100
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 1 "$_Rc" "Chunks mit rc 0, aber null Zuwachs und keine Datei am Ziel -> FAIL"
+t_assert_contains "$_Out" "WIDERSPRUCH" "der Widerspruch wird benannt"
+t_assert_contains "$_Out" "NICHTS ans Ziel gebracht" "und im Klartext erklaert"
+
+# Fall 2: dieselbe Lage, aber am Ziel liegt etwas - das ist eine
+# Wiederaufnahme ueber einen vollstaendigen Baum und voellig normal.
+printf 'da\n' > "$_DstRoot/schon-da.txt"
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "null Zuwachs bei vorhandenen Dateien ist eine Wiederaufnahme -> PASS"
+case "$_Out" in
+    *WIDERSPRUCH*) _Has=ja ;;
+    *)             _Has=nein ;;
+esac
+t_assert_eq "nein" "$_Has" "und wird nicht als Widerspruch gemeldet"
+
+# Fall 3: leeres Ziel, aber gemessener Zuwachs - kein Widerspruch (die Zahlen
+# widersprechen sich nicht, dann urteilt diese Schicht nicht).
+rm -f "$_DstRoot/schon-da.txt"
+_ParKbAfter=500
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "gemessener Zuwachs ist kein Widerspruch, auch ohne gezaehlte Dateien"
+
+# Und ohne Messpunkte (einstroemiger Lauf, --verify-only, altes Verhalten)
+# urteilt die Schicht ueberhaupt nicht - "nicht gemessen" ist kein Befund.
+_ParKbBefore=""
+_ParKbAfter=""
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "ohne Messpunkte faellt diese Schicht kein Urteil"
+_DstRoot="$_SaveDstRoot"
+_DoVerify="$_SaveVerify"
 
 # --- Shell-Optionen und errexit --------------------------------------------
 # Gleiche Zusicherung wie fuer w2u_run_chunk (Task 6): keine Funktion darf die
@@ -523,7 +652,26 @@ rm -f "$_FakeBinDir"/calls.count "$_FakeBinDir"/call.*.args
 _DoChecksum=1
 w2u_verify >/dev/null 2>&1
 t_assert_eq "1" "$(grep -cx -- "-c" "$_FakeBinDir/call.1.args")" "--checksum setzt -c im argv des Verify"
+
+# Der BERICHT muss sagen, WAS verglichen wurde. "Vergleichslauf ohne Befunde"
+# stand bisher gleichlautend da, mit und ohne --checksum - und der Unterschied
+# ist erheblich: ohne -c faellt eine inhaltlich veraenderte Datei gleicher
+# Groesse und Zeit nicht auf. Wer den Bericht spaeter liest (er liegt seit dem
+# Abschluss-Review als report.txt), muss wissen, welche der beiden Aussagen er
+# in der Hand hat.
+_SaveVerifyState="$_VerifyState"
+_VerifyState="sauber"
+_Out="$(w2u_report 2>&1)"
+t_assert_contains "$_Out" "Verglichen wurden INHALTE" "mit --checksum nennt der Bericht den Inhaltsvergleich"
 _DoChecksum=0
+_Out="$(w2u_report 2>&1)"
+t_assert_contains "$_Out" "NICHT die Inhalte" "ohne --checksum sagt der Bericht ausdruecklich, dass die Inhalte NICHT verglichen wurden"
+case "$_Out" in
+    *"Verglichen wurden INHALTE"*) _Has=ja ;;
+    *)                             _Has=nein ;;
+esac
+t_assert_eq "nein" "$_Has" "und behauptet nicht das Gegenteil"
+_VerifyState="$_SaveVerifyState"
 _ExcludeFrom=""
 
 # rc 0 UND trotzdem keine verstandene Listing-Zeile: der Stub endet mit 0 und

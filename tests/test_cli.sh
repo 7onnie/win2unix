@@ -31,7 +31,17 @@ t_assert_contains "$_Out" "Aufruf:" "Usage wird ausgegeben"
 # nicht aus einer nebenbei abweichenden Zahl.
 # ---------------------------------------------------------------------------
 _Tmp="$(mktemp -d "${TMPDIR:-/tmp}/w2u.cli.XXXXXXXX")"
-trap 'd_stop; rm -rf "$_Tmp"' EXIT
+trap 'd_stop; chmod -R u+w "$_Tmp" 2>/dev/null; rm -rf "$_Tmp"' EXIT
+# Alles, was die Laeufe SELBST anlegen (Arbeits- und Logverzeichnisse), landet
+# unter $_Tmp und wird damit vom Trap mitgeraeumt. Nicht Ordnungsliebe: seit dem
+# Abschluss-Review bleiben Logverzeichnisse auch nach einem PASS liegen (sie sind
+# der Nachweis), und diese Datei faehrt viele vollstaendige Laeufe - ohne die
+# Umleitung blieben sie im echten TMPDIR des Entwicklers zurueck. Die
+# feingranularen TMPDIR-Umleitungen einzelner Faelle weiter unten bleiben
+# bestehen: die zaehlen, was in IHREM Verzeichnis liegt, und brauchen es
+# deshalb leer.
+export TMPDIR="$_Tmp/tmpdir"
+mkdir -p "$TMPDIR"
 
 _Fake="$_Tmp/fake-rsync"
 cat > "$_Fake" <<'FAKE'
@@ -153,6 +163,10 @@ _under() {
 # im laufenden Testprozess nicht die Einstellung des vorherigen erbt.
 _reset_opts() {
     _JobCnt=0
+    # MUSS mit zurueckgesetzt werden: --jobs hebt _PMax an (Spec 5.3), und ein
+    # angehobenes _PMax aus einem vorherigen Aufruf im selben Testprozess
+    # verstellte die Zerlegung aller folgenden Faelle.
+    _PMax=8
     _ExcludeFrom=""
     _LogDir=""
     _RsyncBin=""
@@ -177,6 +191,53 @@ t_assert_eq "$_DstBase" "$_DstRoot" "Quelle mit Slash schreibt direkt ins Ziel"
 
 w2u_parse_args --jobs 6 "rsync://10.0.0.1/e/Archiv" "$_DstBase"
 t_assert_eq "6" "$_JobCnt" "--jobs wird uebernommen"
+
+# --- --jobs hebt _PMax (Spec 5.3) --------------------------------------------
+# P_max ist laut Spec 5.3 "Vorgabe 8 ODER der Wert aus --jobs", und an P_max
+# haengen BEIDE Zahlen der Zerlegung: die Schwelle (4 * P_max) und der
+# Chunk-Divisor. Fehlt die zweite Haelfte, setzt --jobs nur die Zahl der Worker,
+# waehrend weiter fuer 8 zerlegt wird - bei der gemessenen Datenlage (Fall A,
+# 308 Arbeitspakete) sind das 31 Chunks fuer 32 Worker. Weniger Chunks als
+# Worker heisst: mindestens einer bekommt nichts, und Work-Stealing gibt es
+# nicht mehr. Deshalb wird hier nicht nur _PMax geprueft, sondern die Folge
+# daraus - die Chunkzahl gegen die Worker-Zahl.
+_reset_opts
+w2u_parse_args --jobs 32 "rsync://10.0.0.1/e/Archiv" "$_DstBase"
+t_assert_eq "32" "$_PMax" "--jobs 32 hebt _PMax auf 32 (Spec 5.3)"
+_JobsWork="$_Tmp/jobs.work"
+: > "$_JobsWork"
+_I=1
+while [ "$_I" -le 308 ]; do
+    printf 'paket %d\n' "$_I" >> "$_JobsWork"
+    _I=$((_I + 1))
+done
+mkdir -p "$_Tmp/jobs.chunks"
+w2u_chunk "$_JobsWork" "$_Tmp/jobs.chunks" "$_PMax" "$_Tmp/jobs.list" >/dev/null 2>&1
+_JobsChunks="$(grep -c . "$_Tmp/jobs.list")"
+t_assert_eq "103" "$_JobsChunks" "Fall A mit --jobs 32: 103 Chunks (mit ungehobenem _PMax waeren es 31)"
+[ "$_JobsChunks" -gt "$_JobCnt" ] && _MehrAlsWorker=ja || _MehrAlsWorker=nein
+t_assert_eq "ja" "$_MehrAlsWorker" "es gibt mehr Chunks ($_JobsChunks) als Worker ($_JobCnt) - sonst laeuft mindestens einer leer"
+
+# Nur ANHEBEN: ein kleines --jobs darf die Zerlegung nicht groeber machen als
+# die Vorgabe, sonst waere man wieder bei "4 Chunks fuer 8 Worker".
+_reset_opts
+w2u_parse_args --jobs 2 "rsync://10.0.0.1/e/Archiv" "$_DstBase"
+t_assert_eq "8" "$_PMax" "--jobs 2 senkt _PMax NICHT unter die Vorgabe"
+
+# Obergrenze: ohne sie waere "--jobs 10000" gueltig und startete 10000
+# rsync-Prozesse gegen eine alte Windows-Kiste.
+_reset_opts
+# Gegen den rsync-Ersatz und ein vorhandenes Ziel, nicht gegen eine
+# unerreichbare Quelle: sonst liefert der naechste Preflight-Check denselben
+# rc 1 und eine entfernte Ablehnung faellt nicht auf. Als Trockenlauf, damit
+# ohne die Ablehnung nicht wirklich 10000 Prozesse entstehen - der Trockenlauf
+# endet ohne die Ablehnung mit rc 0.
+_Out="$(bash "$_Root/pull.sh" --jobs 10000 --dry-run --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp" 2>&1)"; _Rc=$?
+t_assert_rc 1 "$_Rc" "--jobs 10000 wird abgelehnt (ohne die Ablehnung liefe derselbe Aufruf auf rc 0)"
+t_assert_contains "$_Out" "Obergrenze" "die Ablehnung nennt die Obergrenze"
+_Out="$(bash "$_Root/pull.sh" --jobs 64 --dry-run --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp" 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "--jobs 64 (die Grenze selbst) bleibt erlaubt - die Ablehnung greift nicht zu weit"
+_reset_opts
 
 _Out="$(bash "$_Root/pull.sh" --jobs abc rsync://10.0.0.1/e/x /tmp 2>&1 || true)"
 t_assert_contains "$_Out" "ABBRUCH" "nicht-numerisches --jobs bricht ab"
@@ -275,6 +336,36 @@ t_assert_contains "$_Out" "WARNUNG" "im Trockenlauf wirkungslose Optionen warnen
 _reset_opts
 
 # --- Preflight ----------------------------------------------------------------
+# _RsyncTimeout war der einzige Zahlen-Regler ohne case-Pruefung. Er landet als
+# "--timeout=$_RsyncTimeout" im argv von vier verschiedenen rsync-Aufrufen;
+# gemessen wurde, dass GNU rsync einen leeren Wert schluckt (kein Timeout mehr,
+# also Haenger statt Retry) und openrsync ihn ablehnt (jeder Chunk scheitert) -
+# zwei Fehlerbilder aus einem Konfigurationsfehler, beide mit dem Finger auf
+# rsync statt auf die Ursache. Geprueft wird in beide Richtungen: die Ablehnung
+# muss kommen, UND ein gueltiger Wert darf nicht daran haengen.
+_Rc=0
+_Out="$(W2U_LIB_ONLY=1 bash -c '. "$1"; _RsyncTimeout="abc"; w2u_preflight' _ "$_Root/pull.sh" 2>&1)" || _Rc=$?
+t_assert_rc 1 "$_Rc" "nicht-numerisches _RsyncTimeout bricht im Preflight ab"
+t_assert_contains "$_Out" "_RsyncTimeout" "und benennt den Regler"
+# Der rc allein pinnt hier nichts: ohne die Pruefung stirbt derselbe Aufruf
+# zwei Schritte spaeter am fehlenden Zielverzeichnis, wieder mit rc 1. Gepinnt
+# wird deshalb die STELLE - die Pruefung steht vor w2u_find_rsync, also darf
+# dessen Versionszeile noch nicht in der Ausgabe stehen.
+case "$_Out" in
+    *"rsync: "*) _Has=ja ;;
+    *)           _Has=nein ;;
+esac
+t_assert_eq "nein" "$_Has" "und zwar als ERSTES - keine Zeile aus dem restlichen Preflight davor"
+_Rc=0
+_Out="$(W2U_LIB_ONLY=1 bash -c '. "$1"; _RsyncTimeout=""; w2u_preflight' _ "$_Root/pull.sh" 2>&1)" || _Rc=$?
+t_assert_rc 1 "$_Rc" "LEERES _RsyncTimeout ebenso (GNU rsync wuerde es schlucken und ohne Timeout laufen)"
+_Out="$(W2U_LIB_ONLY=1 bash -c '. "$1"; _RsyncTimeout=300; w2u_preflight' _ "$_Root/pull.sh" 2>&1 || true)"
+case "$_Out" in
+    *_RsyncTimeout*) _Has=ja ;;
+    *)               _Has=nein ;;
+esac
+t_assert_eq "nein" "$_Has" "ein gueltiger Wert scheitert NICHT an dieser Pruefung (sie greift nicht zu weit)"
+
 _Out="$(bash "$_Root/pull.sh" --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp/gibtsnicht" 2>&1)"; _Rc=$?
 t_assert_rc 1 "$_Rc" "fehlendes Zielverzeichnis bricht ab"
 t_assert_contains "$_Out" "Zielverzeichnis" "fehlendes Zielverzeichnis wird benannt"
@@ -289,10 +380,14 @@ _Out="$(bash "$_Root/pull.sh" --rsync "$_Fake" --log-dir "$_Tmp/dst-logs/Archiv/
 t_assert_rc 1 "$_Rc" "--log-dir unterhalb des Zielverzeichnisses wird abgelehnt (Ruling 3)"
 
 # --- main(): Ergebnisdatei, Logverzeichnis, Aufraeumen ------------------------
-mkdir -p "$_Tmp/dst-a"
+# TMPDIR umgebogen: dieser Lauf endet mit PASS, und seit dem Abschluss-Review
+# BLEIBEN die Logs auch nach einem PASS liegen (sie sind der Nachweis, und auf
+# ein PASS folgt das Verschrotten der Quelle). Ohne die Umleitung liesse jeder
+# Suite-Lauf ein Logverzeichnis im echten TMPDIR zurueck.
+mkdir -p "$_Tmp/dst-a" "$_Tmp/tmp-a"
 _StateA="$_Tmp/state-a"
 : > "$_StateA"
-_Out="$(bash "$_Probe" "$_Root/pull.sh" "$_StateA" --jobs 2 --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp/dst-a" 2>&1)"; _Rc=$?
+_Out="$(TMPDIR="$_Tmp/tmp-a" bash "$_Probe" "$_Root/pull.sh" "$_StateA" --jobs 2 --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp/dst-a" 2>&1)"; _Rc=$?
 t_assert_rc 0 "$_Rc" "voller Lauf mit Attrappen endet mit rc 0"
 _PTmp="$(_pval "$_StateA" TMPDIR)"
 _PRes="$(_pval "$_StateA" RESULTFILE)"
@@ -312,8 +407,16 @@ t_assert_contains "$_PTraps" "SIGINT" "INT wird abgefangen"
 t_assert_contains "$_PTraps" "SIGTERM" "TERM wird abgefangen"
 [ -d "$_PTmp" ] && _Left=ja || _Left=nein
 t_assert_eq "nein" "$_Left" "Arbeitsverzeichnis ist nach dem Lauf entfernt"
+# Umgekehrte Zusage seit dem Abschluss-Review: das Logverzeichnis BLEIBT auch
+# nach einem erfolgreichen Lauf liegen. Vorher wurde es geloescht - samt
+# verify.log, sweep.log und allen Chunk-Logs -, und der Bericht ging ohnehin nur
+# aufs Terminal. Damit vernichtete das Werkzeug den Nachweis genau in dem Lauf,
+# in dem er zaehlt: PASS ist die Freigabe, die Quellmaschine zu verschrotten.
 [ -d "$_PLog" ] && _Left=ja || _Left=nein
-t_assert_eq "nein" "$_Left" "selbst angelegtes Logverzeichnis ist nach einem erfolgreichen Lauf entfernt"
+t_assert_eq "ja" "$_Left" "selbst angelegtes Logverzeichnis BLEIBT nach einem erfolgreichen Lauf liegen (es ist der Nachweis)"
+[ -f "$_PLog/report.txt" ] && _Left=ja || _Left=nein
+t_assert_eq "ja" "$_Left" "der Abschlussbericht liegt als Datei im Logverzeichnis"
+t_assert_contains "$_Out" "Logs und Bericht bleiben liegen" "und der Lauf sagt, wo"
 t_assert_eq "0" "$(find "$_Tmp/dst-a" -type f | wc -l | tr -d ' ')" "der Lauf legt KEINE Dateien (Logs) im Ziel ab"
 
 # --- Ruling 2: Befunde im Verify duerfen NIE zu PASS fuehren -------------------
@@ -321,11 +424,16 @@ t_assert_eq "0" "$(find "$_Tmp/dst-a" -type f | wc -l | tr -d ' ')" "der Lauf le
 # Vergleichslauf Befunde meldet. Alles andere (Chunk-Buchfuehrung, Dateizahl)
 # ist in beiden Laeufen deckungsgleich - wer den Verify-Ausgang aus dem Bericht
 # entfernt, bekommt zweimal PASS.
-mkdir -p "$_Tmp/dst-b/Archiv"
+mkdir -p "$_Tmp/dst-b/Archiv" "$_Tmp/tmp-b"
 printf 'inhalt\n' > "$_Tmp/dst-b/Archiv/datei.txt"
-_Out="$(W2U_PROBE_REPORT=real bash "$_Probe" "$_Root/pull.sh" "$_Tmp/state-b" --jobs 2 --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp/dst-b" 2>&1)"; _Rc=$?
+_Out="$(TMPDIR="$_Tmp/tmp-b" W2U_PROBE_REPORT=real bash "$_Probe" "$_Root/pull.sh" "$_Tmp/state-b" --jobs 2 --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp/dst-b" 2>&1)"; _Rc=$?
 t_assert_rc 0 "$_Rc" "voller Lauf ohne Befunde meldet PASS"
 t_assert_contains "$_Out" "ERGEBNIS: PASS" "Bericht meldet PASS, wenn wirklich nichts zu beanstanden ist"
+# Der ECHTE Bericht (nicht die Attrappe) muss auch als Datei im Logverzeichnis
+# stehen, mit demselben Ergebnis wie auf dem Terminal. Ein Nachweis, der nur im
+# Scrollback existiert, ist nach dem Verschrotten der Quelle keiner.
+_PLogB="$(_pval "$_Tmp/state-b" LOGDIR)"
+t_assert_contains "$(cat "$_PLogB/report.txt" 2>&1)" "ERGEBNIS: PASS" "report.txt enthaelt denselben Bericht, den das Terminal zeigt"
 
 # TMPDIR umgebogen: dieser Lauf endet absichtlich mit FAIL, und nach einem FAIL
 # bleiben die Logs liegen (so soll es sein). Ohne die Umleitung liesse jeder
@@ -513,30 +621,52 @@ w2u_parse_args --verify-only "rsync://10.0.0.1/e/Daten/Archiv" /tmp 2>/dev/null
 t_assert_eq "1" "$_VerifyOnly" "--verify-only bleibt auch in der einstroemigen Aufrufform erlaubt"
 _reset_opts
 
-# Das Ziel der parallelen Phase ist per Konstruktion ein VORFAHRE des
-# Zielverzeichnisses - bei der Schraegstrich-Form ein Verzeichnis, das der
-# Anwender nie genannt hat. Ist es nicht beschreibbar, wird das nicht
-# stillschweigend versucht, sondern einstroemig uebertragen (und gesagt).
+# Geprueft wird das Schreibrecht dort, wo die Worker WIRKLICH schreiben - und
+# das ist das Zielverzeichnis, nicht der Vorfahre "$_ParDst". Die Dateien landen
+# unter "_ParDst/<praefix>", und das IST $_DstRoot.
+#
+# Vorher stand die Pruefung auf dem Vorfahren, und sie war in BEIDE Richtungen
+# falsch (im Abschluss-Review gefunden, hier in beiden Richtungen gepinnt):
+#   a) ein nur-lesbarer VORFAHRE lehnte einen Lauf ab, der funktioniert haette -
+#      mit --no-verify sogar per Abbruch statt per Warnung, weil ohne Zerlegung
+#      keine bindende Beweisschicht bleibt;
+#   b) ein nicht beschreibbares ZIEL fiel gar nicht auf, obwohl genau dort
+#      geschrieben wird.
 mkdir -p "$_Tmp/ro/Archiv"
 chmod 500 "$_Tmp/ro"
 if [ -w "$_Tmp/ro" ]; then
     t_skip "laeuft als root - ein nicht beschreibbares Elternverzeichnis ist so nicht herstellbar"
 else
-    # TMPDIR umgebogen: der Lauf endet mit FAIL (am Ziel liegt nichts), und
-    # nach einem FAIL bleiben die Logs liegen - ohne die Umleitung im echten
-    # TMPDIR des Anwenders.
+    # TMPDIR umgebogen: dieser Lauf endet mit FAIL (die Attrappe uebertraegt
+    # nichts), und nach einem FAIL bleiben die Logs liegen - ohne die Umleitung
+    # im echten TMPDIR des Anwenders.
     mkdir -p "$_Tmp/tmp-ro"
     _Out="$(TMPDIR="$_Tmp/tmp-ro" bash "$_Root/pull.sh" --rsync "$_Fake" "rsync://10.0.0.1/e/Archiv/" "$_Tmp/ro/Archiv" 2>&1 || true)"
-    t_assert_contains "$_Out" "EINSTROEMIG" "nicht beschreibbares _ParDst schaltet auf einstroemig um"
-    t_assert_contains "$_Out" "nicht beschreibbar" "und nennt den Grund"
+    case "$_Out" in
+        *EINSTROEMIG*) _Has=ja ;;
+        *)             _Has=nein ;;
+    esac
+    t_assert_eq "nein" "$_Has" "a) nur-lesbarer VORFAHRE, beschreibbares Ziel: KEIN Rueckfall - dort schreibt niemand hinein"
+    t_assert_contains "$_Out" "parallele Phase" "a) die parallele Phase laeuft"
+
+    # b) Jetzt das ZIEL selbst. Erreichbar nur ohne abschliessenden
+    # Schraegstrich an der Quelle: bei der Schraegstrich-Form ist $_DstRoot das
+    # genannte Zielverzeichnis, und dessen Schreibrecht prueft der Preflight
+    # schon weiter oben ab.
+    mkdir -p "$_Tmp/ro2/Daten/Archiv" "$_Tmp/tmp-ro2"
+    chmod 500 "$_Tmp/ro2/Daten/Archiv"
+    _Out="$(TMPDIR="$_Tmp/tmp-ro2" bash "$_Root/pull.sh" --rsync "$_Fake" "rsync://10.0.0.1/e/Daten/Archiv" "$_Tmp/ro2/Daten" 2>&1 || true)"
+    chmod 700 "$_Tmp/ro2/Daten/Archiv"
+    t_assert_contains "$_Out" "EINSTROEMIG" "b) nicht beschreibbares ZIEL schaltet auf einstroemig um"
+    t_assert_contains "$_Out" "nicht beschreibbar" "b) und nennt den Grund"
     # Der Rat muss zum Grund passen: hier stimmt der Zielpfad bereits, es fehlen
     # die Rechte - "waehle ein Ziel, das auf den Praefix endet" waere Unsinn.
-    t_assert_contains "$_Out" "es fehlen die Rechte" "und einen Rat, der zum Grund passt"
+    t_assert_contains "$_Out" "es fehlen die Rechte" "b) und einen Rat, der zum Grund passt"
     case "$_Out" in
         *"OHNE abschliessenden Schraegstrich"*) _Has=ja ;;
         *)                                      _Has=nein ;;
     esac
-    t_assert_eq "nein" "$_Has" "und NICHT den Rat aus dem anderen Fall"
+    t_assert_eq "nein" "$_Has" "b) und NICHT den Rat aus dem anderen Fall"
 fi
 chmod 700 "$_Tmp/ro"
 

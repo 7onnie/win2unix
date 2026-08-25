@@ -8,12 +8,59 @@
 #
 # NICHT "curl | bash" verwenden: dabei ist stdin der Skript-Stream, und die
 # Datei-Listen wuerden den restlichen Skriptcode lesen.
+#
+# ---------------------------------------------------------------------------
+# WAS WO STEHT. Eine Datei ohne "source"-Abhaengigkeiten (sie wird per curl
+# geholt und muss allein lauffaehig sein), deshalb hier der Wegweiser. Die
+# Reihenfolge ist die des Ablaufs, nicht die Wichtigkeit.
+#
+#   Melden       w2u_log / w2u_warn / w2u_die   alles nach stderr, die
+#                                               Berichtsausgabe bleibt stdout
+#                w2u_usage                      Aufrufhilfe
+#   Lesen        w2u_parse_listing              rsync-Listing -> "TYP<TAB>NAME"
+#                w2u_find_rsync                 brauchbares rsync suchen
+#                w2u_remote_list                GENAU eine Ebene auflisten
+#   Zerlegen     w2u_decompose                  Quellbaum -> Arbeitspakete
+#                w2u_chunk                      Arbeitspakete -> Chunkdateien
+#   Uebertragen  w2u_run_chunk                  EIN Chunk, mit Retry (Worker)
+#                w2u_run_list                   Chunkliste parallel via xargs
+#                w2u_dst_kb                     belegte KB am Ziel (Messwert)
+#                w2u_result_lines               Zeilenmarke der Ergebnisdatei
+#                w2u_autotune                   Parallelitaet MESSEN (Spec 5.4)
+#                w2u_run_all                    Messung plus Restliste
+#   Beweisen     w2u_sweep                      ein einstroemiger Vollpass
+#                w2u_verify                     Trockenlauf, Erwartung: leer
+#                w2u_count_remote               Dateizahl in der Quelle
+#                w2u_count_local                Dateizahl am Ziel
+#                w2u_name_diff                  Namensvergleich bei Differenz
+#                w2u_report                     PASS/FAIL - das ganze Urteil
+#   Steuern      w2u_take_arg                   Optionswert sicher holen
+#                w2u_einstroemig                Umschalten auf EINEN Strom
+#                w2u_parse_args                 CLI, Zielpfad-Semantik, Verbote
+#                w2u_abs_path                   Pfad aufloesen, ohne anzulegen
+#                w2u_preflight                  alles, was den Lauf unmoeglich
+#                                               macht, VOR der ersten Stunde
+#                w2u_verify_step                Verify fahren, Ausgang merken
+#                w2u_report_step                Bericht drucken UND ablegen
+#                w2u_cleanup / w2u_on_signal    EXIT- und Signal-Behandlung
+#                main                           der Ablauf, und nur er
+# ---------------------------------------------------------------------------
 
 W2U_VERSION="0.1.0"
 
 # ---------- Konfiguration (Zero-Touch: alles hier, keine Rueckfragen) ----------
 _JobCnt=0              # 0 = Auto-Messung (Spec 5.4)
-_PMax=8                # hoechste Parallelitaet, die die Messung probiert
+_PMax=8                # hoechste Parallelitaet, die die Messung probiert - und
+                       # der Massstab fuer Zerlegungsschwelle und Chunkgroesse
+                       # (Spec 5.3). "--jobs N" hebt diesen Wert an, wenn N
+                       # groesser ist; siehe w2u_parse_args.
+_JobsMax=64            # Obergrenze fuer --jobs. Ohne sie waere "--jobs 10000"
+                       # gueltig und startete 10000 rsync-Prozesse gegen EINE
+                       # alte Windows-Kiste - das ist kein Tuning mehr, das ist
+                       # ein Tippfehler mit Folgen. 64 liegt weit oberhalb
+                       # jedes gemessenen Optimums (die Messung eskaliert bis 8)
+                       # und weit unterhalb dessen, was eine Quelle mit
+                       # drehender Platte noch bedienen kann.
 _MaxRetry=3
 _RetryPause=5          # Sekunden, waechst linear mit dem Versuch
 _RsyncTimeout=300      # Sekunden ohne I/O, ab da bricht rsync selbst ab statt zu
@@ -83,6 +130,12 @@ _ChunkListFile=""     # von w2u_chunk gesetzt; der Abschlussbericht gleicht die
                       # Liste meldet w2u_report FAIL, weil dann unbekannt ist,
                       # wieviele es haetten sein muessen.
 _StartTs=0
+# Belegte KB am Ziel unmittelbar VOR und NACH der parallelen Phase. Leer heisst
+# "nicht gemessen" (kein paralleler Lauf) oder "nicht ermittelbar" (du lieferte
+# keine Zahl) - beides ist KEIN Messwert und fuehrt zu keinem Urteil. Wozu:
+# siehe die Widerspruchspruefung in w2u_report.
+_ParKbBefore=""
+_ParKbAfter=""
 _LogDirOwned=0        # 1 = das Logverzeichnis stammt aus unserem mktemp und
                       # darf am Ende geloescht werden. Ein per --log-dir
                       # angegebenes Verzeichnis gehoert dem Anwender und wird
@@ -90,8 +143,8 @@ _LogDirOwned=0        # 1 = das Logverzeichnis stammt aus unserem mktemp und
                       # der einzige Weg, wie dieses Werkzeug Daten zerstoert.
 _VerifyState=""       # "", "sauber" oder "befunde". Von main() nach dem
                       # Vergleichslauf gesetzt, vom Abschlussbericht gelesen
-                      # (CONTROLLER-RULING 2 aus Task 8): Befunde im Verify
-                      # muessen im BERICHT landen, nicht nur im Exit-Code.
+                      # Befunde im Verify muessen im BERICHT landen, nicht
+                      # nur im Exit-Code.
 _AbsPath=""           # Rueckgabekanal von w2u_abs_path, siehe dort
 _ArgVal=""            # Rueckgabekanal von w2u_take_arg - eine Variable statt
                       # einer Kommandosubstitution, siehe dort.
@@ -108,7 +161,7 @@ Aufruf: pull.sh [Optionen] rsync://<WIN-IP>/<modul>/<pfad> <zielverzeichnis>
   Quelle MIT abschliessendem Slash   -> schreibt den Inhalt direkt ins Ziel
 
 Optionen:
-  --jobs N            feste Parallelitaet, ueberspringt die Auto-Messung
+  --jobs N            feste Parallelitaet (1-64), ueberspringt die Auto-Messung
   --exclude-from DATEI Ausschlussmuster; bei Quellen mit Unterpfad OHNE
                       fuehrenden Schraegstrich (sonst Abbruch, siehe Meldung)
   --log-dir PFAD      Logverzeichnis; darf NICHT unter dem Ziel liegen
@@ -126,6 +179,16 @@ EOF
 # --out-format wird von openrsync im Listing-Modus ignoriert (Spec 2.2), deshalb
 # wird geparst statt formatiert. Der Name ist ALLES nach dem Zeitstempel, sonst
 # gehen Leerzeichen verloren. Keine Intervall-Quantoren: BSD-awk kann sie nicht.
+#
+# ANNAHME, an der dieser Parser haengt: das Listing enthaelt KEINE Pfeilform
+# "link -> ziel". Nachgemessen an openrsync UND GNU rsync 3.5.0 gegen einen
+# echten Daemon: "--list-only" (mit -d wie in w2u_remote_list, mit -r wie in
+# w2u_count_remote) gibt Symlinks als gewoehnliche Zeile mit Typ "l" aus, ohne
+# Pfeil. WAS SIE BRICHT: ein "-l" in der Listing-Kommandozeile - DANN erscheint
+# die Pfeilform, und "alles nach dem Zeitstempel" waere der Name PLUS " -> "
+# PLUS Ziel. Aus einem Symlink wuerde ein Arbeitspaket mit einem Pfad, den es
+# nicht gibt. Die Listing-Aufrufe bekommen deshalb nie ein "-l"; wer eines
+# ergaenzt, muss hier die Pfeilform abschneiden.
 w2u_parse_listing() {
     awk '
     {
@@ -162,11 +225,10 @@ w2u_find_rsync() {
 
 # Listet GENAU EINE Ebene unterhalb von <basis>/<rel>.
 #
-# CONTROLLER-RULING: der rsync-Exit-Code darf nicht verworfen werden. Ein
-# nicht lesbares Verzeichnis (rc 23, Permission denied) und ein wirklich
-# leeres Verzeichnis (rc 0, Ausgabe nur der "."-Eintrag) erzeugen beide null
-# geparste Zeilen - ueber die Zeilenzahl allein sind sie nicht zu
-# unterscheiden. w2u_decompose (Task 4) wuerde "null Eintraege" sonst immer
+# Der rsync-Exit-Code darf hier nicht verworfen werden. Ein nicht lesbares
+# Verzeichnis (rc 23, Permission denied) und ein wirklich leeres Verzeichnis
+# (rc 0, Ausgabe nur der "."-Eintrag) erzeugen beide null geparste Zeilen -
+# ueber die Zeilenzahl allein sind sie nicht zu unterscheiden. w2u_decompose (Task 4) wuerde "null Eintraege" sonst immer
 # als leeres Verzeichnis behandeln und den kompletten Unterbaum stillschweigend
 # aus der Arbeitsliste fallen lassen. Deshalb: rsync-Aufruf getrennt vom
 # Parsen ausfuehren (Ausgabe erst in eine Variable), rc separat pruefen -
@@ -210,7 +272,20 @@ w2u_remote_list() {
 # Ein expandierter Ordner ist selbst KEIN Arbeitspaket mehr - rsync legt ihn beim
 # Uebertragen seiner Kinder implizit mit korrekter mtime an (Spec 2.6).
 #
-# CONTROLLER-RULING 2: das Listing wird ueber eine TEMP-DATEI gelesen, nicht ueber
+# ANNAHME, auf der die ganze Funktion steht: ein Listing, das mit rc 0
+# zurueckkommt, ist VOLLSTAENDIG. Nur darum darf ein expandierter Ordner aus der
+# Arbeitsliste verschwinden - seine Kinder stehen ja jetzt drin.
+# WAS SIE BRICHT: ein Listing, das ohne Fehler abbricht (ein Daemon, der bei
+# "max connections" die Verbindung schliesst; ein Timeout, den rsync nicht als
+# Fehler meldet). Dann fehlt ein Teil der Kinder, der Ordner selbst ist aber
+# schon ersetzt - der Unterbaum faellt STILL aus der Arbeitsliste, und keine
+# spaetere Schicht sieht ihn: die Chunk-Buchfuehrung vergleicht gegen genau
+# diese Liste, sie kann nur finden, was drinsteht. Was diese Annahme haelt,
+# steht in w2u_remote_list: der rc wird geprueft und nie mit der Zeilenzahl
+# verwechselt. Wer dort "|| true" ergaenzt, hebt sie auf, und der Verify plus
+# der Dateizahl-Vergleich sind die einzigen Netze, die dann noch tragen.
+#
+# Das Listing wird ueber eine TEMP-DATEI gelesen, nicht ueber
 # eine Prozess-Substitution. In "done < <(w2u_remote_list ...)" liefe
 # w2u_remote_list in einem Kindprozess - dessen w2u_die beendete nur das Kind, die
 # Schleife hier laese null Zeilen, hielte das Verzeichnis fuer LEER, machte daraus
@@ -378,10 +453,9 @@ w2u_chunk() {
 #  kein -a: -a zieht -pog mit, und Cygwin-Rechte sind synthetisch
 #  kein -z: im LAN ist die CPU das Limit, nicht die Leitung
 #
-# CONTROLLER-RULING 1: kein "set +e" / "set -e" um den rsync-Aufruf. Ein
-# abschliessendes "set -e" schaltete errexit auch in einer Shell ein, die
-# pull.sh nur gesourct hat (W2U_LIB_ONLY=1) - unabhaengig vom vorherigen
-# Zustand. Genau diese Leck-Klasse wurde in Task 1 gefunden und ist der
+# Kein "set +e" / "set -e" um den rsync-Aufruf. Ein abschliessendes "set -e"
+# schaltete errexit auch in einer Shell ein, die pull.sh nur gesourct hat
+# (W2U_LIB_ONLY=1) - unabhaengig vom vorherigen Zustand. Genau diese Leck-Klasse wurde in Task 1 gefunden und ist der
 # Grund, warum "set -euo pipefail" heute die erste Anweisung in main() ist,
 # nicht im Dateikopf. Eine Funktion darf die Shell-Optionen ihres Aufrufers
 # nicht veraendern. Stattdessen dasselbe Muster wie in w2u_remote_list
@@ -391,7 +465,7 @@ w2u_chunk() {
 # Log-Zeile eines spaeter doch noch erfolgreichen Versuchs, weil
 # "cmd || _Rc=$?" bei Erfolg _Rc unangetastet laesst.
 #
-# CONTROLLER-RULING 2: ein rsync-Aufruf, nicht zwei fast identische in
+# Ein rsync-Aufruf, nicht zwei fast identische in
 # if/else - genau die Art verbatim duplizierter Logik, die stillschweigend
 # auseinanderlaeuft, sobald spaeter nur ein Zweig eine Option dazubekommt.
 # Die Argumentliste wird einmal als Array aufgebaut (bash 3.2 kann Arrays)
@@ -412,8 +486,8 @@ w2u_chunk() {
 # 1) "printf ... >> $_ResultFile" ist unter set -e (main()'s Konfiguration) ein
 #    einfaches Kommando: schlaegt der Redirect fehl (Ergebnisverzeichnis nicht
 #    beschreibbar o.ae.), reisst errexit die Shell ab, BEVOR "return 0" erreicht
-#    wird - genau die Klasse Leck, gegen die Ruling 1 haertet, nur diesmal am
-#    Funktionsende statt am rsync-Aufruf. "|| w2u_log ..." haelt den Schreibfehler
+#    wird - genau die Klasse Leck, gegen die der Absatz zu "set +e" oben
+#    haertet, nur diesmal am Funktionsende statt am rsync-Aufruf. "|| w2u_log ..." haelt den Schreibfehler
 #    selbst am Leben (dieselbe Ausnahme-Idiom wie ueberall sonst) UND macht ihn
 #    sichtbar, statt eine verlorene Ergebniszeile spurlos verschwinden zu lassen.
 #
@@ -479,7 +553,12 @@ w2u_run_chunk() {
     [ -n "$_ParDst" ] || w2u_die "w2u_run_chunk ohne _ParDst aufgerufen (Ziel der parallelen Phase fehlt)"
 
     local _Args
-    _Args=( -rlt -W --partial --numeric-ids --stats "--timeout=$_RsyncTimeout" )
+    # Kein --stats: seine Ausgabe wird nirgends gelesen (die Messung laeuft
+    # ueber "du -sk" am Ziel, weil openrsync und GNU rsync verschiedene
+    # Stats-Formate schreiben - siehe w2u_autotune). Eine Option, die im argv
+    # steht und deren Ausgabe niemand auswertet, ist ein Versprechen an den
+    # naechsten Leser, das nicht gehalten wird.
+    _Args=( -rlt -W --partial --numeric-ids "--timeout=$_RsyncTimeout" )
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     _Args=( "${_Args[@]}" "--files-from=$_ChunkFile" )
 
@@ -492,10 +571,10 @@ w2u_run_chunk() {
     done
     [ "$_Try" -gt "$_MaxRetry" ] && _Try="$_MaxRetry"
 
-    # CONTROLLER-RULING 2 (Task 7): dieses ">>" laeuft ab Task 7 aus bis zu
-    # _PMax parallelen Prozessen gleichzeitig und ist die EINZIGE Stelle, an der
-    # ein fehlgeschlagener Chunk sichtbar wird. Nachgemessen, nicht angenommen
-    # (Zahlen im Task-7-Report): der parallele Append haelt.
+    # Dieses ">>" laeuft aus bis zu _PMax parallelen Prozessen gleichzeitig und
+    # ist die EINZIGE Stelle, an der ein fehlgeschlagener Chunk sichtbar wird.
+    # Nachgemessen, nicht angenommen (Zahlen im Task-7-Report): der parallele
+    # Append haelt.
     #
     # ANNAHME: Zeilenlaenge deutlich unter 1 KB (real 19-23 Byte, gemessene
     # Grenze 1024) und $_ResultFile auf einem LOKALEN Dateisystem.
@@ -514,13 +593,13 @@ w2u_run_chunk() {
 # Arbeitet eine Chunkliste mit <jobs> parallelen Prozessen ab (Spec 5.5).
 # Messwerte zu allen unten genannten xargs-Eigenschaften: Task-7-Report.
 #
-# CONTROLLER-RULING 1: "xargs -a DATEI" gibt es auf BSD nicht. stdin wird
-# deshalb EXPLIZIT aus der Liste umgeleitet - das ist auch der eigentliche Punkt
-# der Constraint: xargs darf nie das GEERBTE stdin lesen, beim Bootstrap ueber
-# "bash -c "$(curl ...)"" ist das der Skript-Stream selbst.
+# "xargs -a DATEI" gibt es auf BSD nicht. stdin wird deshalb EXPLIZIT aus der
+# Liste umgeleitet, und das ist der eigentliche Punkt: xargs darf nie das
+# GEERBTE stdin lesen, beim Bootstrap ueber "bash -c "$(curl ...)"" ist das der
+# Skript-Stream selbst.
 #
-# CONTROLLER-RULING 3 - hier entsteht die Prozessgrenze, auf die sich das
-# Fail-Fast in w2u_run_chunk stuetzt. Sie haelt, solange drei Dinge stimmen:
+# Hier entsteht die Prozessgrenze, auf die sich das Fail-Fast in w2u_run_chunk
+# stuetzt. Sie haelt, solange drei Dinge stimmen:
 #   a) je Chunk EIN eigener Prozess ("-I {}" = ein Argument je Aufruf), ein
 #      w2u_die im Worker ist damit "exit 1" nur DIESES Prozesses;
 #   b) xargs macht nach einem Kind mit rc 1 weiter. NICHT so bei rc 255 und bei
@@ -542,6 +621,27 @@ w2u_run_chunk() {
 # entscheidet main(). 4096 ist das Vierfache von PATH_MAX - ein einzelner
 # absoluter Pfad kann die Grenze damit strukturell nicht mehr reissen.
 #
+# Diese Option gibt es aber NUR bei BSD/macOS. GNU-findutils-xargs kennt kein
+# "-S" ueberhaupt und bricht schon am Optionen-Parsen ab ("xargs: invalid
+# option -- 'S'"), also BEVOR ein einziger Worker startet - auf jedem
+# GNU/Linux-Ziel, das das README zusagt, waere kein Chunk uebertragen worden.
+# GNU hat die 255-Byte-Grenze der "-I"-Ersetzung nicht, braucht die Option also
+# auch nicht. Deshalb wird sie GEMESSEN statt angenommen: ein Probelauf mit
+# genau dieser Option entscheidet, ob sie ins argv kommt.
+#
+# Das Ergebnis wird NICHT zwischengespeichert. Ein Cache waere genau dann
+# falsch, wenn er zaehlt (ein anderes xargs im PATH als beim ersten Aufruf),
+# und die Kosten sind ein einzelner fork je PHASE - gegen einen Transfer von
+# hunderten GB ist das nicht messbar. Getragen wird die Option in einem ARRAY,
+# nicht in einer Variablen: eine leere Variable waere unter "set -u" ein leeres
+# ARGUMENT ("xargs -P 4 '' -I {}") und damit ein Fehler statt einer
+# Auslassung. Die "+"-Form der Expansion ist Pflicht - "${_Arr[@]}" auf einem
+# leeren Array ist unter bash 3.2 mit set -u "unbound variable".
+#
+# "-I {}" bleibt in jedem Fall stehen: "-n 1" waere die naheliegende
+# Alternative, zerlegt aber an Leerzeichen - und $TMPDIR (also der Pfad jedes
+# Chunks) darf Leerzeichen enthalten.
+#
 # "${BASH:-bash}": das Umgebungsformat von "export -f" unterscheidet sich
 # zwischen bash 3.2 (Apple) und 4.3+ (Homebrew). Startete ein Skript unter
 # Homebrew-bash seine Worker mit /bin/bash, importierte das Kind die Funktionen
@@ -549,6 +649,7 @@ w2u_run_chunk() {
 # Interpreter wie der laufende und laesst die Frage nicht aufkommen.
 w2u_run_list() {
     local _ListFile="$1" _Jobs="$2" _Rc=0 _Missing="" _MissCnt=0 _Done=""
+    local _XargsRepl
     # "-P 0" heisst bei BSD-xargs UNBEGRENZT viele Prozesse - auf einer Quelle
     # mit drehender Platte das Gegenteil dessen, was die Messung erreichen soll.
     case "$_Jobs" in
@@ -563,6 +664,12 @@ w2u_run_list() {
     # Verschmelzung wie in w2u_remote_list (Task 3) und beim head weiter unten.
     [ -e "$_ListFile" ] || w2u_die "Chunkliste $_ListFile existiert nicht - ein stiller rc 0 saehe hier aus wie 'nichts mehr zu tun'"
     [ -r "$_ListFile" ] || w2u_die "Chunkliste $_ListFile ist nicht lesbar"
+    # Vervollstaendigt das Trio, das dieser Guard auseinanderhalten soll:
+    # fehlend / kaputt / leer. Ein VERZEICHNIS an dieser Stelle existiert (-e),
+    # ist lesbar (-r) und nicht leer (-s) - es kaeme also durch, und xargs
+    # bekaeme null Chunks bei rc 0. Genau die Verwechslung, gegen die die
+    # beiden Zeilen darueber stehen.
+    [ -f "$_ListFile" ] || w2u_die "Chunkliste $_ListFile ist keine regulaere Datei - ein Verzeichnis kaeme sonst als 'leere Liste' durch"
     [ -s "$_ListFile" ] || return 0
 
     # _ParSrc/_ParDst statt _SrcUrl/_DstRoot: der Worker uebertraegt von der
@@ -571,7 +678,16 @@ w2u_run_list() {
     # w2u_run_chunk laesse jeden Chunk ohne Ergebniszeile scheitern.
     export _RsyncBin _ParSrc _ParDst _LogDir _ResultFile _MaxRetry _RetryPause _ExcludeFrom _RsyncTimeout
     export -f w2u_run_chunk w2u_die w2u_log
-    xargs -P "$_Jobs" -S 4096 -I {} "${BASH:-bash}" -c 'w2u_run_chunk "$1"' _ {} < "$_ListFile" || _Rc=$?
+    # Einmal je Phase nachsehen, ob dieses xargs "-S" kennt (siehe oben).
+    # "true" statt eines echten Kommandos: der Probelauf darf nichts tun, nur
+    # das Optionen-Parsen ausloesen. Ein fehlendes xargs (rc 127) landet
+    # ebenfalls im GNU-Zweig - der echte Aufruf unten scheitert dann ohnehin,
+    # und zwar sichtbar.
+    _XargsRepl=( )
+    if printf 'x\n' | xargs -S 4096 -I {} true >/dev/null 2>&1; then
+        _XargsRepl=( -S 4096 )      # BSD: hebt die 255-Byte-Grenze der -I-Ersetzung
+    fi                              # GNU: kennt -S nicht und hat die Grenze nicht
+    xargs -P "$_Jobs" ${_XargsRepl[@]+"${_XargsRepl[@]}"} -I {} "${BASH:-bash}" -c 'w2u_run_chunk "$1"' _ {} < "$_ListFile" || _Rc=$?
     if [ "$_Rc" -ne 0 ]; then
         w2u_warn "xargs endete mit rc $_Rc - w2u_run_chunk selbst liefert immer 0, also ist mindestens ein Worker vorzeitig gestorben. Bei Signal-Tod (z.B. OOM) und bei Exit 255 liest xargs die Liste danach NICHT weiter."
         # Der Abgleich gehoert hierher und nirgendwo sonst: dies ist die einzige
@@ -904,6 +1020,20 @@ w2u_sweep() {
 # Struktur-Verify (Spec 5.7): ein Trockenlauf, dessen Erwartung LEERE Ausgabe
 # ist. Jede Zeile ist ein Befund, rc 1 heisst "nicht sauber".
 #
+# ANNAHME, die diese Schicht ueberhaupt zu einer Schicht macht: rc 0 plus leere
+# Ausgabe heisst "Quelle und Ziel sind gleich". Sie steht auf zwei Beinen -
+# der rc sagt, dass der Vergleich WIRKLICH GELAUFEN ist, die leere Ausgabe, dass
+# er NICHTS GEFUNDEN hat. Beide werden unten geprueft, und deshalb sind es zwei
+# Beine und nicht eines.
+# WAS SIE BRICHT: (1) ein verworfener rc - ein abgestuerzter Vergleichslauf hat
+# ebenfalls leere Ausgabe, und "nicht gelaufen" saehe dann aus wie "gleich";
+# (2) ein "-i", das nichts itemisiert (eine kuenftige rsync-Variante, ein
+# --out-format daneben) - dann ist die Ausgabe immer leer und die Schicht immer
+# "sauber", also wertlos, ohne dass irgendetwas fehlschlaegt. Gegen (1) steht
+# die rc-Pruefung unten, gegen (2) der NEGATIVTEST in tests/test_verify.sh: er
+# stellt einen unvollstaendigen Transfer her und verlangt Befunde. Eine
+# Verifikation, die nicht nachweislich fehlschlagen KANN, beweist nichts.
+#
 # Gefiltert wird AUSSCHLIESSLICH die mtime der Wurzel selbst ("./"): sie ist
 # systematisch (das Ziel ist oft ein Mountpunkt, dessen mtime nicht gesetzt
 # werden kann) und harmlos. Wer pauschal alle .d-Zeilen wegwirft, wirft jeden
@@ -932,7 +1062,13 @@ w2u_sweep() {
 # statt vernichteter Daten.
 w2u_verify() {
     local _Args _List _Rc=0 _GrepRc=0
-    _List="$(mktemp "${TMPDIR:-/tmp}/w2u.verify.XXXXXXXX" 2>/dev/null)" || _List=""
+    # In $_TmpDir, nicht direkt in $TMPDIR: nur $_TmpDir raeumt w2u_cleanup weg.
+    # Ein Ctrl-C mitten im Vergleichslauf liess diese Datei sonst liegen - und
+    # sie ist genau dann GROSS, wenn etwas schiefging (ein gescheiterter
+    # Transfer itemisiert JEDE Datei, das sind schnell zweistellige MB). Der
+    # Rueckfall auf $TMPDIR bleibt: gesourcte Aufrufer (Tests) haben kein
+    # $_TmpDir, und ohne Arbeitsdatei gaebe es hier gar keinen Verify.
+    _List="$(mktemp "${_TmpDir:-${TMPDIR:-/tmp}}/w2u.verify.XXXXXXXX" 2>/dev/null)" || _List=""
     if [ -z "$_List" ]; then
         printf 'VERIFY NICHT MOEGLICH: keine Arbeitsdatei fuer die Ausgabe des Vergleichslaufs anlegbar\n'
         return 1
@@ -981,7 +1117,9 @@ w2u_verify() {
 # Filtersemantik von --list-only ist kein Beweis, siehe w2u_report).
 w2u_count_remote() {
     local _List _Args _Rc=0 _Cnt="" _Seen=""
-    _List="$(mktemp "${TMPDIR:-/tmp}/w2u.remotelist.XXXXXXXX" 2>/dev/null)" || _List=""
+    # In $_TmpDir (Grund siehe w2u_verify): nur das raeumt w2u_cleanup weg, und
+    # das Listing eines grossen Baums hat leicht hunderttausende Zeilen.
+    _List="$(mktemp "${_TmpDir:-${TMPDIR:-/tmp}}/w2u.remotelist.XXXXXXXX" 2>/dev/null)" || _List=""
     if [ -z "$_List" ]; then
         printf '%s\n' ""
         return 0
@@ -1017,7 +1155,7 @@ w2u_count_remote() {
 # kleine Zahl; die duerfte nie als Messwert durchgehen.
 #
 # $_LogDir wird ausgeschlossen. Seit Task 9 liegt es per Vorgabe NICHT mehr
-# unter dem Ziel (eigenes mktemp-Verzeichnis, CONTROLLER-RULING 3), und ein
+# unter dem Ziel (eigenes mktemp-Verzeichnis), und ein
 # per --log-dir angegebenes unterhalb des Ziels lehnt w2u_preflight ab - der
 # Ausschluss hier ist also heute ein Guertel zum Hosentraeger und kein
 # tragender Teil. Er bleibt trotzdem stehen: laege das Logverzeichnis je wieder
@@ -1033,7 +1171,8 @@ w2u_count_local() {
         printf '%s\n' ""
         return 0
     fi
-    _List="$(mktemp "${TMPDIR:-/tmp}/w2u.locallist.XXXXXXXX" 2>/dev/null)" || _List=""
+    # In $_TmpDir, gleicher Grund wie in w2u_verify und w2u_count_remote.
+    _List="$(mktemp "${_TmpDir:-${TMPDIR:-/tmp}}/w2u.locallist.XXXXXXXX" 2>/dev/null)" || _List=""
     if [ -z "$_List" ]; then
         printf '%s\n' ""
         return 0
@@ -1047,11 +1186,120 @@ w2u_count_local() {
     return 0
 }
 
+# Namensvergleich Quelle <-> Ziel. Aufruf: w2u_name_diff <ausgabedatei>.
+# rc 0 = der Vergleich stand; rc 1 = nicht ermittelbar (dann sagt der Bericht
+# genau das - eine leere Ausgabedatei darf NIE als "keine Unterschiede" gelesen
+# werden, das ist dieselbe Verwechslung wie ueberall sonst hier).
+#
+# Warum es diese Funktion gibt (Fund im Abschluss-Review, an einem echten
+# Daemon nachgemessen): ein "pkill -9" auf den Empfaenger laesst rsyncs
+# Temp-Datei ".big.bin.AoO9Ya" im Ziel liegen - bei einem gewoehnlichen TERM
+# wird sie umbenannt, bei -9 nicht. Der naechste, voellig saubere Lauf holt die
+# echte Datei und laesst die Waise daneben stehen: w2u_count_local zaehlt sie
+# mit, w2u_count_remote kann sie nicht sehen, und der Bericht meldete
+# "ABWEICHUNG in der Dateizahl" mit einer nackten Zahl - dauerhaft, bei jeder
+# Wiederholung, ohne jeden Hinweis WELCHE Datei ueberzaehlig ist. Und die
+# Wiederaufnahme nach einem harten Abbruch ist eine harte Zusage (Spec 1.3).
+#
+# Ausgabe je Zeile, Klasse<TAB>modul-relativer Pfad:
+#   R  nur in der QUELLE - eine echte Fehlstelle, das Ziel ist unvollstaendig
+#   T  nur am ZIEL, in der Form einer rsync-Temp-Datei (".<name>.XXXXXX") UND
+#      <name> existiert in der Quelle: die Waise eines abgebrochenen Laufs
+#   L  nur am ZIEL, alles andere - unerklaerte ueberzaehlige Datei
+# Die Trennung T/L ist der ganze Punkt: nur T darf entschuldigt werden, und die
+# Zusatzbedingung "<name> existiert in der Quelle" ist es, die eine echte
+# Nutzerdatei wie ".hidden.abcdef" (Temp-FORM, aber ohne Original) in L haelt.
+#
+# Verglichen wird mit GENAU denselben Filtern wie die beiden Zaehlfunktionen:
+# remote "^-" (nur regulaere Dateien, Symlinks sind "l"), lokal "-type f", und
+# derselbe -prune auf $_LogDir. Jede Abweichung davon erzeugte Unterschiede,
+# die keine sind - ein falsches FAIL aus dem Messwerkzeug selbst.
+#
+# ANNAHME: kein Dateiname enthaelt einen Zeilenumbruch (beide Listen sind
+# zeilenweise). WAS SIE BRICHT: nichts, was hier vorkommt - NTFS-Namen aus
+# Windows-Anwendungen haben keine Zeilenumbrueche, und der Dateizahl-Vergleich
+# daneben ist gegen dieselbe Annahme blind.
+w2u_name_diff() {
+    local _Out="$1" _Rem="" _Loc="" _Args _Rc=0
+    [ -n "$_Out" ] || return 1
+    [ -n "$_DstRoot" ] || return 1
+    [ -d "$_DstRoot" ] || return 1
+    _Rem="$(mktemp "${_TmpDir:-${TMPDIR:-/tmp}}/w2u.nd-remote.XXXXXXXX" 2>/dev/null)" || _Rem=""
+    _Loc="$(mktemp "${_TmpDir:-${TMPDIR:-/tmp}}/w2u.nd-local.XXXXXXXX" 2>/dev/null)" || _Loc=""
+    if [ -z "$_Rem" ] || [ -z "$_Loc" ]; then
+        rm -f "$_Rem" "$_Loc"
+        return 1
+    fi
+    _Args=( -r --list-only "--timeout=$_RsyncTimeout" )
+    # Der Ausschluss-Arm ist heute NICHT erreichbar: der einzige Aufrufer steht
+    # im else-Zweig hinter "[ -n "$_ExcludeFrom" ]", auf diesem Pfad sind die
+    # Ausschluesse also immer leer. Er bleibt trotzdem stehen, weil er zur
+    # Bedingung gehoert, unter der dieser Vergleich ueberhaupt stimmt: WENN je
+    # mit Ausschluessen verglichen wird, muessen sie fuer beide Seiten gelten -
+    # sonst waere jede ausgeschlossene Datei eine Fehlstelle. Wer das Tor
+    # verschiebt, soll den Arm schon vorfinden und nicht erst den Fehler.
+    [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
+    "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" > "$_Rem" 2>/dev/null || _Rc=$?
+    if [ "$_Rc" -eq 0 ]; then
+        find "$_DstRoot" -path "${_LogDir%/}" -prune -o -type f -print > "$_Loc" 2>/dev/null || _Rc=$?
+    fi
+    if [ "$_Rc" -eq 0 ]; then
+        # Unterschieden wird ueber FILENAME, nicht ueber "NR == FNR" - dieselbe
+        # Begruendung wie in w2u_run_list und w2u_report: die Abkuerzung bricht
+        # genau dann, wenn die erste Datei leer ist.
+        # Keine Intervall-Quantoren im Muster: BSD-awk kann sie nicht, deshalb
+        # stehen die sechs Zeichen des rsync-Suffixes ausgeschrieben da.
+        awk -v _RemFile="$_Rem" -v _Root="$_DstRoot" '
+            BEGIN {
+                _Skip = length(_Root) + 2
+                if (substr(_Root, length(_Root)) == "/") { _Skip = length(_Root) + 1 }
+            }
+            FILENAME == _RemFile {
+                sub(/\r$/, "")
+                if (substr($0, 1, 1) != "-") { next }
+                if (match($0, / [0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] /) == 0) { next }
+                _N = substr($0, RSTART + RLENGTH)
+                if (_N != "" && _N != ".") { _R[_N] = 1 }
+                next
+            }
+            {
+                _P = substr($0, _Skip)
+                if (_P == "") { next }
+                _L[_P] = 1
+                if (_P in _R) { next }
+                _D = ""
+                _B = _P
+                if (_P ~ /\//) {
+                    _D = _P
+                    sub(/\/[^\/]*$/, "/", _D)
+                    sub(/^.*\//, "", _B)
+                }
+                if (_B ~ /^\.[^\/]*\.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]$/) {
+                    _Orig = substr(_B, 2, length(_B) - 8)
+                    if ((_D _Orig) in _R) {
+                        printf "T\t%s\n", _P
+                        next
+                    }
+                }
+                printf "L\t%s\n", _P
+            }
+            END {
+                for (_K in _R) {
+                    if (!(_K in _L)) { printf "R\t%s\n", _K }
+                }
+            }
+        ' "$_Rem" "$_Loc" > "$_Out" || _Rc=$?
+    fi
+    rm -f "$_Rem" "$_Loc"
+    [ "$_Rc" -eq 0 ] || return 1
+    return 0
+}
+
 # Abschlussbericht. Das PASS/FAIL-Kriterium ist explizit, weil daran haengt, ob
 # die Quelle verschrottet werden darf.
 #
-# CONTROLLER-RULING 1: die Ergebniszeilen werden gegen die CHUNKLISTE
-# abgeglichen, nicht nur untereinander ausgewertet. w2u_run_chunk gibt bewusst
+# Die Ergebniszeilen werden gegen die CHUNKLISTE abgeglichen, nicht nur
+# untereinander ausgewertet. w2u_run_chunk gibt bewusst
 # IMMER 0 zurueck, damit ein kaputter Chunk keinen Terabyte-Transfer abbricht -
 # die Ergebnisdatei ist damit die einzige Stelle, an der ein Fehlschlag je
 # sichtbar wird. Wer nur die Zeilen auswertet, DIE DA SIND, kann einen Chunk
@@ -1064,7 +1312,7 @@ w2u_count_local() {
 # Zeilen fuer chunk.aa und keine fuer chunk.ab ergeben exakt die Zeilenzahl
 # eines sauberen Laufs.
 #
-# CONTROLLER-RULING 2: $_TmpDir/chunks.rest wird hier NICHT gelesen - weder als
+# $_TmpDir/chunks.rest wird hier NICHT gelesen - weder als
 # Quelle der Chunkzahl noch sonst. Die Datei entsteht nur im Auto-Messungs-Pfad
 # von w2u_run_all, im "--jobs N"-Pfad nie, und niemand entfernt eine alte aus
 # einem frueheren Lauf im selben Arbeitsverzeichnis; sie waere im schlimmsten
@@ -1084,6 +1332,7 @@ w2u_report() {
     local _Missing="" _Dupes="" _Unknown="" _Recon=""
     local _ResultState="ok" _ListState="ok"
     local _Dur=-1 _Now _Remote="" _Local="" _Rc=0 _Detail=0 _Binding=0
+    local _NdFile="" _NdRc=0 _NdMiss=0 _NdOrph=0 _NdExtra=0 _GrowFiles=""
 
     # ---- Ergebnisdatei: existiert / lesbar / auswertbar? --------------------
     # "existiert nicht" und "ist leer" duerfen nicht zusammenfallen (gleiche
@@ -1148,7 +1397,7 @@ w2u_report() {
         fi
     fi
 
-    # ---- Abgleich Chunkliste <-> Ergebniszeilen (Ruling 1) -----------------
+    # ---- Abgleich Chunkliste <-> Ergebniszeilen ---------------------------
     # Ein Durchlauf ueber beide Dateien. Unterschieden wird ueber FILENAME und
     # nicht ueber das uebliche "NR == FNR": diese Abkuerzung bricht genau dann,
     # wenn die Ergebnisdatei LEER ist - also im Fall, in dem am meisten fehlt.
@@ -1382,17 +1631,145 @@ w2u_report() {
             # Erst hier wurden zwei belastbare Zahlen wirklich verglichen.
             _Binding=1
             if [ "$_Remote" != "$_Local" ]; then
-                printf '   ABWEICHUNG in der Dateizahl!\n'
-                _Fail=1
+                # Ab hier wird die Zahl zu NAMEN aufgeloest. Zwei Gruende, und
+                # der zweite ist der eigentliche:
+                # 1) Eine nackte Zahl ist als Diagnose nutzlos - der Anwender
+                #    weiss nicht, welche Datei fehlt oder ueberzaehlig ist, und
+                #    genau das braucht er, bevor er die Quelle verschrottet.
+                # 2) Eine rsync-Temp-Datei aus einem hart abgebrochenen Lauf
+                #    (nachgemessen: "pkill -9" laesst ".big.bin.AoO9Ya" liegen)
+                #    machte JEDEN spaeteren, vollstaendigen Lauf dauerhaft zum
+                #    FAIL. Ein falsches FAIL auf dem dokumentierten
+                #    Wiederaufnahme-Weg (Spec 1.3) ist kein Schoenheitsfehler:
+                #    es ist die Meldung, die niemand mehr wegbekommt.
+                # Der zusaetzliche Listing-Lauf kostet Zeit - er laeuft nur auf
+                # diesem Zweig, also nur wenn ohnehin etwas nicht stimmt.
+                _NdFile="${_TmpDir:-${TMPDIR:-/tmp}}/w2u.namediff.$$"
+                _NdRc=0
+                w2u_name_diff "$_NdFile" || _NdRc=$?
+                if [ "$_NdRc" -ne 0 ]; then
+                    # Nicht ermittelbar ist nicht "in Ordnung": die Abweichung
+                    # steht, nur ihr Grund bleibt offen.
+                    printf '   ABWEICHUNG in der Dateizahl!\n'
+                    printf '   Welche Dateien abweichen, liess sich NICHT ermitteln - Abweichung bleibt bestehen.\n'
+                    _Fail=1
+                else
+                    _NdMiss="$(awk -F'\t' '$1 == "R" { _N++ } END { print _N + 0 }' "$_NdFile")" || _NdMiss=""
+                    _NdOrph="$(awk -F'\t' '$1 == "T" { _N++ } END { print _N + 0 }' "$_NdFile")" || _NdOrph=""
+                    _NdExtra="$(awk -F'\t' '$1 == "L" { _N++ } END { print _N + 0 }' "$_NdFile")" || _NdExtra=""
+                    # "x" trennt die drei Felder: ohne Trenner wuerde ein
+                    # leeres Feld einfach verschwinden (""+"0"+"0" = "00",
+                    # rein numerisch) und der Guard bliebe stumm - genau das
+                    # ist der Bug, den dieser case abfangen soll.
+                    case "x${_NdMiss}x${_NdOrph}x${_NdExtra}" in
+                        *xx*|*[!0-9x]*)
+                            printf '   ABWEICHUNG in der Dateizahl!\n'
+                            printf '   Welche Dateien abweichen, liess sich NICHT auswerten - Abweichung bleibt bestehen.\n'
+                            _Fail=1
+                            _NdMiss=0; _NdOrph=0; _NdExtra=0
+                            ;;
+                    esac
+                    # Die Ueberschrift steht VOR den Listen, aber nur wenn die
+                    # Abweichung wirklich eine ist: eine abgebrochene
+                    # Temp-Datei allein soll keinen Bericht "ABWEICHUNG" rufen
+                    # lassen, den der Anwender dann drei Zeilen weiter
+                    # entkraeftet findet. Deshalb erst zaehlen, dann drucken.
+                    if [ "$_NdMiss" -gt 0 ] || [ "$_NdExtra" -gt 0 ] \
+                       || { [ "$_NdMiss" -eq 0 ] && [ "$_NdExtra" -eq 0 ] && [ "$_NdOrph" -eq 0 ]; }; then
+                        printf '   ABWEICHUNG in der Dateizahl!\n'
+                    fi
+                    if [ "$_NdMiss" -gt 0 ]; then
+                        printf '   %s Datei(en) FEHLEN am Ziel:\n' "$_NdMiss"
+                        awk -F'\t' '$1 == "R" && _N < 20 { printf "     %s\n", $2; _N++ }' "$_NdFile" \
+                            || printf '     (Liste konnte nicht gelesen werden)\n'
+                        if [ "$_NdMiss" -gt 20 ]; then
+                            printf '     ... und %s weitere\n' "$((_NdMiss - 20))"
+                        fi
+                        _Fail=1
+                    fi
+                    if [ "$_NdExtra" -gt 0 ]; then
+                        printf '   %s Datei(en) am Ziel OHNE Gegenstueck in der Quelle:\n' "$_NdExtra"
+                        awk -F'\t' '$1 == "L" && _N < 20 { printf "     %s\n", $2; _N++ }' "$_NdFile" \
+                            || printf '     (Liste konnte nicht gelesen werden)\n'
+                        if [ "$_NdExtra" -gt 20 ]; then
+                            printf '     ... und %s weitere\n' "$((_NdExtra - 20))"
+                        fi
+                        _Fail=1
+                    fi
+                    if [ "$_NdOrph" -gt 0 ]; then
+                        # Die einzige entschuldigte Klasse - und sie wird
+                        # NAMENTLICH genannt, jede einzelne. Entschuldigt wird
+                        # nur, was die Form einer rsync-Temp-Datei hat UND
+                        # dessen Originaldatei in der Quelle steht; alles andere
+                        # steht oben unter L und faellt durch.
+                        printf '   %s abgebrochene rsync-Temp-Datei(en) am Ziel - NICHT als Abweichung gewertet:\n' "$_NdOrph"
+                        awk -F'\t' '$1 == "T" && _N < 20 { printf "     %s\n", $2; _N++ }' "$_NdFile" \
+                            || printf '     (Liste konnte nicht gelesen werden)\n'
+                        if [ "$_NdOrph" -gt 20 ]; then
+                            printf '     ... und %s weitere\n' "$((_NdOrph - 20))"
+                        fi
+                        printf '     Sie stammen aus einem hart abgebrochenen Lauf (die Originaldatei ist da).\n'
+                        printf '     Nach dem Bericht loeschbar; hier zaehlt sie nicht gegen die Vollstaendigkeit.\n'
+                    fi
+                    if [ "$_NdMiss" -eq 0 ] && [ "$_NdExtra" -eq 0 ] && [ "$_NdOrph" -eq 0 ]; then
+                        # Zahlen verschieden, Namen deckungsgleich: dann hat
+                        # sich zwischen den beiden Zaehlungen etwas geaendert
+                        # (jemand schreibt noch dorthin) - kein Freispruch.
+                        printf '   Die Zahlen gehen auseinander, die Namen aber nicht - schreibt noch jemand an Quelle oder Ziel?\n'
+                        _Fail=1
+                    fi
+                fi
+                rm -f "$_NdFile"
             fi
         fi
     else
         printf ' Dateizahl       : Vergleich uebersprungen (--no-verify)\n'
     fi
 
-    # CONTROLLER-RULING 2 (Task 8, umgesetzt in Task 9): der Ausgang des
-    # Vergleichslaufs gehoert in das BERICHTSERGEBNIS, nicht nur in den
-    # Exit-Code von main(). Wer ihn dort mit "|| true" verwirft, laesst diesen
+    # ---- Widerspruch: alle Chunks melden Erfolg, am Ziel liegt nichts -------
+    # Die eine Tuer, die --no-verify noch offen laesst: dort setzt die
+    # Chunk-Buchfuehrung allein "_Binding=1", ein PASS heisst dann nur "jeder
+    # Chunk hat rc 0 gemeldet" - und genau dieses Signal hat in diesem Projekt
+    # gelogen (openrsync liefert rc 0 und uebertraegt nichts, siehe Kopf bei
+    # _SrcRoot). Ein Widerspruch ist kein PASS, also gehoert er hierher.
+    #
+    # Zwei Bedingungen MUESSEN zusammenkommen, sonst waere das ein falsches FAIL
+    # auf einem voellig normalen Weg:
+    #   - das Ziel ist um NULL KB gewachsen, UND
+    #   - am Ziel steht keine einzige regulaere Datei.
+    # Die zweite Bedingung ist es, die die Wiederaufnahme rettet: ein zweiter
+    # Lauf ueber einen vollstaendigen Zielbaum uebertraegt legitim null Bytes -
+    # dort liegen aber Dateien, und der Lauf bleibt PASS. Trockenlauf und
+    # --verify-only sind ausgenommen (sie uebertragen nichts, das ist kein
+    # Widerspruch, sondern ihr Zweck).
+    #
+    # "$_Local" wird wiederverwendet, wenn der Bericht die Zahl schon hat, sonst
+    # neu ermittelt - unter --no-verify ist sie leer, und leer heisst "nicht
+    # ermittelbar". Auf einer LEEREN Zeichenkette ist der Vergleich mit "0"
+    # falsch, die Pruefung schweigt dann also: keine Aussage statt einer
+    # erfundenen. Verlassen darf sich darauf niemand, deshalb steht es hier.
+    #
+    # ANNAHME: eine Quelle enthaelt mindestens eine regulaere Datei. WAS SIE
+    # BRICHT: ein Quellbaum aus ausschliesslich leeren Verzeichnissen - der
+    # bekaeme hier ein falsches FAIL. Bewusst so: dieser Baum ist pathologisch,
+    # und die Richtung des Irrtums ist die richtige.
+    if [ "$_VerifyOnly" != "1" ] && [ "$_DryRun" != "1" ] && [ "$_ParMode" = "parallel" ] \
+       && [ "$_ResultState" = "ok" ] && [ "$_ListState" = "ok" ] \
+       && [ "$_Lines" -gt 0 ] && [ "$_Bad" -eq 0 ] && [ "$_Malformed" -eq 0 ] \
+       && [ -n "$_ParKbBefore" ] && [ -n "$_ParKbAfter" ] && [ "$_ParKbAfter" -le "$_ParKbBefore" ]; then
+        _GrowFiles="$_Local"
+        [ -n "$_GrowFiles" ] || _GrowFiles="$(w2u_count_local)"
+        if [ "$_GrowFiles" = "0" ]; then
+            printf '\n WIDERSPRUCH: alle %s Chunks melden rc 0, aber die parallele Phase hat NICHTS ans Ziel gebracht\n' "$_Lines"
+            printf '   (Ziel davor %s KB, danach %s KB, und keine einzige Datei am Ziel).\n' "$_ParKbBefore" "$_ParKbAfter"
+            printf '   Ein rc 0 ohne uebertragene Daten ist in diesem Projekt gemessen worden -\n'
+            printf '   "jeder Chunk meldet Erfolg" ist damit allein kein Nachweis.\n'
+            _Fail=1
+        fi
+    fi
+
+    # Der Ausgang des Vergleichslaufs gehoert in das BERICHTSERGEBNIS, nicht
+    # nur in den Exit-Code von main(). Wer ihn dort mit "|| true" verwirft, laesst diesen
     # Bericht "PASS - Transfer vollstaendig" drucken, NACHDEM der Verify
     # Befunde ausgegeben hat - und PASS ist hier die Freigabe, die
     # Quellmaschine zu verschrotten.
@@ -1400,11 +1777,10 @@ w2u_report() {
     # Bewusst KEIN "_Binding=1": ein Verify OHNE Befunde ist keine Schicht, die
     # dieser Bericht allein tragen kann. Er lief mit derselben Filtersemantik,
     # an der schon der Dateizahl-Vergleich sein Urteil verliert, sobald
-    # Ausschluesse aktiv sind - und genau darauf beruht Ruling 5 (der Fall
-    # "--verify-only + --exclude-from" hat KEINE bindende Schicht und wird
-    # deshalb in der CLI abgelehnt). Diese Schicht darf also FAIL setzen, aber
-    # nie allein ein PASS tragen. Wer hier "_Binding=1" ergaenzt, hebt Ruling 5
-    # still auf.
+    # Ausschluesse aktiv sind - und genau darauf beruht die Ablehnung von
+    # "--verify-only + --exclude-from" im Parser (dieser Fall hat KEINE bindende
+    # Schicht). Diese Schicht darf also FAIL setzen, aber nie allein ein PASS
+    # tragen. Wer hier "_Binding=1" ergaenzt, hebt jene Ablehnung still auf.
     case "$_VerifyState" in
         befunde)
             printf ' Verify          : BEFUNDE - Quelle und Ziel sind NICHT gleich (%s/verify.log)\n' "${_LogDir%/}"
@@ -1417,6 +1793,20 @@ w2u_report() {
             :
             ;;
     esac
+    # WAS verglichen wurde, gehoert dazu. "Vergleichslauf ohne Befunde" stand
+    # bisher gleichlautend da, egal ob mit oder ohne --checksum - und der
+    # Unterschied ist erheblich: ohne -c vergleicht rsync Groesse und
+    # Zeitstempel, eine inhaltlich veraenderte Datei GLEICHER Groesse und
+    # Zeit faellt dabei nicht auf (mit -c faellt sie auf, an openrsync
+    # nachgemessen). Wer den Bericht spaeter liest, muss wissen, welche der
+    # beiden Aussagen er in der Hand hat.
+    if [ -n "$_VerifyState" ]; then
+        if [ "$_DoChecksum" = "1" ]; then
+            printf '   Verglichen wurden INHALTE (Pruefsummen), dazu Groesse und Zeitstempel.\n'
+        else
+            printf '   Verglichen wurden nur Groesse und Zeitstempel, NICHT die Inhalte (dafuer --checksum).\n'
+        fi
+    fi
 
     # DIE REGEL, positiv formuliert und an genau EINER Stelle (Re-Review Task 8):
     # PASS setzt mindestens eine BINDENDE Beweisschicht voraus. Bindend ist eine
@@ -1430,6 +1820,19 @@ w2u_report() {
     # PRODUKTE zweier je einzeln gepruefter Formen; die naechste Kombination
     # waere wieder eine gewesen. Wer hier eine Schicht hinzufuegt, muss nur an
     # der Stelle, an der sie wirklich vergleicht, "_Binding=1" setzen.
+    #
+    # ANNAHME dieser Regel: "_Binding=1" wird NUR dort gesetzt, wo wirklich
+    # verglichen wurde - nicht dort, wo ein Vergleich angestossen oder geplant
+    # wurde. Genau zwei Stellen setzen es heute: der Namensabgleich der
+    # Chunk-Buchfuehrung und der Dateizahl-Vergleich mit zwei belastbaren
+    # Zahlen. WAS SIE BRICHT: ein "_Binding=1" vor einer Pruefung statt nach
+    # ihr, oder eines an einer Schicht, die FAIL setzen kann aber kein PASS
+    # tragen darf (der Verify - siehe die Begruendung dort). Der Bruch ist
+    # lautlos: dieser Bericht meldete dann PASS fuer einen Lauf, der nichts
+    # geprueft hat, und PASS ist die Freigabe zum Verschrotten der Quelle. Es
+    # gibt keinen Test, der ein falsches "_Binding=1" allgemein faengt -
+    # gepinnt sind nur die bekannten Kombinationen. Diese Zeile ist deshalb
+    # eine Stelle, an der man nicht "aufraeumt".
     if [ "$_Binding" -eq 0 ]; then
         _Fail=1
         printf '\n KEINE Beweisschicht war bindend - PASS waere eine Behauptung.\n'
@@ -1489,8 +1892,8 @@ w2u_take_arg() {
 #    allein am Dateizahl-Vergleich - und faellt der auch weg (--no-verify, oder
 #    --exclude-from, das ihn zu einer blossen Orientierung macht), bleibt keine
 #    bindende Beweisschicht und der Lauf koennte nur FAIL melden. Dieselbe Lage
-#    wie bei Ruling 5, nur aus anderen Faktoren: also gleich ablehnen statt nach
-#    Stunden FAIL zu melden.
+#    wie bei "--verify-only + --exclude-from", nur aus anderen Faktoren: also
+#    gleich ablehnen statt nach Stunden FAIL zu melden.
 # 3) --verify-only ist ausgenommen: dieser Modus uebertraegt ohnehin nichts, die
 #    Aufrufform spielt dort keine Rolle.
 w2u_einstroemig() {
@@ -1567,6 +1970,23 @@ w2u_parse_args() {
     case "$_JobCnt" in
         ''|*[!0-9]*) w2u_die "--jobs braucht eine Zahl, bekam: $_JobCnt" ;;
     esac
+    if [ "$_JobCnt" -gt "$_JobsMax" ]; then
+        w2u_die "--jobs $_JobCnt ist zu viel (Obergrenze $_JobsMax): es wuerden $_JobCnt rsync-Prozesse gleichzeitig auf EINE alte Windows-Kiste losgehen. Die Auto-Messung eskaliert bis 8; alles darueber ist Handarbeit, und ab hier ist es ein Tippfehler."
+    fi
+    # Spec 5.3: SCHWELLE = 4 * P_max, und P_max ist "Vorgabe 8 ODER der Wert aus
+    # --jobs". Genau diese zweite Haelfte fehlte (Fund im Abschluss-Review):
+    # _JobCnt setzte nur die Zahl der Worker, waehrend Zerlegungsschwelle und
+    # Chunkgroesse weiter mit 8 rechneten. Nachgerechnet an der gemessenen
+    # Datenlage (Fall A, 308 Arbeitspakete) ergab "--jobs 32" damit 31 Chunks -
+    # WENIGER Chunks als Worker, also mindestens ein Worker ohne Arbeit und kein
+    # Work-Stealing mehr. Genau das, was die Formel aus Spec 5.5 verhindern
+    # soll. Mit angehobenem _PMax sind es 103 Chunks auf 32 Worker.
+    # Nur ANHEBEN, nie senken: "--jobs 2" darf die Zerlegung nicht groeber
+    # machen als die Vorgabe - grobe Chunks sind der Weg zurueck zum Fall
+    # "4 Chunks fuer 8 Worker", von dem w2u_chunk handelt.
+    if [ "$_JobCnt" -gt "$_PMax" ]; then
+        _PMax="$_JobCnt"
+    fi
     case "$_SrcUrl" in
         rsync://*) : ;;
         *) w2u_die "Quelle muss mit rsync:// beginnen, bekam: $_SrcUrl" ;;
@@ -1670,16 +2090,15 @@ w2u_parse_args() {
 
     # ---- Flag-Kombinationen: ABGELEHNT ------------------------------------
     if [ "$_VerifyOnly" -eq 1 ] && [ "$_DoVerify" -eq 0 ]; then
-        # CONTROLLER-RULING 4.1: nachgewiesenes Loch. Der eine Lauf soll NUR
-        # pruefen, der andere gar nicht - zusammen bleibt weder
-        # Chunk-Buchfuehrung noch Dateizahl-Vergleich, also keine bindende
-        # Beweisschicht. w2u_report riegelt das seit Task 8 zusaetzlich ab;
+        # Nachgewiesenes Loch. Der eine Lauf soll NUR pruefen, der andere gar
+        # nicht - zusammen bleibt weder Chunk-Buchfuehrung noch
+        # Dateizahl-Vergleich, also keine bindende Beweisschicht. w2u_report riegelt das seit Task 8 zusaetzlich ab;
         # hier soll die sinnlose Kombination gar nicht erst starten.
         w2u_die "--verify-only und --no-verify widersprechen sich: der eine Lauf soll NUR pruefen, der andere gar nicht. Uebrig bliebe ein Lauf ohne jede bindende Beweisschicht - der Bericht koennte nur FAIL melden. Eines von beiden weglassen."
     fi
     if [ "$_VerifyOnly" -eq 1 ] && [ -n "$_ExcludeFrom" ]; then
-        # CONTROLLER-RULING 5: bei aktiven Ausschluessen ist der
-        # Dateizahl-Vergleich nur orientierend und damit nicht bindend; ohne
+        # Bei aktiven Ausschluessen ist der Dateizahl-Vergleich nur
+        # orientierend und damit nicht bindend; ohne
         # Uebertragung gibt es zugleich keine Chunk-Buchfuehrung. Der Lauf
         # koennte nach der ganzen Pruefzeit nur FAIL melden - und dieses FAIL
         # saegte nichts ueber die Daten aus.
@@ -1731,7 +2150,7 @@ w2u_parse_args() {
 # "<ziel>/foo/../Archiv/logs" saehe fuer den Vergleich nach "ausserhalb" aus,
 # waehrend "mkdir -p" es anschliessend INNERHALB des verglichenen Baums anlegt -
 # der Lauf uebertraegt Stunden und faellt am Ende am Dateizahl-Vergleich auf
-# FAIL (Ruling 3). Umgekehrt wuerde "<ziel>/Archiv/x/../../aussen" grundlos
+# FAIL (Logdateien im verglichenen Baum). Umgekehrt wuerde "<ziel>/Archiv/x/../../aussen" grundlos
 # abgelehnt, obwohl es kanonisch draussen liegt. Und ".." ist kein Sonderfall
 # fuer Bastler: "--log-dir ../logs" ist der normale Aufruf aus einem
 # Arbeitsverzeichnis heraus.
@@ -1744,7 +2163,7 @@ w2u_parse_args() {
 # wirklich noch nicht existierende Rest wird rein rechnerisch behandelt.
 # Zerlegt wird per Parameter-Expansion statt per IFS-Wortzerlegung: die
 # braeuchte "set -f" gegen Glob-Zeichen im Pfad, und eine Funktion darf die
-# Shell-Optionen ihres Aufrufers nicht anfassen (Ruling aus Task 6).
+# Shell-Optionen ihres Aufrufers nicht anfassen.
 w2u_abs_path() {
     local _P="$1" _Rest _Seg _Cur
     _AbsPath=""
@@ -1792,6 +2211,18 @@ w2u_abs_path() {
 # HIER laut - nicht nach der ersten Stunde Uebertragung.
 w2u_preflight() {
     local _Version _VersionAll _Nl _LogAbs _DstAbs _Rc=0
+    # _RsyncTimeout war der einzige Zahlen-Regler ohne die case-Pruefung, die
+    # die anderen sechs haben. Er landet als "--timeout=$_RsyncTimeout" im argv
+    # von w2u_run_chunk, w2u_sweep, w2u_verify UND w2u_count_remote - deshalb
+    # steht die Pruefung EINMAL hier und nicht viermal dort. Gemessen (Task 7):
+    # ein leerer Wert wird von GNU rsync 3 geschluckt (rc 0, aber kein Timeout
+    # mehr - aus einem haengenden Daemon wird ein Haenger statt eines Retries),
+    # von openrsync abgelehnt (rc 1, JEDER Chunk scheitert). Zwei verschiedene
+    # Fehlerbilder aus einem Konfigurationsfehler, und beide zeigen auf rsync
+    # statt auf die Ursache. Ganz vorne, damit es der erste Satz des Laufs ist.
+    case "$_RsyncTimeout" in
+        ''|*[!0-9]*) w2u_die "_RsyncTimeout ist keine nichtnegative Ganzzahl: '$_RsyncTimeout' - daraus wuerde '--timeout=$_RsyncTimeout' im argv jedes rsync-Aufrufs" ;;
+    esac
     w2u_find_rsync
     # KEIN "| head -1" (nachgemessen, sonst stirbt hier JEDER Lauf): head
     # schliesst die Pipe nach der ersten Zeile, GNU rsync 3.5 schreibt aber
@@ -1821,7 +2252,7 @@ w2u_preflight() {
     "$_RsyncBin" --list-only -d "$_SrcUrl/" >/dev/null 2>&1 \
         || w2u_die "Quelle nicht erreichbar: $_SrcUrl (laeuft START-RSYNC-SERVER.cmd? Port 873 offen?)"
 
-    # CONTROLLER-RULING: verankerte Ausschlussmuster werden ABGELEHNT, nicht
+    # Verankerte Ausschlussmuster werden ABGELEHNT, nicht
     # umgeschrieben.
     #
     # Ausschluesse gelten relativ zur WURZEL DES TRANSFERS. Die ist seit dem
@@ -1885,7 +2316,7 @@ w2u_preflight() {
         [ -d "$_DstRoot" ] || w2u_die "--verify-only, aber am Ziel gibt es nichts zu pruefen: $_DstRoot existiert nicht"
     fi
     # ---- Logverzeichnis ---------------------------------------------------
-    # CONTROLLER-RULING 3: $_LogDir darf NICHT unterhalb von $_DstRoot liegen.
+    # $_LogDir darf NICHT unterhalb von $_DstRoot liegen.
     # Der Bericht vergleicht die Zahl regulaerer Dateien remote gegen lokal;
     # Logdateien im verglichenen Baum sind lokale Dateien ohne Gegenstueck auf
     # der Quelle, und JEDER vollstaendige Lauf fiele falsch auf FAIL. Die
@@ -1932,17 +2363,33 @@ w2u_preflight() {
     # Verzeichnisse anlegt, ist kein Trockenlauf.
     if [ "$_VerifyOnly" -eq 0 ] && [ "$_DryRun" -eq 0 ]; then
         mkdir -p "$_DstRoot"
-        # _ParDst ist per Konstruktion ein VORFAHRE von _DstRoot - bei der
-        # Schraegstrich-Form kann das ein Verzeichnis sein, das der Anwender nie
-        # genannt hat und das die Pruefung oben nie gesehen hat. Dorthin
-        # schreiben die Worker. Was nicht beschreibbar ist, wird nicht
-        # stillschweigend versucht: dann laeuft der Transfer einstroemig, und
-        # der Anwender erfaehrt es.
+        # Geprueft wird, wo die Worker WIRKLICH schreiben - und das ist
+        # $_DstRoot, nicht $_ParDst.
+        #
+        # Fund im Abschluss-Review: hier stand die Pruefung auf $_ParDst, also
+        # auf einem VORFAHREN von $_DstRoot. Die Dateien landen aber unter
+        # "_ParDst/<praefix>", und das IST _DstRoot - eben von "mkdir -p"
+        # angelegt oder schon vorhanden. Schreibrecht auf den Vorfahren braucht
+        # dafuer niemand: existiert die Praefix-Kette, traegt _DstRoot allein.
+        # Der Preis der zu strengen Pruefung war kein Schoenheitsfehler: mit
+        # --no-verify STIRBT w2u_einstroemig (keine bindende Beweisschicht),
+        # ein Lauf, der parallel funktioniert haette, wurde also im Preflight
+        # abgelehnt.
+        #
+        # Der Fall, in dem der Vorfahre wirklich zaehlt - eine noch FEHLENDE
+        # Praefix-Ebene unter einem nicht beschreibbaren Vorfahren - kommt hier
+        # nie an: dann waere schon das "mkdir -p" oben gescheitert und der Lauf
+        # unter dem errexit aus main() dort beendet. Uebrig bleibt genau die
+        # Frage, die zaehlt: darf in _DstRoot geschrieben werden?
+        # ANNAHME: die Praefix-Verzeichnisse zwischen _ParDst und _DstRoot sind
+        # durchquerbar (x-Recht). WAS SIE BRICHT: ein Vorfahre ohne x-Recht -
+        # dann kommt aber auch das "mkdir -p" und der Sweep nicht durch, das
+        # faellt also laut und nicht still aus.
         if [ "$_ParMode" = "parallel" ]; then
-            if [ ! -d "$_ParDst" ] || [ ! -w "$_ParDst" ]; then
+            if [ ! -d "$_DstRoot" ] || [ ! -w "$_DstRoot" ]; then
                 w2u_einstroemig \
-                    "das Ziel der parallelen Phase '$_ParDst' (der Teil von '$_DstRoot' oberhalb von '$_SrcPrefix') ist nicht beschreibbar" \
-                    "Der Zielpfad selbst stimmt bereits - es fehlen die Rechte: entweder '$_ParDst' beschreibbar machen, oder ein Ziel waehlen, dessen entsprechender Vorfahre beschreibbar ist."
+                    "das Zielverzeichnis '$_DstRoot', in das die Worker schreiben, ist nicht beschreibbar" \
+                    "Der Zielpfad selbst stimmt bereits - es fehlen die Rechte: '$_DstRoot' beschreibbar machen."
             fi
         fi
     fi
@@ -1951,7 +2398,7 @@ w2u_preflight() {
 
 # Fuehrt den Vergleichslauf aus und haelt sein Ergebnis fuer den Bericht fest.
 #
-# CONTROLLER-RULING 2: der Ausgang darf NICHT mit "|| true" verworfen werden,
+# Der Ausgang darf NICHT mit "|| true" verworfen werden,
 # sonst druckt w2u_report ein PASS, nachdem der Verify Befunde ausgegeben hat.
 # Geprueft werden BEIDE Formen - der rc UND die Ausgabe. w2u_verify meldet
 # Befunde ueber beides; wer nur eine Form prueft, verliert die andere, sobald
@@ -1970,14 +2417,56 @@ w2u_verify_step() {
     fi
 }
 
+# Druckt den Abschlussbericht UND legt ihn als Datei ins Logverzeichnis.
+#
+# Warum als Datei (Fund im Abschluss-Review): der Bericht ging bisher nur aufs
+# Terminal. Er ist aber das einzige Dokument, das die Vollstaendigkeit
+# bezeugt - und auf ein PASS folgt das Verschrotten der Quelle. Wer danach
+# nachsehen will, hat nur noch den Scrollback, und den hat er nicht.
+#
+# "| tee" und nicht "> datei; cat datei": der Bericht muss WAEHREND seines
+# Entstehens auf dem Terminal erscheinen. Bricht w2u_report mitten drin ab,
+# steht das Bisherige da - bei "erst Datei, dann cat" saehe der Anwender
+# NICHTS, und ein Lauf ohne gedruckten Bericht ist genau der, den niemand
+# bemerkt (siehe den Kopf von w2u_report).
+#
+# Unter dem "pipefail" aus main() traegt der rc der Pipeline auch einen
+# Fehlschlag des tee. Das ist gewollt: ein Bericht, der nicht festgehalten
+# werden konnte, ist kein PASS. Gedruckt wurde er trotzdem - tee schreibt nach
+# stdout weiter, auch wenn die Datei scheitert.
+w2u_report_step() {
+    local _Rc=0
+    if [ -n "$_LogDir" ] && [ -d "$_LogDir" ] && [ -w "$_LogDir" ]; then
+        w2u_report | tee "${_LogDir%/}/report.txt" || _Rc=$?
+    else
+        # Kein Logverzeichnis (oder nicht beschreibbar): drucken geht vor
+        # festhalten. Der Preflight hat die Beschreibbarkeit schon geprueft,
+        # dieser Zweig ist der Riegel fuer alles, was danach noch passiert.
+        w2u_report || _Rc=$?
+    fi
+    return "$_Rc"
+}
+
 # Aufraeumen am Ende JEDES Weges aus main() heraus - auch aus w2u_die, auch
 # nach einem Signal.
 #
 # Das Arbeitsverzeichnis geht immer, es enthaelt nur Zwischenstaende. Das
-# Logverzeichnis nur dann, wenn WIR es angelegt haben UND der Lauf sauber war:
-# nach einem FAIL sind die Logs die einzige Spur, warum, und der Bericht nennt
-# genau diesen Pfad. Ein per --log-dir angegebenes Verzeichnis wird nie
-# geloescht - es koennte auf alles Moegliche zeigen.
+# Logverzeichnis wird geloescht, wenn WIR es angelegt haben UND es LEER ist -
+# und sonst nie. Ein per --log-dir angegebenes wird ohnehin nie angefasst, es
+# koennte auf alles Moegliche zeigen.
+#
+# Fund im Abschluss-Review: hier wurde das eigene Logverzeichnis auch nach
+# einem ERFOLGREICHEN Lauf geloescht, samt verify.log, sweep.log und allen
+# Chunk-Logs, und der Bericht ging ohnehin nur auf das Terminal. Damit
+# vernichtete das Werkzeug die Beweise genau in dem Lauf, in dem sie zaehlen:
+# PASS ist die Freigabe, die Quellmaschine zu verschrotten, und danach ist der
+# Nachweis der Vollstaendigkeit das Einzige, was von ihr uebrig bleibt. Der
+# Bericht liegt seit demselben Review als report.txt daneben (w2u_report_step).
+#
+# Ein LEERES eigenes Logverzeichnis geht weiterhin weg - auch nach einem
+# Fehlschlag: scheitert der Lauf vor der ersten Uebertragung (das Listing der
+# Quelle bricht ab), bliebe sonst bei jedem Versuch ein leeres Verzeichnis
+# zurueck, und die Meldung verspraeche Logs, die es nicht gibt.
 w2u_cleanup() {
     local _Rc=$? _LogEmpty=0
     if [ -n "$_TmpDir" ] && [ -d "$_TmpDir" ]; then
@@ -1987,14 +2476,10 @@ w2u_cleanup() {
         if [ -z "$(ls -A "$_LogDir" 2>/dev/null)" ]; then
             _LogEmpty=1
         fi
-        # Ein LEERES eigenes Logverzeichnis geht auch nach einem Fehlschlag:
-        # scheitert der Lauf vor der ersten Uebertragung (Listing der Quelle
-        # bricht ab), bliebe sonst bei jedem Versuch ein leeres Verzeichnis
-        # zurueck, und die Meldung verspraeche Logs, die es nicht gibt.
-        if [ "$_LogDirOwned" -eq 1 ] && { [ "$_Rc" -eq 0 ] || [ "$_LogEmpty" -eq 1 ]; }; then
+        if [ "$_LogDirOwned" -eq 1 ] && [ "$_LogEmpty" -eq 1 ]; then
             rm -rf "$_LogDir"
         else
-            printf '[%s] Logs bleiben liegen: %s\n' "$(date '+%H:%M:%S')" "$_LogDir" >&2
+            printf '[%s] Logs und Bericht bleiben liegen: %s\n' "$(date '+%H:%M:%S')" "$_LogDir" >&2
         fi
     fi
     return "$_Rc"
@@ -2031,8 +2516,8 @@ main() {
     _StartTs="$(date +%s)"
     w2u_parse_args "$@"
 
-    # CONTROLLER-RULING (Task 7): $_TmpDir kommt aus mktemp -d und liegt damit
-    # auf einem LOKALEN Dateisystem. Das ist keine Bequemlichkeit: $_ResultFile
+    # $_TmpDir kommt aus mktemp -d und liegt damit auf einem LOKALEN
+    # Dateisystem. Das ist keine Bequemlichkeit: $_ResultFile
     # wird gleich von bis zu _PMax Prozessen gleichzeitig per ">>" beschrieben,
     # und die Messung dazu (32 Schreiber, 116.000 Zeilen, kein Verlust) gilt
     # nur lokal. Das ZIEL dieses Werkzeugs ist oft ein SMB-/NFS-Mount, auf dem
@@ -2046,7 +2531,7 @@ main() {
     w2u_preflight
 
     _ResultFile="$_TmpDir/results"
-    # CONTROLLER-RULING 4.2/4.3: in JEDEM Modus, auch in --verify-only.
+    # In JEDEM Modus angelegt, auch in --verify-only.
     # w2u_report stuft eine FEHLENDE Ergebnisdatei als Defekt ein (richtig so -
     # sie ist die einzige Spur eines fehlgeschlagenen Chunks); ohne diese Zeile
     # fiele jeder Verify-Only-Lauf falsch auf FAIL. Das ">" leert sie zugleich:
@@ -2057,7 +2542,7 @@ main() {
         w2u_log "nur Verifikation - es wird nichts uebertragen"
         w2u_verify_step
         _Rc=0
-        w2u_report || _Rc=$?
+        w2u_report_step || _Rc=$?
         exit "$_Rc"
     fi
 
@@ -2093,7 +2578,15 @@ main() {
         mkdir -p "$_TmpDir/chunks"
         w2u_chunk "$_TmpDir/work.par" "$_TmpDir/chunks" "$_PMax" "$_TmpDir/chunks.list"
         w2u_log "parallele Phase: $_ParSrc/ -> $_ParDst/ (Praefix '${_SrcPrefix:-<keiner>}')"
+        # Zwei Messpunkte um die ganze Phase. Sie kosten je ein "du -sk" (dieselbe
+        # Funktion, die die Auto-Messung ohnehin benutzt) und sind die Grundlage
+        # der Widerspruchspruefung im Bericht: Chunks, die alle Erfolg melden,
+        # waehrend am Ziel nichts angekommen ist. Genau dieses Bild wurde in
+        # diesem Projekt gemessen (openrsync liefert rc 0 und uebertraegt
+        # nichts, siehe Kopf bei _SrcRoot).
+        _ParKbBefore="$(w2u_dst_kb)"
         w2u_run_all "$_TmpDir/chunks.list"
+        _ParKbAfter="$(w2u_dst_kb)"
     else
         # Einstroemig: kein Zerlegen, keine Chunks, keine Buchfuehrung - der
         # Sweep unten macht die ganze Arbeit. Beim Parsen ist das bereits
@@ -2120,7 +2613,7 @@ main() {
     fi
 
     _Rc=0
-    w2u_report || _Rc=$?
+    w2u_report_step || _Rc=$?
     exit "$_Rc"
 }
 
