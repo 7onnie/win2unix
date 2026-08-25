@@ -36,7 +36,8 @@ fi
 _Src="$(mktemp -d)"
 _Dst="$(mktemp -d)"
 _Dst2="$(mktemp -d)"
-trap 'd_stop; rm -rf "$_Src" "$_Dst" "$_Dst2"' EXIT
+_Dst3="$(mktemp -d)"
+trap 'd_stop; rm -rf "$_Src" "$_Dst" "$_Dst2" "$_Dst3"' EXIT
 
 # Prueft, dass eine Zeichenkette NICHT vorkommt. Bewusst hier und nicht in
 # testlib.sh: dieser Test braucht sie, die anderen zehn nicht, und eine
@@ -166,11 +167,37 @@ t_assert_contains "$_Out" "einstroemige Aufrufform" "der Trockenlauf nennt die e
 # das: Ziel '<x>' scheitert (es entstuende '<x>/SonoGDT'), Ziel '<x>/Daten'
 # geht. Das ist die Zusage im README, und sie ist genau die Stelle, an der ein
 # Anwender die Parallelitaet unbemerkt verliert - deshalb hier beide Richtungen.
+#
+# Die NEGATIVE Richtung genuegt als Trockenlauf: geprueft wird die Ansage.
 _Out="$(bash "$_Root/pull.sh" --dry-run "$D_Url/Daten/SonoGDT" "$_Dst2" 2>&1)"
 t_assert_contains "$_Out" "EINSTROEMIG" "tiefer Praefix ohne gespiegeltes Ziel: einstroemig, und angesagt"
-mkdir -p "$_Dst2/Daten"
-_Out="$(bash "$_Root/pull.sh" --dry-run "$D_Url/Daten/SonoGDT" "$_Dst2/Daten" 2>&1)"
-t_assert_contains "$_Out" "Arbeitspakete" "tiefer Praefix mit gespiegeltem Ziel: es wird zerlegt"
+
+# Die POSITIVE Richtung darf KEIN Trockenlauf sein (Review-Fund): der Trockenlauf
+# steigt vor der Praefix-Umschreibung und vor w2u_chunk/w2u_run_all aus. Ein
+# falsch berechnetes, aber existierendes und beschreibbares _ParDst erfuellte
+# alle Ansage-Asserts - die Chunks schrieben an die falsche Wurzel, meldeten rc
+# 0, und der Sweep lieferte den richtigen Baum nach. Genau die Klasse "parallele
+# Phase wirkungslos, Lauf meldet Erfolg", gegen die dieser Test existiert. Also
+# echt uebertragen, und zwar in ein EIGENES Ziel, damit die Buchfuehrung dieses
+# Laufs fuer sich steht.
+#
+# Das Zielverzeichnis-Argument muss existieren - w2u_preflight bricht sonst mit
+# "Zielverzeichnis existiert nicht" ab (nachgemessen). Nur die Ebenen UNTERHALB
+# legt pull.sh selbst an.
+mkdir -p "$_Dst3/Daten"
+_Out="$(bash "$_Root/pull.sh" --jobs 4 "$D_Url/Daten/SonoGDT" "$_Dst3/Daten" 2>&1)"
+_Rc=$?
+t_assert_rc 0 "$_Rc" "tiefer Praefix mit gespiegeltem Ziel: echter Lauf endet mit rc 0"
+t_assert_contains "$_Out" "ERGEBNIS: PASS" "tiefer Praefix: echter Lauf meldet PASS"
+t_assert_contains "$_Out" "parallele Phase:" "tiefer Praefix: die parallele Phase lief wirklich"
 e_assert_absent "$_Out" "EINSTROEMIG" "tiefer Praefix mit gespiegeltem Ziel: kein Rueckfall"
+t_assert_contains "$_Out" ", 0 fehlgeschlagen" "tiefer Praefix: kein Chunk fehlgeschlagen"
+t_assert_eq "" "$(diff -r "$_Src/Daten/SonoGDT" "$_Dst3/Daten/SonoGDT" 2>&1)" "tiefer Praefix: Unterbaum inhaltlich identisch"
+# Der entscheidende Assert gegen ein falsch berechnetes _ParDst: unterhalb von
+# $_Dst3 darf NICHTS ausserhalb des erwarteten Unterbaums liegen. Schrieben die
+# Worker an die falsche Wurzel und der Sweep raeumte hinterher auf, waeren beide
+# Zahlen verschieden - waehrend diff -r trotzdem sauber waere.
+t_assert_eq "31" "$(find "$_Dst3/Daten/SonoGDT" -type f | wc -l | tr -d ' ')" "tiefer Praefix: 31 Dateien im erwarteten Unterbaum"
+t_assert_eq "31" "$(find "$_Dst3" -type f | wc -l | tr -d ' ')" "tiefer Praefix: KEINE Datei ausserhalb des erwarteten Unterbaums"
 
 t_summary

@@ -1531,7 +1531,7 @@ w2u_einstroemig() {
 # Abgelehnt wird beim PARSEN, nicht nach Stunden Arbeit: ein Lauf, der
 # strukturell nur FAIL melden kann, darf nicht erst den ganzen Bestand lesen.
 w2u_parse_args() {
-    local _Pos=0 _Base _Rest _SrcHost _SrcModule
+    local _Pos=0 _Base _Rest _SrcHost _SrcModule _Weg
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --jobs)         w2u_take_arg "$1" "${2-}"; _JobCnt="$_ArgVal"; shift 2 ;;
@@ -1643,9 +1643,29 @@ w2u_parse_args() {
         [ -n "$_ParDst" ] || _ParDst="/"
         _ParMode="parallel"
     else
+        # Der Ratschlag MUSS zur Tiefe des Praefixes passen (Fund in Task 12,
+        # gegen einen echten Daemon nachgemessen). Die Regel ist: das Ziel muss
+        # auf dem GANZEN modul-relativen Pfad enden, nicht bloss auf dessen
+        # letztem Teil. Bei einem Praefix aus EINEM Segment ist beides dasselbe,
+        # da stimmt '<ziel>' - nachgemessen. Bei jedem tieferen Praefix ist
+        # '<ziel>' aber exakt der Aufruf, der gerade abgelehnt wurde: der
+        # Anwender folgte dem Vorschlag und landete wieder einstroemig.
+        #
+        # Zerlegt per Muster-Ersetzung statt per dirname: pull.sh braucht
+        # dirname sonst nirgends, und dirname lieferte fuer ein einsegmentiges
+        # Praefix "." - also '<ziel>/.', eine Verschlechterung genau des Falls,
+        # der heute korrekt ist.
+        case "$_SrcPrefix" in
+            */*)
+                _Weg="Volle Parallelitaet gibt es, wenn das Ziel auf dem GANZEN modul-relativen Pfad '$_SrcPrefix' endet - der Zwischenpfad gehoert also mit ins Zielverzeichnis: 'pull.sh $_SrcRoot/$_SrcPrefix <ziel>/${_SrcPrefix%/*}'. Dieses Zielverzeichnis muss vorher existieren (mkdir -p)."
+                ;;
+            *)
+                _Weg="Volle Parallelitaet gibt es mit einer Quelle OHNE abschliessenden Schraegstrich, deren letzter Pfadteil das Ziel bildet - z.B. 'pull.sh $_SrcRoot/$_SrcPrefix <ziel>'."
+                ;;
+        esac
         w2u_einstroemig \
             "das Ziel '$_DstRoot' endet nicht auf '/$_SrcPrefix', die modul-relativen Eintraege passen also in kein Verzeichnis" \
-            "Volle Parallelitaet gibt es mit einer Quelle OHNE abschliessenden Schraegstrich, deren letzter Pfadteil das Ziel bildet - z.B. 'pull.sh $_SrcRoot/$_SrcPrefix <ziel>'."
+            "$_Weg"
     fi
 
     # ---- Flag-Kombinationen: ABGELEHNT ------------------------------------

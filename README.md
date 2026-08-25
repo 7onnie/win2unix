@@ -62,9 +62,12 @@ Bricht der Transfer ab — Netzwerk, Strom, versehentlich geschlossenes Fenster,
 **denselben Befehl erneut ausführen**. Es wird nur geholt, was fehlt; bereits übertragene Dateien
 bleiben liegen.
 
-Voraussetzung auf dieser Seite ist nur bash und ein rsync: **Apples `openrsync` genügt als Client**
+Voraussetzung auf dieser Seite ist bash und ein rsync: **Apples `openrsync` genügt als Client**
 (auf den Ziel-Macs ist das der Normalfall, Homebrew ist dort meist nicht installiert). Ein
-Homebrew-rsync wird bevorzugt, wenn es liegt; `--rsync PFAD` erzwingt ein bestimmtes.
+Homebrew-rsync wird bevorzugt, wenn es liegt; `--rsync PFAD` erzwingt ein bestimmtes. Dazu die
+üblichen POSIX-Werkzeuge, die `pull.sh` aufruft — `awk`, `find`, `du`, `split`, `xargs`, `grep`,
+`cut`, `head`, `tail`, `tr`, `basename`, `mktemp`, optional `pkill`. Auf macOS und jedem
+Linux-System ist das vorhanden; die BSD-Varianten reichen (`awk` ohne Intervall-Quantoren, bash 3.2).
 
 ### Die Form des Zielpfads entscheidet über die Parallelität
 
@@ -88,10 +91,14 @@ pull.sh rsync://<IP>/e /ziel             # -> /ziel/e, ganzes Laufwerk, immer pa
 Liegt die Quelle **tiefer** unter dem Modul, muss das Ziel den Zwischenpfad mitbringen:
 
 ```bash
-mkdir -p /ziel/Daten
+mkdir -p /ziel/Daten                                # nötig: siehe unten
 pull.sh rsync://<IP>/e/Daten/Archiv /ziel/Daten     # -> /ziel/Daten/Archiv, parallel
 pull.sh rsync://<IP>/e/Daten/Archiv /ziel           # -> /ziel/Archiv, EINSTROEMIG
 ```
+
+Das `mkdir -p` ist keine Dekoration: **das angegebene Zielverzeichnis muss existieren**, sonst
+bricht der Lauf mit `Zielverzeichnis existiert nicht` ab. Nur die Ebenen *darunter* legt `pull.sh`
+selbst an.
 
 Passt die Kürzung nicht auf, überträgt ein einzelner rsync-Prozess. Der Lauf ist trotzdem
 vollständig und wird verifiziert, dauert aber deutlich länger — und das Werkzeug **sagt es an**,
@@ -117,7 +124,7 @@ Verifikation, die es beim blanken rsync nicht gibt.
 | Option | Wirkung |
 |---|---|
 | `--jobs N` | feste Parallelität, überspringt die Auto-Messung |
-| `--exclude-from DATEI` | Ausschlussmuster. Bei einer Quelle **mit** Unterpfad müssen die Muster **ohne** führenden Schrägstrich stehen, sonst bricht der Lauf ab (ein `/x` meint in den einzelnen Phasen verschiedene Stellen) |
+| `--exclude-from DATEI` | Ausschlussmuster. Muster **ohne** führenden Schrägstrich gelten überall gleich und sind immer erlaubt. **Verankerte** Muster (mit führendem `/`) lehnt der Lauf ab, sobald die Quelle einen Unterpfad hat und parallel übertragen wird — dort meint ein `/x` je Phase eine andere Stelle. Gegen die Modulwurzel und im `--verify-only`-Lauf sind sie eindeutig und bleiben erlaubt; im Trockenlauf gibt es nur eine Warnung |
 | `--log-dir PFAD` | Logverzeichnis. Darf **nicht** unter dem Ziel liegen, sonst zählen die Logdateien als lokale Dateien mit |
 | `--rsync PFAD` | ein bestimmtes rsync benutzen statt selbst zu suchen |
 | `--verify-only` | nur prüfen, nichts übertragen |

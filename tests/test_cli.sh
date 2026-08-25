@@ -435,16 +435,43 @@ t_assert_eq "$_Tmp/ziel/e" "$_ParDst" "ohne Praefix ist _ParDst gleich _DstRoot"
 t_assert_eq "parallel" "$_ParMode" "Modulwurzel ist parallel uebertragbar"
 
 _reset_opts
-w2u_parse_args "rsync://10.0.0.1:8873/e/Daten/Archiv" "$_Tmp/ziel"
+# Die Meldung wird in eine DATEI umgeleitet und von dort gelesen, nicht per
+# Kommandosubstitution eingefangen: "$(w2u_parse_args …)" liefe in einer
+# Subshell, und die gesetzten Variablen (_ParSrc, _SrcPrefix, _ParMode) kaemen
+# hier nie an - die Asserts darunter pruefen dann Reste des VORIGEN Aufrufs.
+# Genau diese Falle steckte unbemerkt im Block darunter (siehe dort).
+w2u_parse_args "rsync://10.0.0.1:8873/e/Daten/Archiv" "$_Tmp/ziel" 2> "$_Tmp/hinweis.txt"
+_Out="$(cat "$_Tmp/hinweis.txt")"
 t_assert_eq "rsync://10.0.0.1:8873/e" "$_ParSrc" "Port bleibt in der Modulwurzel erhalten"
 t_assert_eq "Daten/Archiv" "$_SrcPrefix" "mehrstufiger Praefix erkannt"
 t_assert_eq "einstroemig" "$_ParMode" "tieferer Unterpfad: Kuerzung geht nicht auf, also einstroemig"
+# Der Ratschlag in dieser Meldung muss zur Tiefe des Praefixes passen. Vor dem
+# Fix nannte er '<ziel>' - also genau den Aufruf, der gerade abgelehnt wurde,
+# und der Anwender landete beim zweiten Versuch wieder einstroemig (in Task 12
+# gegen einen echten Daemon nachgemessen). Geprueft wird deshalb der
+# Zwischenpfad im Vorschlag UND, dass dort kein "/." steht (die naheliegende
+# dirname-Loesung liefert fuer ein einsegmentiges Praefix genau das).
+t_assert_contains "$_Out" "<ziel>/Daten" "mehrstufiges Praefix: der Vorschlag nimmt den Zwischenpfad mit"
+_HatPunkt=nein
+case "$_Out" in
+    *"<ziel>/."*) _HatPunkt=ja ;;
+esac
+t_assert_eq "nein" "$_HatPunkt" "der Vorschlag enthaelt kein '<ziel>/.'"
 
 _reset_opts
-_Out="$(w2u_parse_args "rsync://10.0.0.1/e/Archiv/" "$_Tmp/ziel" 2>&1)"
+# Auch hier in eine Datei statt in eine Substitution. Vorher stand hier ein
+# "$(w2u_parse_args …)", und der _ParMode-Assert darunter pruefte in Wahrheit
+# den Wert, den der VORIGE (nicht substituierte) Aufruf hinterlassen hatte -
+# er war vakuum-gruen. Aufgefallen, als der Aufruf darueber ebenfalls eine
+# Substitution wurde und dieser Assert plaetzlich fehlschlug.
+w2u_parse_args "rsync://10.0.0.1/e/Archiv/" "$_Tmp/ziel" 2> "$_Tmp/hinweis.txt"
+_Out="$(cat "$_Tmp/hinweis.txt")"
 t_assert_eq "einstroemig" "$_ParMode" "Quelle MIT Schraegstrich: Kuerzung geht nicht auf"
 t_assert_contains "$_Out" "EINSTROEMIG" "und der Anwender erfaehrt es SOFORT, nicht erst am Ende"
 t_assert_contains "$_Out" "OHNE abschliessenden Schraegstrich" "die Meldung sagt auch, wie man volle Parallelitaet bekommt"
+# Einsegmentiges Praefix: hier IST '<ziel>' der richtige Rat (nachgemessen),
+# der Fix fuer den mehrstufigen Fall darf ihn nicht mit verschlimmern.
+t_assert_contains "$_Out" "'pull.sh rsync://10.0.0.1/e/Archiv <ziel>'" "einsegmentiges Praefix: der Vorschlag bleibt '<ziel>'"
 
 _reset_opts
 w2u_parse_args "rsync://10.0.0.1/e/Archiv/" "$_Tmp/ziel/Archiv" 2>/dev/null
