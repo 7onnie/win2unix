@@ -191,6 +191,35 @@ _Out="$(w2u_report 2>&1)"; _Rc=$?
 t_assert_rc 1 "$_Rc" "Ergebniszeile fuer einen Chunk ausserhalb der Chunkliste -> FAIL"
 t_assert_contains "$_Out" "chunk.zz" "der fremde Chunk wird benannt"
 
+# Bei mehr als 20 Befunden kappen alle drei Bloecke - dann MUSS die Zahl der
+# nicht gezeigten dabeistehen, sonst zeigt der Bericht 20 Zeilen und nennt
+# daneben eine groessere Zahl ohne Erklaerung.
+_Bulk="$_TmpDir/bulk.list"
+printf '%s\n' "$_TmpDir/chunks/chunk.aa" > "$_Bulk"
+_ChunkListFile="$_Bulk"
+: > "$_ResultFile"
+_I=1
+while [ "$_I" -le 25 ]; do
+    printf 'fremd.%s\t0\t1\n' "$_I" >> "$_ResultFile"
+    _I=$((_I + 1))
+done
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 1 "$_Rc" "25 Fremdnamen ergeben FAIL"
+t_assert_contains "$_Out" "und 5 weitere" "der Fremdnamen-Block nennt die nicht gezeigten Befunde"
+
+: > "$_ResultFile"
+_I=1
+while [ "$_I" -le 21 ]; do
+    printf 'chunk.d%s\t0\t1\n' "$_I" >> "$_ResultFile"
+    printf 'chunk.d%s\t0\t1\n' "$_I" >> "$_ResultFile"
+    printf '%s\n' "$_TmpDir/chunks/chunk.d$_I" >> "$_Bulk"
+    _I=$((_I + 1))
+done
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 1 "$_Rc" "21 doppelte Chunks ergeben FAIL"
+t_assert_contains "$_Out" "und 1 weitere" "der Duplikat-Block nennt die nicht gezeigten Befunde"
+_ChunkListFile="$_TmpDir/chunks.list"
+
 # Kaputte Zeile: rc-Feld nicht numerisch. Nicht auswertbar heisst nicht sauber.
 printf 'chunk.aa\t0\t1\nchunk.ab\tkaputt\n' > "$_ResultFile"
 _Out="$(w2u_report 2>&1)"; _Rc=$?
@@ -243,11 +272,33 @@ _Out="$(w2u_report 2>&1)"; _Rc=$?
 t_assert_rc 1 "$_Rc" "Ergebniszeilen ohne bekannte Chunkliste -> FAIL"
 t_assert_contains "$_Out" "CHUNKLISTE" "der Grund wird benannt"
 
-# Verify-Only-Form: keine Chunkliste UND keine Ergebniszeilen ist die einzige
-# zulaessige Kombination ohne Chunk-Buchfuehrung.
+# Verify-Only-Form: keine Chunkliste UND keine Ergebniszeilen, und der Lauf ist
+# ausdruecklich als --verify-only erklaert - nur dann ist fehlende
+# Chunk-Buchfuehrung zulaessig, und auch dann nur mit aktivem Zahlenvergleich.
 : > "$_ResultFile"
+_VerifyOnly=1
 _Out="$(w2u_report 2>&1)"; _Rc=$?
-t_assert_rc 0 "$_Rc" "Verify-Only (keine Chunks, keine Ergebnisse) ergibt PASS"
+t_assert_rc 0 "$_Rc" "erklaerter Verify-Only-Lauf (keine Chunks, keine Ergebnisse, Zahlen aktiv) ergibt PASS"
+
+# CRITICAL (Review Task 8): "--verify-only --no-verify" laesst KEINE
+# Beweisschicht uebrig - keine Chunk-Buchfuehrung, keine Dateizahlen. Ein PASS
+# hiesse "Transfer vollstaendig" auf der Grundlage von nichts. Beide Optionen
+# sind dokumentiert, und main() ist noch ein Stub: es gibt heute keinen Parser,
+# der die Kombination ablehnt.
+_DoVerify=0
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 1 "$_Rc" "CRITICAL: --verify-only zusammen mit --no-verify ergibt FAIL, nicht PASS"
+t_assert_contains "$_Out" "KEINE Beweisschicht" "der Bericht sagt, warum hier nichts geprueft wurde"
+_DoVerify=1
+
+# Gegenprobe zur anderen Haelfte derselben Bedingung: kein erklaertes
+# --verify-only, trotzdem keine Chunkliste - das ist ein Lauf, der zerlegen
+# sollte und dessen Massstab verlorenging.
+_VerifyOnly=0
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 1 "$_Rc" "fehlende Chunkliste ohne erklaertes --verify-only ergibt FAIL"
+t_assert_contains "$_Out" "Massstab fehlt" "auch hier steht der Grund im Klartext"
+_VerifyOnly=1
 
 # --- CONTROLLER-RULING 2: chunks.rest wird nicht vorausgesetzt --------------
 # w2u_run_all schreibt chunks.rest NUR im Auto-Messungs-Pfad; im --jobs-N-Pfad
@@ -255,6 +306,7 @@ t_assert_rc 0 "$_Rc" "Verify-Only (keine Chunks, keine Ergebnisse) ergibt PASS"
 # Lauf. Eine veraltete chunks.rest waere eine Chunkliste eines anderen Laufs,
 # im schlimmsten Fall gegen ein anderes Quellverzeichnis. Der Bericht darf sie
 # deshalb weder brauchen noch beachten.
+_VerifyOnly=0
 printf '%s\n' "$_TmpDir/chunks/chunk.aa" > "$_TmpDir/chunks.list"
 _ChunkListFile="$_TmpDir/chunks.list"
 printf 'chunk.aa\t0\t1\n' > "$_ResultFile"
@@ -313,6 +365,25 @@ t_assert_eq "$_OptsBefore" "$_OptsAfter" "w2u_verify/w2u_report lassen die Shell
 # fehlgeschlagener Test mitten im Bericht (etwa "[ $_Bad -gt 0 ]" als
 # Einzelkommando) risse dort die Shell ab, BEVOR das Ergebnis gedruckt ist -
 # und ein Lauf ohne gedrucktes Ergebnis ist genau das, was niemand bemerkt.
+# w2u_verify unter echtem errexit, beide Ausgaenge: der saubere Lauf darf die
+# Shell nicht abreissen, und der Befund-Lauf muss seine Begruendung VOLLSTAENDIG
+# ausgeben, bevor er mit rc 1 endet.
+# Vorher aufraeumen: der Dateizahl-Test oben hat eine Datei aus Bildarchiv
+# heraus- und wieder hineingeschoben, und das aendert die mtime des
+# VERZEICHNISSES. Der Verify meldet das (".d..t...... Bildarchiv/") - zu Recht,
+# und nebenbei ein weiterer Beleg, dass der Wurzel-Filter wirklich nur die
+# Wurzel schluckt. Fuer die errexit-Probe wird ein sauberer Baum gebraucht.
+w2u_sweep >/dev/null 2>&1
+_ProbeOut="$( ( set -e; w2u_verify; printf 'VERIFY_DURCH\n' ) 2>&1 )"; _ProbeRc=$?
+t_assert_rc 0 "$_ProbeRc" "sauberer Verify laeuft unter echtem errexit durch"
+t_assert_contains "$_ProbeOut" "VERIFY_DURCH" "und kommt bis hinter den Aufruf"
+_SaveUrl2="$_SrcUrl"
+_SrcUrl="rsync://127.0.0.1:1/test"
+_ProbeOut="$( ( set -e; w2u_verify; printf 'VERIFY_DURCH\n' ) 2>&1 )"; _ProbeRc=$?
+t_assert_rc 1 "$_ProbeRc" "Verify mit Befund liefert unter echtem errexit rc 1"
+t_assert_contains "$_ProbeOut" "NICHT MOEGLICH" "und hat seine Begruendung vorher gedruckt"
+_SrcUrl="$_SaveUrl2"
+
 _ProbeOut="$( ( set -e; w2u_sweep; printf 'SWEEP_DURCH\n' ) 2>&1 )"; _ProbeRc=$?
 t_assert_rc 0 "$_ProbeRc" "der Sweep laeuft unter echtem errexit durch (ohne Ausschluesse, also mit falschem '[ -n ] &&')"
 t_assert_contains "$_ProbeOut" "SWEEP_DURCH" "und kommt bis hinter den Aufruf"
@@ -367,6 +438,51 @@ w2u_verify >/dev/null 2>&1
 t_assert_eq "1" "$(grep -cx -- "-c" "$_FakeBinDir/call.1.args")" "--checksum setzt -c im argv des Verify"
 _DoChecksum=0
 _ExcludeFrom=""
+
+# rc 0 UND trotzdem keine verstandene Listing-Zeile: der Stub endet mit 0 und
+# schreibt nichts auf stdout. Eine 0 waere hier eine Zahl aus dem Nichts -
+# "remote 0 / lokal 0" laese sich als Uebereinstimmung.
+rm -f "$_FakeBinDir"/calls.count "$_FakeBinDir"/call.*.args
+t_assert_eq "" "$(w2u_count_remote)" "rc 0 mit LEERER Ausgabe ergibt keine Zahl, sondern 'nicht ermittelbar'"
+
+# Dasselbe mit Ausgabe, die kein rsync-Listing ist (fremdes Format, Bannerzeile,
+# abgeschnittene Uebertragung): auch das ist keine Messung.
+cat > "$_FakeBinDir/rsync" <<'FAKE2_EOF'
+#!/usr/bin/env bash
+printf 'irgendein Text, der kein Listing ist
+'
+printf 'noch eine Zeile
+'
+exit 0
+FAKE2_EOF
+chmod +x "$_FakeBinDir/rsync"
+t_assert_eq "" "$(w2u_count_remote)" "rc 0 mit unverstandener Ausgabe ergibt ebenfalls 'nicht ermittelbar'"
+
+# Gegenprobe, damit die Pruefung nicht einfach immer leer liefert: ein echtes
+# Listing mit einer Verzeichniszeile und ohne Datei IST eine Messung (0).
+cat > "$_FakeBinDir/rsync" <<'FAKE3_EOF'
+#!/usr/bin/env bash
+printf 'drwxr-xr-x            128 2026/08/25 04:34:32 .
+'
+exit 0
+FAKE3_EOF
+chmod +x "$_FakeBinDir/rsync"
+t_assert_eq "0" "$(w2u_count_remote)" "ein verstandenes Listing ohne regulaere Datei ergibt die Messung 0, nicht 'unbekannt'"
+
+# argv-Stub wiederherstellen
+cat > "$_FakeBinDir/rsync" <<'FAKE_EOF'
+#!/usr/bin/env bash
+_Dir="$(dirname "$0")"
+_N=0
+[ -f "$_Dir/calls.count" ] && _N="$(cat "$_Dir/calls.count")"
+_N=$((_N + 1))
+printf '%s
+' "$_N" > "$_Dir/calls.count"
+printf '%s
+' "$@" > "$_Dir/call.$_N.args"
+exit 0
+FAKE_EOF
+chmod +x "$_FakeBinDir/rsync"
 
 rm -f "$_FakeBinDir"/calls.count "$_FakeBinDir"/call.*.args
 _ExcludeFrom=""

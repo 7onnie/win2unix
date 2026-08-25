@@ -854,6 +854,16 @@ w2u_sweep() {
 # Itemize-String ist versionsabhaengig (nachgemessen: openrsync 9 Zeichen,
 # GNU rsync 3.5 11 Zeichen), deshalb der offene Quantor.
 #
+# Die Ausgabe geht in eine Arbeitsdatei und wird von dort GESTREAMT, nie in
+# einer Shell-Variablen gehalten (dieselbe Form wie w2u_count_remote, aus einem
+# schaerferen Grund): die Ausgabe dieses Laufs ist genau dann gross, wenn etwas
+# schiefging - ein gescheiterter Transfer itemisiert JEDE Datei. Eine Variable
+# plus "printf | grep" hielte davon zwei Kopien im Speicher, und das Fehlerbild
+# waere nicht ein falsches FAIL, sondern eine sterbende Shell OHNE gedruckten
+# Bericht - das schlimmste Ergebnis ueberhaupt, weil es niemand bemerkt.
+# Der rc des grep traegt zugleich das Urteil: 0 = Befunde ausgegeben, 1 = nichts
+# ausser der gefilterten Wurzelzeile, alles andere = Ausgabe nicht lesbar.
+#
 # Der rc des rsync darf NICHT verworfen werden - das ist hier die zentrale
 # Falle: stirbt der Vergleichslauf (Daemon weg, Timeout, Verbindungsabbruch),
 # ist seine Ausgabe womoeglich leer, und "keine Ausgabe" saehe dann aus wie
@@ -863,27 +873,39 @@ w2u_sweep() {
 # fehlt. Das ist die gewollte Seite der Asymmetrie - ein Nachmittag Nachsehen
 # statt vernichteter Daten.
 w2u_verify() {
-    local _Args _Out _Raw _Rc=0
+    local _Args _List _Rc=0 _GrepRc=0
+    _List="$(mktemp "${TMPDIR:-/tmp}/w2u.verify.XXXXXXXX" 2>/dev/null)" || _List=""
+    if [ -z "$_List" ]; then
+        printf 'VERIFY NICHT MOEGLICH: keine Arbeitsdatei fuer die Ausgabe des Vergleichslaufs anlegbar\n'
+        return 1
+    fi
     _Args=( -rlt -W -n -i "--timeout=$_RsyncTimeout" )
     [ "$_DoChecksum" = "1" ] && _Args=( "${_Args[@]}" -c )
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
-    _Raw="$("$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" "$_DstRoot/" 2>&1)" || _Rc=$?
-    _Out="$(printf '%s\n' "$_Raw" | grep -Ev '^\.d\.\.t[.]* \./$' || true)"
+    "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" "$_DstRoot/" > "$_List" 2>&1 || _Rc=$?
     # Die Meldung auf STDOUT ist Verdrahtung, nicht Kosmetik: main() entscheidet
     # im Normalpfad an "[ -s verify.log ]", also an der AUSGABE, nicht am rc.
     # Wer sie zu "return 1 genuegt" aufraeumt, haengt die rc-Pruefung still ab.
     if [ "$_Rc" -ne 0 ]; then
         printf 'VERIFY NICHT MOEGLICH: der Vergleichslauf endete mit rc %s - eine leere Ausgabe ist hier KEIN Beweis fuer Gleichheit\n' "$_Rc"
-        if [ -n "$_Out" ]; then
-            printf '%s\n' "$_Out"
-        fi
+    fi
+    grep -Ev '^\.d\.\.t[.]* \./$' "$_List" || _GrepRc=$?
+    rm -f "$_List"
+    if [ "$_Rc" -ne 0 ]; then
         return 1
     fi
-    if [ -n "$_Out" ]; then
-        printf '%s\n' "$_Out"
-        return 1
-    fi
-    return 0
+    case "$_GrepRc" in
+        0)
+            return 1
+            ;;
+        1)
+            return 0
+            ;;
+        *)
+            printf 'VERIFY NICHT MOEGLICH: die Ausgabe des Vergleichslaufs ist nicht lesbar (grep rc %s)\n' "$_GrepRc"
+            return 1
+            ;;
+    esac
 }
 
 # Anzahl regulaerer Dateien in der Quelle, oder eine LEERE Ausgabe, wenn sie
@@ -900,7 +922,7 @@ w2u_verify() {
 # Menge passt; verglichen wird bei aktiven Ausschluessen trotzdem nicht (die
 # Filtersemantik von --list-only ist kein Beweis, siehe w2u_report).
 w2u_count_remote() {
-    local _List _Args _Rc=0 _Cnt=""
+    local _List _Args _Rc=0 _Cnt="" _Seen=""
     _List="$(mktemp "${TMPDIR:-/tmp}/w2u.remotelist.XXXXXXXX" 2>/dev/null)" || _List=""
     if [ -z "$_List" ]; then
         printf '%s\n' ""
@@ -909,8 +931,23 @@ w2u_count_remote() {
     _Args=( -r --list-only "--timeout=$_RsyncTimeout" )
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" > "$_List" 2>/dev/null || _Rc=$?
+    # Zwei Zahlen, nicht eine: Dateien ("-") UND ueberhaupt erkannte
+    # Listing-Zeilen (Rechte-Spalte). rc 0 plus null Datei-Treffer ist zweideutig
+    # - es kann ein Baum ganz ohne regulaere Dateien sein ODER eine Ausgabe, die
+    # dieser Zaehler nicht versteht (fremdes Format, abgeschnittenes Listing,
+    # leere Ausgabe). Nur wenn ueberhaupt eine Listing-Zeile erkannt wurde, ist
+    # die Null eine Messung; sonst bleibt die Ausgabe leer, also "nicht
+    # ermittelbar". Sonst laese sich "remote 0 / lokal 0" als Uebereinstimmung.
     if [ "$_Rc" -eq 0 ]; then
-        _Cnt="$(awk '/^-/ { _N++ } END { print _N + 0 }' "$_List")" || _Cnt=""
+        _Seen="$(awk '/^-/ { _F++ } /^[-dlbcps]/ { _K++ } END { printf "%d %d\n", _F + 0, _K + 0 }' "$_List")" || _Seen=""
+        case "$_Seen" in
+            [0-9]*' '[0-9]*)
+                set -- $_Seen
+                if [ "$2" -gt 0 ]; then
+                    _Cnt="$1"
+                fi
+                ;;
+        esac
     fi
     rm -f "$_List"
     printf '%s\n' "$_Cnt"
@@ -1093,15 +1130,40 @@ w2u_report() {
     if [ "$_ListState" != "ok" ] && [ "$_ListState" != "unbekannt" ]; then
         _Fail=1
     fi
-    if [ "$_ListState" = "unbekannt" ] && [ "$_Lines" -gt 0 ]; then
+    # CRITICAL (Review Task 8): ohne Chunkliste gibt es KEINE Chunk-Buchfuehrung.
+    # Das ist nur zulaessig, wenn der Lauf ausdruecklich als --verify-only
+    # erklaert ist UND die Dateizahlen tatsaechlich verglichen werden. Sonst
+    # bliebe von den drei Schichten keine einzige uebrig, und der Bericht
+    # meldete "PASS - Transfer vollstaendig" auf: Buchfuehrung keine,
+    # Dateizahlen keine. Erreichbar ueber "--verify-only --no-verify"; beide
+    # Optionen sind dokumentiert, und ein Parser, der die Kombination ablehnt,
+    # ist der zweite Riegel, nicht dieser hier.
+    if [ "$_ListState" = "unbekannt" ]; then
         # Ergebniszeilen ohne Massstab: wieviele es haetten sein muessen, ist
         # nicht feststellbar - und nicht feststellbar ist kein PASS.
-        _Fail=1
+        if [ "$_Lines" -gt 0 ]; then
+            _Fail=1
+        fi
+        if [ "$_VerifyOnly" != "1" ]; then
+            _Fail=1
+        fi
+        if [ "$_DoVerify" != "1" ]; then
+            _Fail=1
+        fi
     fi
     if [ "$_Malformed" -gt 0 ] || [ "$_Bad" -gt 0 ]; then
         _Fail=1
     fi
     if [ "$_MissCnt" -gt 0 ] || [ "$_DupCnt" -gt 0 ] || [ "$_UnkCnt" -gt 0 ]; then
+        _Fail=1
+    fi
+    # Erzwungen wird die Namensmenge, GEDRUCKT wird daneben eine Zeilenzahl.
+    # Diese Zeile macht beide zur selben Aussage: eine Zahl im Bericht, an der
+    # nichts haengt, laedt dazu ein, ihr zu glauben. Bei exakt deckenden
+    # Namensmengen ist sie strukturell nicht ausloesbar (ein Ueberschuss waere
+    # ein Duplikat, ein Fehlbetrag ein fehlender Name) - sie ist der Riegel fuer
+    # den Fall, dass jemand spaeter am Abgleich schraubt.
+    if [ "$_ListState" = "ok" ] && [ "$_ResultState" = "ok" ] && [ "$_Lines" -ne "$_Chunks" ]; then
         _Fail=1
     fi
 
@@ -1144,7 +1206,13 @@ w2u_report() {
             if [ "$_Lines" -gt 0 ]; then
                 printf ' Chunks          : %s Ergebniszeile(n), aber KEINE CHUNKLISTE bekannt - wieviele es haetten sein muessen, ist nicht feststellbar\n' "$_Lines"
             else
-                printf ' Chunks          : keine (Lauf ohne Uebertragung, z.B. --verify-only)\n'
+                printf ' Chunks          : keine CHUNKLISTE, keine Ergebniszeilen - es gibt keine Chunk-Buchfuehrung\n'
+            fi
+            if [ "$_VerifyOnly" != "1" ]; then
+                printf '   Ohne --verify-only ist das ein Lauf, der zerlegen sollte und dessen Massstab fehlt.\n'
+            fi
+            if [ "$_DoVerify" != "1" ]; then
+                printf '   Zusammen mit --no-verify bleibt KEINE Beweisschicht uebrig - dafuer gibt es kein PASS.\n'
             fi
             ;;
         *)
@@ -1196,12 +1264,18 @@ w2u_report() {
         _Detail=1
         printf '\n %s CHUNK(S) DOPPELT im Ergebnisprotokoll - die Zeilenzahl allein taeuscht Vollstaendigkeit vor:\n' "$_DupCnt"
         printf '%s\n' "$_Dupes"
+        if [ "$_DupCnt" -gt 20 ]; then
+            printf '   ... und %s weitere\n' "$((_DupCnt - 20))"
+        fi
     fi
 
     if [ "$_UnkCnt" -gt 0 ]; then
         _Detail=1
         printf '\n %s ERGEBNISZEILE(N) ZU UNBEKANNTEN CHUNKS - Protokoll und Chunkliste gehoeren nicht zusammen:\n' "$_UnkCnt"
         printf '%s\n' "$_Unknown"
+        if [ "$_UnkCnt" -gt 20 ]; then
+            printf '   ... und %s weitere\n' "$((_UnkCnt - 20))"
+        fi
     fi
 
     if [ "$_Detail" -eq 1 ]; then
