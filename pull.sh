@@ -16,6 +16,9 @@ _JobCnt=0              # 0 = Auto-Messung (Spec 5.4)
 _PMax=8                # hoechste Parallelitaet, die die Messung probiert
 _MaxRetry=3
 _RetryPause=5          # Sekunden, waechst linear mit dem Versuch
+_RsyncTimeout=300      # Sekunden ohne I/O, ab da bricht rsync selbst ab statt zu
+                       # haengen (Review Task 6) - sonst wird aus einem Retry ein
+                       # Haenger, der die Schleife nie zum naechsten Versuch kommen laesst
 _ChunkMax=100          # Obergrenze Eintraege je Chunk (Spec 5.5)
 _ThresholdFactor=4     # SCHWELLE = _ThresholdFactor * _PMax (Spec 5.3)
 _MaxItems=200000       # Notbremse gegen explodierende Ebenen
@@ -333,26 +336,85 @@ w2u_chunk() {
 # konnten nicht uebertragen werden") sind auf der Windows-Seite die Signatur
 # gesperrter/unlesbarer Dateien und werden hier unveraendert durchgereicht,
 # nie verschluckt.
+#
+# Review-Haertung (Task 6, nach erster Abnahme):
+#
+# 1) "printf ... >> $_ResultFile" ist unter set -e (main()'s Konfiguration) ein
+#    einfaches Kommando: schlaegt der Redirect fehl (Ergebnisverzeichnis nicht
+#    beschreibbar o.ae.), reisst errexit die Shell ab, BEVOR "return 0" erreicht
+#    wird - genau die Klasse Leck, gegen die Ruling 1 haertet, nur diesmal am
+#    Funktionsende statt am rsync-Aufruf. "|| w2u_log ..." haelt den Schreibfehler
+#    selbst am Leben (dieselbe Ausnahme-Idiom wie ueberall sonst) UND macht ihn
+#    sichtbar, statt eine verlorene Ergebniszeile spurlos verschwinden zu lassen.
+#
+# 2) _Rc startet nicht mehr bei 0, sondern bei einem Sentinel (255), der NUR ein
+#    tatsaechlich gelaufener rsync-Versuch ueberschreiben kann. Bei "_MaxRetry=0"
+#    oder einer while-Bedingung, die aus irgendeinem Grund nie eintritt, macht
+#    keine Zeile "Chunk 0 Versuche" mehr wie ein Erfolg aussehen. _MaxRetry und
+#    _RetryPause werden zusaetzlich vorab auf nichtnegative Ganzzahlen geprueft:
+#    ein nicht-numerisches _RetryPause wuerde sonst "$((_RetryPause * _Try))" zu
+#    einem Arithmetikfehler machen, der den GESAMTEN Lauf abbricht statt nur
+#    diesen einen Chunk als Fehler zu protokollieren - lieber hier laut und
+#    kontrolliert per w2u_die scheitern (ein Konfigurationsfehler, kein
+#    Transferfehler) als spaeter unkontrolliert crashen oder falsch gruen sein.
+#
+# 3) --timeout steht jetzt immer im argv (openrsync-erlaubt) - ohne Timeout
+#    wird aus einem haengenden Daemon ein Haenger statt eines Retries, und genau
+#    das hebt den Sinn der ganzen Schleife auf.
+#
+# 4) Jeder Versuch bekommt sein EIGENES Logfile ($_Name.$_Try.log) statt eines
+#    gemeinsamen, das jeder neue Versuch ueberschreibt. rc 23/24 listen genau die
+#    gesperrten/unlesbaren Dateinamen, die diese Aufgabe ueberhaupt erst
+#    interessant machen - verliert Versuch 2 das Log von Versuch 1, ist diese
+#    Diagnose weg, und es gibt kein zweites Hinsehen: die Windows-Quelle wird
+#    nach dem Transfer verschrottet.
+#
+# 5) Ein Chunkname mit TAB oder Zeilenumbruch wuerde die einzige Stelle
+#    zerstoeren, an der ein Fehlschlag je sichtbar wird ($_ResultFile). Aktuell
+#    von "split" (chunk.aaaa) strukturell nicht erzeugbar, aber der Guard ist
+#    billig gekauft gegen jeden kuenftigen Aufrufer, der das nicht mehr
+#    garantiert.
 w2u_run_chunk() {
     local _ChunkFile="$1"
-    local _Name _Try=1 _Rc=0
+    local _Name _Try=1 _Rc=255
     _Name="$(basename "$_ChunkFile")"
 
+    # ACHTUNG: "$(printf '\n')" waere hier eine Falle - Kommandosubstitution
+    # entfernt ALLE abschliessenden Newlines, das Ergebnis ist eine leere
+    # Zeichenkette und das Pattern wuerde zu "**" (passt auf ALLES). Deshalb
+    # ein echter eingebetteter Zeilenumbruch statt printf-Substitution.
+    local _Tab _Nl
+    _Tab="$(printf '\t')"
+    _Nl="
+"
+    case "$_Name" in
+        *"$_Tab"*|*"$_Nl"*)
+            w2u_die "Chunkname enthaelt TAB oder Zeilenumbruch, wuerde \$_ResultFile zerstoeren: '$_Name'"
+            ;;
+    esac
+    case "$_MaxRetry" in
+        ''|*[!0-9]*) w2u_die "_MaxRetry ist keine nichtnegative Ganzzahl: '$_MaxRetry'" ;;
+    esac
+    case "$_RetryPause" in
+        ''|*[!0-9]*) w2u_die "_RetryPause ist keine nichtnegative Ganzzahl: '$_RetryPause'" ;;
+    esac
+
     local _Args
-    _Args=( -rlt -W --partial --numeric-ids --stats )
+    _Args=( -rlt -W --partial --numeric-ids --stats "--timeout=$_RsyncTimeout" )
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     _Args=( "${_Args[@]}" "--files-from=$_ChunkFile" )
 
     while [ "$_Try" -le "$_MaxRetry" ]; do
         _Rc=0
-        "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" "$_DstRoot/" > "$_LogDir/$_Name.log" 2>&1 || _Rc=$?
+        "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" "$_DstRoot/" > "$_LogDir/$_Name.$_Try.log" 2>&1 || _Rc=$?
         [ "$_Rc" -eq 0 ] && break
         [ "$_Try" -lt "$_MaxRetry" ] && sleep $((_RetryPause * _Try))
         _Try=$((_Try + 1))
     done
     [ "$_Try" -gt "$_MaxRetry" ] && _Try="$_MaxRetry"
 
-    printf '%s\t%s\t%s\n' "$_Name" "$_Rc" "$_Try" >> "$_ResultFile"
+    printf '%s\t%s\t%s\n' "$_Name" "$_Rc" "$_Try" >> "$_ResultFile" \
+        || w2u_log "WARNUNG: Ergebniszeile fuer $_Name konnte nicht geschrieben werden (rc/Versuche: $_Rc/$_Try)"
     return 0
 }
 
