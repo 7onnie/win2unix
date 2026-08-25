@@ -1078,6 +1078,108 @@ w2u_count_local() {
     return 0
 }
 
+# Namensvergleich Quelle <-> Ziel. Aufruf: w2u_name_diff <ausgabedatei>.
+# rc 0 = der Vergleich stand; rc 1 = nicht ermittelbar (dann sagt der Bericht
+# genau das - eine leere Ausgabedatei darf NIE als "keine Unterschiede" gelesen
+# werden, das ist dieselbe Verwechslung wie ueberall sonst hier).
+#
+# Warum es diese Funktion gibt (Fund im Abschluss-Review, an einem echten
+# Daemon nachgemessen): ein "pkill -9" auf den Empfaenger laesst rsyncs
+# Temp-Datei ".big.bin.AoO9Ya" im Ziel liegen - bei einem gewoehnlichen TERM
+# wird sie umbenannt, bei -9 nicht. Der naechste, voellig saubere Lauf holt die
+# echte Datei und laesst die Waise daneben stehen: w2u_count_local zaehlt sie
+# mit, w2u_count_remote kann sie nicht sehen, und der Bericht meldete
+# "ABWEICHUNG in der Dateizahl" mit einer nackten Zahl - dauerhaft, bei jeder
+# Wiederholung, ohne jeden Hinweis WELCHE Datei ueberzaehlig ist. Und die
+# Wiederaufnahme nach einem harten Abbruch ist eine harte Zusage (Spec 1.3).
+#
+# Ausgabe je Zeile, Klasse<TAB>modul-relativer Pfad:
+#   R  nur in der QUELLE - eine echte Fehlstelle, das Ziel ist unvollstaendig
+#   T  nur am ZIEL, in der Form einer rsync-Temp-Datei (".<name>.XXXXXX") UND
+#      <name> existiert in der Quelle: die Waise eines abgebrochenen Laufs
+#   L  nur am ZIEL, alles andere - unerklaerte ueberzaehlige Datei
+# Die Trennung T/L ist der ganze Punkt: nur T darf entschuldigt werden, und die
+# Zusatzbedingung "<name> existiert in der Quelle" ist es, die eine echte
+# Nutzerdatei wie ".hidden.abcdef" (Temp-FORM, aber ohne Original) in L haelt.
+#
+# Verglichen wird mit GENAU denselben Filtern wie die beiden Zaehlfunktionen:
+# remote "^-" (nur regulaere Dateien, Symlinks sind "l"), lokal "-type f", und
+# derselbe -prune auf $_LogDir. Jede Abweichung davon erzeugte Unterschiede,
+# die keine sind - ein falsches FAIL aus dem Messwerkzeug selbst.
+#
+# ANNAHME: kein Dateiname enthaelt einen Zeilenumbruch (beide Listen sind
+# zeilenweise). WAS SIE BRICHT: nichts, was hier vorkommt - NTFS-Namen aus
+# Windows-Anwendungen haben keine Zeilenumbrueche, und der Dateizahl-Vergleich
+# daneben ist gegen dieselbe Annahme blind.
+w2u_name_diff() {
+    local _Out="$1" _Rem="" _Loc="" _Args _Rc=0
+    [ -n "$_Out" ] || return 1
+    [ -n "$_DstRoot" ] || return 1
+    [ -d "$_DstRoot" ] || return 1
+    _Rem="$(mktemp "${_TmpDir:-${TMPDIR:-/tmp}}/w2u.nd-remote.XXXXXXXX" 2>/dev/null)" || _Rem=""
+    _Loc="$(mktemp "${_TmpDir:-${TMPDIR:-/tmp}}/w2u.nd-local.XXXXXXXX" 2>/dev/null)" || _Loc=""
+    if [ -z "$_Rem" ] || [ -z "$_Loc" ]; then
+        rm -f "$_Rem" "$_Loc"
+        return 1
+    fi
+    _Args=( -r --list-only "--timeout=$_RsyncTimeout" )
+    [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
+    "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" > "$_Rem" 2>/dev/null || _Rc=$?
+    if [ "$_Rc" -eq 0 ]; then
+        find "$_DstRoot" -path "${_LogDir%/}" -prune -o -type f -print > "$_Loc" 2>/dev/null || _Rc=$?
+    fi
+    if [ "$_Rc" -eq 0 ]; then
+        # Unterschieden wird ueber FILENAME, nicht ueber "NR == FNR" - dieselbe
+        # Begruendung wie in w2u_run_list und w2u_report: die Abkuerzung bricht
+        # genau dann, wenn die erste Datei leer ist.
+        # Keine Intervall-Quantoren im Muster: BSD-awk kann sie nicht, deshalb
+        # stehen die sechs Zeichen des rsync-Suffixes ausgeschrieben da.
+        awk -v _RemFile="$_Rem" -v _Root="$_DstRoot" '
+            BEGIN {
+                _Skip = length(_Root) + 2
+                if (substr(_Root, length(_Root)) == "/") { _Skip = length(_Root) + 1 }
+            }
+            FILENAME == _RemFile {
+                sub(/\r$/, "")
+                if (substr($0, 1, 1) != "-") { next }
+                if (match($0, / [0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] /) == 0) { next }
+                _N = substr($0, RSTART + RLENGTH)
+                if (_N != "" && _N != ".") { _R[_N] = 1 }
+                next
+            }
+            {
+                _P = substr($0, _Skip)
+                if (_P == "") { next }
+                _L[_P] = 1
+                if (_P in _R) { next }
+                _D = ""
+                _B = _P
+                if (_P ~ /\//) {
+                    _D = _P
+                    sub(/\/[^\/]*$/, "/", _D)
+                    sub(/^.*\//, "", _B)
+                }
+                if (_B ~ /^\.[^\/]*\.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]$/) {
+                    _Orig = substr(_B, 2, length(_B) - 8)
+                    if ((_D _Orig) in _R) {
+                        printf "T\t%s\n", _P
+                        next
+                    }
+                }
+                printf "L\t%s\n", _P
+            }
+            END {
+                for (_K in _R) {
+                    if (!(_K in _L)) { printf "R\t%s\n", _K }
+                }
+            }
+        ' "$_Rem" "$_Loc" > "$_Out" || _Rc=$?
+    fi
+    rm -f "$_Rem" "$_Loc"
+    [ "$_Rc" -eq 0 ] || return 1
+    return 0
+}
+
 # Abschlussbericht. Das PASS/FAIL-Kriterium ist explizit, weil daran haengt, ob
 # die Quelle verschrottet werden darf.
 #
@@ -1115,6 +1217,7 @@ w2u_report() {
     local _Missing="" _Dupes="" _Unknown="" _Recon=""
     local _ResultState="ok" _ListState="ok"
     local _Dur=-1 _Now _Remote="" _Local="" _Rc=0 _Detail=0 _Binding=0
+    local _NdFile="" _NdRc=0 _NdMiss=0 _NdOrph=0 _NdExtra=0
 
     # ---- Ergebnisdatei: existiert / lesbar / auswertbar? --------------------
     # "existiert nicht" und "ist leer" duerfen nicht zusammenfallen (gleiche
@@ -1413,8 +1516,91 @@ w2u_report() {
             # Erst hier wurden zwei belastbare Zahlen wirklich verglichen.
             _Binding=1
             if [ "$_Remote" != "$_Local" ]; then
-                printf '   ABWEICHUNG in der Dateizahl!\n'
-                _Fail=1
+                # Ab hier wird die Zahl zu NAMEN aufgeloest. Zwei Gruende, und
+                # der zweite ist der eigentliche:
+                # 1) Eine nackte Zahl ist als Diagnose nutzlos - der Anwender
+                #    weiss nicht, welche Datei fehlt oder ueberzaehlig ist, und
+                #    genau das braucht er, bevor er die Quelle verschrottet.
+                # 2) Eine rsync-Temp-Datei aus einem hart abgebrochenen Lauf
+                #    (nachgemessen: "pkill -9" laesst ".big.bin.AoO9Ya" liegen)
+                #    machte JEDEN spaeteren, vollstaendigen Lauf dauerhaft zum
+                #    FAIL. Ein falsches FAIL auf dem dokumentierten
+                #    Wiederaufnahme-Weg (Spec 1.3) ist kein Schoenheitsfehler:
+                #    es ist die Meldung, die niemand mehr wegbekommt.
+                # Der zusaetzliche Listing-Lauf kostet Zeit - er laeuft nur auf
+                # diesem Zweig, also nur wenn ohnehin etwas nicht stimmt.
+                _NdFile="${_TmpDir:-${TMPDIR:-/tmp}}/w2u.namediff.$$"
+                _NdRc=0
+                w2u_name_diff "$_NdFile" || _NdRc=$?
+                if [ "$_NdRc" -ne 0 ]; then
+                    # Nicht ermittelbar ist nicht "in Ordnung": die Abweichung
+                    # steht, nur ihr Grund bleibt offen.
+                    printf '   ABWEICHUNG in der Dateizahl!\n'
+                    printf '   Welche Dateien abweichen, liess sich NICHT ermitteln - Abweichung bleibt bestehen.\n'
+                    _Fail=1
+                else
+                    _NdMiss="$(awk -F'\t' '$1 == "R" { _N++ } END { print _N + 0 }' "$_NdFile")" || _NdMiss=""
+                    _NdOrph="$(awk -F'\t' '$1 == "T" { _N++ } END { print _N + 0 }' "$_NdFile")" || _NdOrph=""
+                    _NdExtra="$(awk -F'\t' '$1 == "L" { _N++ } END { print _N + 0 }' "$_NdFile")" || _NdExtra=""
+                    case "$_NdMiss$_NdOrph$_NdExtra" in
+                        ''|*[!0-9]*)
+                            printf '   ABWEICHUNG in der Dateizahl!\n'
+                            printf '   Welche Dateien abweichen, liess sich NICHT auswerten - Abweichung bleibt bestehen.\n'
+                            _Fail=1
+                            _NdMiss=0; _NdOrph=0; _NdExtra=0
+                            ;;
+                    esac
+                    # Die Ueberschrift steht VOR den Listen, aber nur wenn die
+                    # Abweichung wirklich eine ist: eine abgebrochene
+                    # Temp-Datei allein soll keinen Bericht "ABWEICHUNG" rufen
+                    # lassen, den der Anwender dann drei Zeilen weiter
+                    # entkraeftet findet. Deshalb erst zaehlen, dann drucken.
+                    if [ "$_NdMiss" -gt 0 ] || [ "$_NdExtra" -gt 0 ] \
+                       || { [ "$_NdMiss" -eq 0 ] && [ "$_NdExtra" -eq 0 ] && [ "$_NdOrph" -eq 0 ]; }; then
+                        printf '   ABWEICHUNG in der Dateizahl!\n'
+                    fi
+                    if [ "$_NdMiss" -gt 0 ]; then
+                        printf '   %s Datei(en) FEHLEN am Ziel:\n' "$_NdMiss"
+                        awk -F'\t' '$1 == "R" && _N < 20 { printf "     %s\n", $2; _N++ }' "$_NdFile" \
+                            || printf '     (Liste konnte nicht gelesen werden)\n'
+                        if [ "$_NdMiss" -gt 20 ]; then
+                            printf '     ... und %s weitere\n' "$((_NdMiss - 20))"
+                        fi
+                        _Fail=1
+                    fi
+                    if [ "$_NdExtra" -gt 0 ]; then
+                        printf '   %s Datei(en) am Ziel OHNE Gegenstueck in der Quelle:\n' "$_NdExtra"
+                        awk -F'\t' '$1 == "L" && _N < 20 { printf "     %s\n", $2; _N++ }' "$_NdFile" \
+                            || printf '     (Liste konnte nicht gelesen werden)\n'
+                        if [ "$_NdExtra" -gt 20 ]; then
+                            printf '     ... und %s weitere\n' "$((_NdExtra - 20))"
+                        fi
+                        _Fail=1
+                    fi
+                    if [ "$_NdOrph" -gt 0 ]; then
+                        # Die einzige entschuldigte Klasse - und sie wird
+                        # NAMENTLICH genannt, jede einzelne. Entschuldigt wird
+                        # nur, was die Form einer rsync-Temp-Datei hat UND
+                        # dessen Originaldatei in der Quelle steht; alles andere
+                        # steht oben unter L und faellt durch.
+                        printf '   %s abgebrochene rsync-Temp-Datei(en) am Ziel - NICHT als Abweichung gewertet:\n' "$_NdOrph"
+                        awk -F'\t' '$1 == "T" && _N < 20 { printf "     %s\n", $2; _N++ }' "$_NdFile" \
+                            || printf '     (Liste konnte nicht gelesen werden)\n'
+                        if [ "$_NdOrph" -gt 20 ]; then
+                            printf '     ... und %s weitere\n' "$((_NdOrph - 20))"
+                        fi
+                        printf '     Sie stammen aus einem hart abgebrochenen Lauf (die Originaldatei ist da).\n'
+                        printf '     Nach dem Bericht loeschbar; hier zaehlt sie nicht gegen die Vollstaendigkeit.\n'
+                    fi
+                    if [ "$_NdMiss" -eq 0 ] && [ "$_NdExtra" -eq 0 ] && [ "$_NdOrph" -eq 0 ]; then
+                        # Zahlen verschieden, Namen deckungsgleich: dann hat
+                        # sich zwischen den beiden Zaehlungen etwas geaendert
+                        # (jemand schreibt noch dorthin) - kein Freispruch.
+                        printf '   Die Zahlen gehen auseinander, die Namen aber nicht - schreibt noch jemand an Quelle oder Ziel?\n'
+                        _Fail=1
+                    fi
+                fi
+                rm -f "$_NdFile"
             fi
         fi
     else

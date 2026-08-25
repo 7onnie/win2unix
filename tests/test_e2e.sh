@@ -138,6 +138,29 @@ t_assert_eq "brief 1" "$(cat "$_Dst/Daten/BRIEFE/1/1 AC.DOC")" "geloeschte Datei
 t_assert_eq "ja" "$_L" "geloeschtes leeres Verzeichnis wurde wiederhergestellt"
 t_assert_eq "" "$(diff -r "$_Src/Daten" "$_Dst/Daten" 2>&1)" "nach der Reparatur wieder identisch"
 
+# ---- Lauf 3b: Wiederaufnahme nach einem HARTEN Abbruch (Spec 9.4, Test 4) ---
+# Der Zustand, den ein "pkill -9" auf den Empfaenger hinterlaesst, wurde an
+# einem echten Daemon nachgemessen: rsyncs Temp-Datei ".<name>.XXXXXX" bleibt im
+# Ziel liegen (bei einem gewoehnlichen TERM wird sie umbenannt, bei -9 nicht).
+# Genau dieser Zustand wird hier hergestellt - nicht der Kill selbst: der
+# braeuchte ein Zeitfenster im Transfer, und ein Test, der manchmal nicht
+# zuschlaegt, ist kein Test.
+#
+# Der Fehler, den dieser Lauf pinnt: der naechste, VOLLSTAENDIGE Lauf zaehlte
+# die Waise als lokale Datei ohne entferntes Gegenstueck und meldete dauerhaft
+# "ABWEICHUNG in der Dateizahl" - bei jeder Wiederholung, mit einer nackten
+# Zahl. Wiederaufnahme ist aber eine harte Zusage (Spec 1.3), und ein FAIL, das
+# niemand mehr wegbekommt, ist genau das Signal, dem danach keiner mehr glaubt.
+printf 'halbe datei\n' > "$_Dst/Daten/BRIEFE/1/.1 AC.DOC.jccefG"
+_Out="$(bash "$_Root/pull.sh" --jobs 4 "$D_Url/Daten" "$_Dst" 2>&1)"
+_Rc=$?
+t_assert_rc 0 "$_Rc" "Lauf ueber eine liegengebliebene rsync-Temp-Datei endet mit rc 0"
+t_assert_contains "$_Out" "ERGEBNIS: PASS" "und meldet PASS - die Waise ist kein Grund fuer ein FAIL"
+t_assert_contains "$_Out" "rsync-Temp-Datei" "der Bericht nennt die Ausnahme, statt sie stillschweigend zu nehmen"
+t_assert_contains "$_Out" "BRIEFE/1/.1 AC.DOC.jccefG" "und die Waise mit Namen - eine nackte Zahl waere als Diagnose nutzlos"
+rm -f "$_Dst/Daten/BRIEFE/1/.1 AC.DOC.jccefG"
+t_assert_eq "" "$(diff -r "$_Src/Daten" "$_Dst/Daten" 2>&1)" "nach dem Entfernen der Waise wieder identisch"
+
 # ---- Lauf 4: Trockenlauf uebertraegt nichts --------------------------------
 # Pinnt die README-Zusage "--dry-run zeigt die Arbeitspakete, uebertraegt
 # nichts" an einem LEEREN Ziel: waere sie falsch, laege hier ein Baum.

@@ -414,6 +414,10 @@ mv "$_DstRoot/Bildarchiv/direkt_datei.txt" "$_TmpDir/beiseite.txt"
 _Out="$(w2u_report 2>&1)"; _Rc=$?
 t_assert_rc 1 "$_Rc" "abweichende Dateizahl -> FAIL"
 t_assert_contains "$_Out" "ABWEICHUNG" "die Abweichung wird benannt"
+# Eine nackte Zahl ist als Diagnose nutzlos: "remote 3 / lokal 2" sagt nicht,
+# WELCHE Datei fehlt - und danach wird die Quelle verschrottet.
+t_assert_contains "$_Out" "FEHLEN am Ziel" "der Bericht sagt, dass Dateien fehlen (nicht nur, dass eine Zahl abweicht)"
+t_assert_contains "$_Out" "Bildarchiv/direkt_datei.txt" "und nennt die fehlende Datei mit Namen"
 
 # Bei aktiven Ausschluessen sind die Zahlen nur orientierend - sonst waere
 # jeder Lauf mit --exclude-from ein garantiertes falsches FAIL.
@@ -430,6 +434,56 @@ t_assert_rc 0 "$_Rc" "--no-verify ueberspringt den Zahlenvergleich"
 t_assert_contains "$_Out" "uebersprungen" "der Bericht benennt die uebersprungene Pruefung"
 _DoVerify=1
 mv "$_TmpDir/beiseite.txt" "$_DstRoot/Bildarchiv/direkt_datei.txt"
+
+# --- Waisen eines hart abgebrochenen Laufs (Spec 9.4, Test 4) ---------------
+# Nachgemessen an einem echten Daemon: "pkill -9" auf den Empfaenger laesst
+# rsyncs Temp-Datei ".<name>.XXXXXX" im Ziel liegen (bei einem gewoehnlichen
+# TERM wird sie umbenannt, bei -9 nicht). Der naechste, VOLLSTAENDIGE Lauf holt
+# die echte Datei und laesst die Waise daneben stehen - vorher meldete der
+# Bericht dann dauerhaft "ABWEICHUNG in der Dateizahl", bei jeder Wiederholung,
+# mit einer nackten Zahl und ohne Hinweis auf den Namen. Ein falsches FAIL auf
+# genau dem Weg, den Spec 1.3 als harte Zusage fuehrt.
+#
+# Drei Faelle, weil die Ausnahme nur so bewiesen ist. Ohne Fall 2 und 3 waere
+# "Zahlendifferenz plus eine Datei in Temp-Form" ein Freibrief.
+_Orph="$_DstRoot/Bildarchiv/.direkt_datei.txt.jccefG"
+printf 'halb\n' > "$_Orph"
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "Fall 1: eine abgebrochene rsync-Temp-Datei macht aus einem VOLLSTAENDIGEN Transfer kein FAIL"
+t_assert_contains "$_Out" "rsync-Temp-Datei" "Fall 1: die Ausnahme wird benannt, nicht stillschweigend genommen"
+t_assert_contains "$_Out" "Bildarchiv/.direkt_datei.txt.jccefG" "Fall 1: die Waise steht namentlich im Bericht"
+case "$_Out" in
+    *ABWEICHUNG*) _Has=ja ;;
+    *)            _Has=nein ;;
+esac
+t_assert_eq "nein" "$_Has" "Fall 1: der Bericht ruft nicht 'ABWEICHUNG', was er zwei Zeilen weiter selbst entkraeftet"
+
+# Fall 2: dieselbe Waise UND eine wirklich fehlende Datei. Zwei Waisen, damit
+# die ZAHLEN auseinandergehen - eine fehlende Datei plus eine Waise heben sich
+# in der Zahl gegenseitig auf, und dann kommt dieser Vergleich nie zum Zug (das
+# ist die bekannte Blindheit des Zahlenvergleichs, gegen die der Verify steht).
+printf 'halb\n' > "$_DstRoot/Bildarchiv/1/tag/.f1.jpg.aB3xY9"
+mv "$_DstRoot/Bildarchiv/2/tag/f2.jpg" "$_TmpDir/beiseite2.jpg"
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 1 "$_Rc" "Fall 2: Waisen entschuldigen KEINE wirklich fehlende Datei -> FAIL"
+t_assert_contains "$_Out" "FEHLEN am Ziel" "Fall 2: die Fehlstelle wird als solche gemeldet"
+t_assert_contains "$_Out" "Bildarchiv/2/tag/f2.jpg" "Fall 2: und namentlich genannt"
+t_assert_contains "$_Out" "ABWEICHUNG" "Fall 2: hier ruft der Bericht sehr wohl ABWEICHUNG"
+mv "$_TmpDir/beiseite2.jpg" "$_DstRoot/Bildarchiv/2/tag/f2.jpg"
+rm -f "$_DstRoot/Bildarchiv/1/tag/.f1.jpg.aB3xY9"
+
+# Fall 3: die FORM einer Temp-Datei genuegt nicht - die Originaldatei muss in
+# der Quelle stehen. Sonst waere jede Nutzerdatei ".irgendwas.abcdef" ein
+# Freibrief fuer eine ueberzaehlige Datei am Ziel.
+printf 'fremd\n' > "$_DstRoot/Bildarchiv/.gibtsnicht.abcdef"
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 1 "$_Rc" "Fall 3: Temp-FORM ohne Originaldatei in der Quelle wird NICHT entschuldigt -> FAIL"
+t_assert_contains "$_Out" "OHNE Gegenstueck in der Quelle" "Fall 3: die ueberzaehlige Datei wird als solche gemeldet"
+t_assert_contains "$_Out" "Bildarchiv/.gibtsnicht.abcdef" "Fall 3: und namentlich genannt"
+rm -f "$_DstRoot/Bildarchiv/.gibtsnicht.abcdef"
+rm -f "$_Orph"
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "nach dem Aufraeumen ist der Bericht wieder sauber (die Faelle oben haben nichts liegengelassen)"
 
 # Eine Zahl, die nicht ermittelt werden konnte, darf nicht als "gleich" gelten.
 _SrcUrl="rsync://127.0.0.1:1/test"
