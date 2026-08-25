@@ -25,6 +25,14 @@ w2u_find_rsync
 
 _SrcUrl="$D_Url"
 _DstRoot="$_Dst"
+# Die parallele Phase hat seit dem Modulwurzel-Fix (Task 9) eigene Pfade:
+# w2u_run_chunk uebertraegt von _ParSrc (der MODULWURZEL - mit einer
+# Unterpfad-URL findet der Daemon die --files-from-Eintraege nicht und
+# uebertraegt nichts) nach _ParDst. Hier ist die Quelle ohnehin die Wurzel, die
+# Werte sind also dieselben wie oben; gesetzt werden muessen sie trotzdem,
+# sonst greift der Guard in w2u_run_chunk.
+_ParSrc="$D_Url"
+_ParDst="$_Dst"
 _LogDir="$_TmpDir/logs"; mkdir -p "$_LogDir"
 _ResultFile="$_TmpDir/results"; : > "$_ResultFile"
 _MaxRetry=2

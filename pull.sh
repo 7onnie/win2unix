@@ -43,6 +43,37 @@ _DoChecksum=0
 _SrcUrl=""
 _DstDir=""
 _DstRoot=""
+# ---- Modulwurzel, Praefix und die Pfade der PARALLELEN Phase ----------------
+# GEMESSEN (Controller-Nachmessung, Task 9): "--files-from" funktioniert gegen
+# einen rsync-Daemon AUSSCHLIESSLICH, wenn die Quelle die MODULWURZEL ist. Mit
+# einem Unterpfad - also dem dokumentierten Hauptfall rsync://IP/e/Archiv -
+# meldet der Sender "file has vanished" und uebertraegt NICHTS; openrsync
+# liefert dabei rc 0, der Ausfall waere also lautlos gewesen (rsync 3.5.0 als
+# Client: rc 24). Ein Elternpfad genuegt nicht, nur die Wurzel selbst.
+# Deshalb laeuft die parallele Phase ueber eigene Pfade:
+#   _ParSrc = Modulwurzel, Chunk-Eintraege tragen _SrcPrefix davor,
+#   _ParDst  so, dass "_ParDst/<_SrcPrefix>" wieder _DstRoot ergibt.
+# Sweep und Verify benutzen weiter _SrcUrl/_DstRoot - sie kommen ohne
+# --files-from aus und sind von der Falle nicht betroffen (nachgemessen).
+_SrcRoot=""           # rsync://host[:port]/modul  (ohne Schraegstrich am Ende)
+_SrcPrefix=""         # modul-relativer Pfad, leer wenn die Quelle die Wurzel ist
+_ParSrc=""            # Quelle der Worker = _SrcRoot
+_ParDst=""            # Ziel der Worker; leer, wenn nicht parallel uebertragen wird
+_ParMode="parallel"   # Vorgabe bewusst "parallel": w2u_report wertet eine
+                      # FEHLENDE Chunkliste nur im einstroemigen Lauf als
+                      # zulaessig. Die strenge Vorgabe heisst also, dass ein
+                      # Aufrufer, der w2u_parse_args nie durchlaufen hat
+                      # (gesourcte Tests, kuenftige Aufrufer), eine verlorene
+                      # Chunkliste weiterhin als FAIL sieht. Die umgekehrte
+                      # Vorgabe wuerde jeden verlorenen Massstab entschuldigen.
+                      # "parallel" oder "einstroemig". Einstroemig heisst: die
+                      # Kuerzung _DstRoot minus Praefix geht nicht auf, es gibt
+                      # also kein Ziel, in das die modul-relativen Eintraege
+                      # passen. Dann uebertraegt der Sweep allein - korrekt und
+                      # verifiziert, nur langsamer. Der Anwender MUSS das
+                      # erfahren: Geschwindigkeit ist der Grund fuer dieses
+                      # Werkzeug, und ein stiller Rueckfall waere derselbe
+                      # Fehler wie der lautlose Ausfall oben.
 _TmpDir=""
 _ResultFile=""
 _ChunkListFile=""     # von w2u_chunk gesetzt; der Abschlussbericht gleicht die
@@ -52,6 +83,18 @@ _ChunkListFile=""     # von w2u_chunk gesetzt; der Abschlussbericht gleicht die
                       # Liste meldet w2u_report FAIL, weil dann unbekannt ist,
                       # wieviele es haetten sein muessen.
 _StartTs=0
+_LogDirOwned=0        # 1 = das Logverzeichnis stammt aus unserem mktemp und
+                      # darf am Ende geloescht werden. Ein per --log-dir
+                      # angegebenes Verzeichnis gehoert dem Anwender und wird
+                      # NIE angefasst - "rm -rf" auf einen fremden Pfad waere
+                      # der einzige Weg, wie dieses Werkzeug Daten zerstoert.
+_VerifyState=""       # "", "sauber" oder "befunde". Von main() nach dem
+                      # Vergleichslauf gesetzt, vom Abschlussbericht gelesen
+                      # (CONTROLLER-RULING 2 aus Task 8): Befunde im Verify
+                      # muessen im BERICHT landen, nicht nur im Exit-Code.
+_AbsPath=""           # Rueckgabekanal von w2u_abs_path, siehe dort
+_ArgVal=""            # Rueckgabekanal von w2u_take_arg - eine Variable statt
+                      # einer Kommandosubstitution, siehe dort.
 
 w2u_log()  { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
 w2u_warn() { printf '[%s] WARNUNG: %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
@@ -66,8 +109,10 @@ Aufruf: pull.sh [Optionen] rsync://<WIN-IP>/<modul>/<pfad> <zielverzeichnis>
 
 Optionen:
   --jobs N            feste Parallelitaet, ueberspringt die Auto-Messung
-  --exclude-from DATEI
-  --log-dir PFAD
+  --exclude-from DATEI Ausschlussmuster; bei Quellen mit Unterpfad OHNE
+                      fuehrenden Schraegstrich (sonst Abbruch, siehe Meldung)
+  --log-dir PFAD      Logverzeichnis; darf NICHT unter dem Ziel liegen
+  --rsync PFAD        bestimmtes rsync benutzen statt selbst zu suchen
   --verify-only       nur pruefen, nichts uebertragen
   --no-verify         Verifikation ueberspringen (nicht empfohlen)
   --checksum          Verifikation zusaetzlich mit Pruefsummen (langsam)
@@ -423,6 +468,15 @@ w2u_run_chunk() {
     case "$_RetryPause" in
         ''|*[!0-9]*) w2u_die "_RetryPause ist keine nichtnegative Ganzzahl: '$_RetryPause'" ;;
     esac
+    # Quelle und Ziel der PARALLELEN Phase, nicht _SrcUrl/_DstRoot. Warum, steht
+    # im Kopf bei _SrcRoot: mit einer Unterpfad-URL findet der Daemon die
+    # Eintraege aus --files-from nicht und uebertraegt NICHTS - unter openrsync
+    # sogar mit rc 0. Ein Worker ohne diese beiden Werte darf deshalb gar nicht
+    # erst rsync aufrufen: er wuerde eine Ergebniszeile schreiben, die wie
+    # Erfolg aussieht. Leer heisst hier "der Aufrufer hat die parallele Phase
+    # nicht vorbereitet" - ein Programmierfehler, kein Transferfehler.
+    [ -n "$_ParSrc" ] || w2u_die "w2u_run_chunk ohne _ParSrc aufgerufen (Modulwurzel fehlt)"
+    [ -n "$_ParDst" ] || w2u_die "w2u_run_chunk ohne _ParDst aufgerufen (Ziel der parallelen Phase fehlt)"
 
     local _Args
     _Args=( -rlt -W --partial --numeric-ids --stats "--timeout=$_RsyncTimeout" )
@@ -431,7 +485,7 @@ w2u_run_chunk() {
 
     while [ "$_Try" -le "$_MaxRetry" ]; do
         _Rc=0
-        "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" "$_DstRoot/" > "$_LogDir/$_Name.$_Try.log" 2>&1 || _Rc=$?
+        "$_RsyncBin" "${_Args[@]}" "${_ParSrc%/}/" "${_ParDst%/}/" > "$_LogDir/$_Name.$_Try.log" 2>&1 || _Rc=$?
         [ "$_Rc" -eq 0 ] && break
         [ "$_Try" -lt "$_MaxRetry" ] && sleep $((_RetryPause * _Try))
         _Try=$((_Try + 1))
@@ -511,7 +565,11 @@ w2u_run_list() {
     [ -r "$_ListFile" ] || w2u_die "Chunkliste $_ListFile ist nicht lesbar"
     [ -s "$_ListFile" ] || return 0
 
-    export _RsyncBin _SrcUrl _DstRoot _LogDir _ResultFile _MaxRetry _RetryPause _ExcludeFrom _RsyncTimeout
+    # _ParSrc/_ParDst statt _SrcUrl/_DstRoot: der Worker uebertraegt von der
+    # MODULWURZEL aus (siehe w2u_run_chunk). Fehlten sie in dieser Liste, waeren
+    # sie im Kind leer - dort gilt kein "set -u" - und der Guard in
+    # w2u_run_chunk laesse jeden Chunk ohne Ergebniszeile scheitern.
+    export _RsyncBin _ParSrc _ParDst _LogDir _ResultFile _MaxRetry _RetryPause _ExcludeFrom _RsyncTimeout
     export -f w2u_run_chunk w2u_die w2u_log
     xargs -P "$_Jobs" -S 4096 -I {} "${BASH:-bash}" -c 'w2u_run_chunk "$1"' _ {} < "$_ListFile" || _Rc=$?
     if [ "$_Rc" -ne 0 ]; then
@@ -958,13 +1016,17 @@ w2u_count_remote() {
 # das ueber ein unlesbares Verzeichnis stolpert, liefert rc 1 UND eine zu
 # kleine Zahl; die duerfte nie als Messwert durchgehen.
 #
-# $_LogDir wird ausgeschlossen: es liegt per Vorgabe UNTER dem Ziel
-# ($_DstRoot/.win2unix-logs, siehe main()), und mitgezaehlt waere die lokale
-# Zahl in JEDEM produktiven Lauf groesser als die entfernte - ein garantiertes
-# falsches FAIL. Bei leerem $_LogDir passt "-path ''" auf nichts, der Ausdruck
-# bleibt also auch ohne Logverzeichnis korrekt. Der abgeschnittene Schraegstrich
-# ist kein Schoenheitsfehler: "--log-dir /pfad/" kommt vom Nutzer, und mit
-# Schraegstrich passte "-path" nicht mehr - die Logs waeren wieder in der Zahl.
+# $_LogDir wird ausgeschlossen. Seit Task 9 liegt es per Vorgabe NICHT mehr
+# unter dem Ziel (eigenes mktemp-Verzeichnis, CONTROLLER-RULING 3), und ein
+# per --log-dir angegebenes unterhalb des Ziels lehnt w2u_preflight ab - der
+# Ausschluss hier ist also heute ein Guertel zum Hosentraeger und kein
+# tragender Teil. Er bleibt trotzdem stehen: laege das Logverzeichnis je wieder
+# im verglichenen Baum, waere die lokale Zahl in JEDEM produktiven Lauf groesser
+# als die entfernte - ein garantiertes falsches FAIL. Bei leerem $_LogDir passt
+# "-path ''" auf nichts, der Ausdruck bleibt also auch ohne Logverzeichnis
+# korrekt. Der abgeschnittene Schraegstrich ist kein Schoenheitsfehler:
+# "--log-dir /pfad/" kommt vom Nutzer, und mit Schraegstrich passte "-path"
+# nicht mehr - die Logs waeren wieder in der Zahl.
 w2u_count_local() {
     local _List _Rc=0 _Cnt=""
     if [ ! -d "$_DstRoot" ]; then
@@ -1144,9 +1206,14 @@ w2u_report() {
             _Fail=1
         fi
         # b) Ein Lauf, der zerlegen sollte, dessen Massstab aber fehlt: die
-        #    Registrierung in w2u_chunk ging verloren. Nur der ausdrueckliche
-        #    --verify-only-Lauf darf ueberhaupt ohne Chunkliste dastehen.
-        if [ "$_VerifyOnly" != "1" ]; then
+        #    Registrierung in w2u_chunk ging verloren. Genau ZWEI Laeufe duerfen
+        #    ohne Chunkliste dastehen, und beide sind ausdrueckliche
+        #    Entscheidungen, keine Pannen: der --verify-only-Lauf (er
+        #    uebertraegt nichts) und der einstroemige Lauf (er zerlegt nicht,
+        #    weil die Eintraege in kein Ziel passen - angesagt beim Parsen).
+        #    In beiden Faellen traegt der Dateizahl-Vergleich das Urteil allein;
+        #    faellt auch der weg, greift die Bindungs-Regel weiter unten.
+        if [ "$_VerifyOnly" != "1" ] && [ "$_ParMode" != "einstroemig" ]; then
             _Fail=1
         fi
     fi
@@ -1194,7 +1261,18 @@ w2u_report() {
     else
         printf ' Dauer           : unbekannt (Startzeit nicht gesetzt)\n'
     fi
-    printf ' Parallelitaet   : %s\n' "$_JobCnt"
+    # Der Bericht ueberlebt den Scrollback - er darf nicht leise das Gegenteil
+    # dessen behaupten, was der Lauf laut angesagt hat (Review-Fund). _JobCnt
+    # traegt nur dann eine Messung, wenn w2u_run_all wirklich gelaufen ist; in
+    # jedem anderen Modus stuende dort der ungenutzte Vorgabe- oder --jobs-Wert
+    # und behauptete eine Parallelitaet, die es nie gab.
+    if [ "$_VerifyOnly" = "1" ]; then
+        printf ' Parallelitaet   : entfaellt (nur Verifikation, kein Transfer)\n'
+    elif [ "$_ParMode" = "einstroemig" ]; then
+        printf ' Parallelitaet   : keine (einstroemiger Lauf, ein rsync-Prozess)\n'
+    else
+        printf ' Parallelitaet   : %s\n' "$_JobCnt"
+    fi
 
     case "$_ListState" in
         ok)
@@ -1207,7 +1285,17 @@ w2u_report() {
             else
                 printf ' Chunks          : keine CHUNKLISTE, keine Ergebniszeilen - es gibt keine Chunk-Buchfuehrung\n'
             fi
-            if [ "$_VerifyOnly" != "1" ]; then
+            # Reihenfolge: --verify-only gewinnt. Beide Bedingungen koennen
+            # gleichzeitig wahr sein (ein Verify-Only-Lauf in einer Aufrufform,
+            # die auch einstroemig waere) - der Text "der Sweep hat
+            # uebertragen" waere dort schlicht falsch, denn dieser Modus
+            # uebertraegt nichts.
+            if [ "$_VerifyOnly" = "1" ]; then
+                :
+            elif [ "$_ParMode" = "einstroemig" ]; then
+                printf '   Einstroemiger Lauf: es wurde bewusst nicht zerlegt, der Sweep hat uebertragen.\n'
+                printf '   Das Urteil traegt hier allein der Dateizahl-Vergleich.\n'
+            elif [ "$_VerifyOnly" != "1" ]; then
                 printf '   Ohne --verify-only ist das ein Lauf, der zerlegen sollte und dessen Massstab fehlt.\n'
             fi
             ;;
@@ -1302,6 +1390,34 @@ w2u_report() {
         printf ' Dateizahl       : Vergleich uebersprungen (--no-verify)\n'
     fi
 
+    # CONTROLLER-RULING 2 (Task 8, umgesetzt in Task 9): der Ausgang des
+    # Vergleichslaufs gehoert in das BERICHTSERGEBNIS, nicht nur in den
+    # Exit-Code von main(). Wer ihn dort mit "|| true" verwirft, laesst diesen
+    # Bericht "PASS - Transfer vollstaendig" drucken, NACHDEM der Verify
+    # Befunde ausgegeben hat - und PASS ist hier die Freigabe, die
+    # Quellmaschine zu verschrotten.
+    #
+    # Bewusst KEIN "_Binding=1": ein Verify OHNE Befunde ist keine Schicht, die
+    # dieser Bericht allein tragen kann. Er lief mit derselben Filtersemantik,
+    # an der schon der Dateizahl-Vergleich sein Urteil verliert, sobald
+    # Ausschluesse aktiv sind - und genau darauf beruht Ruling 5 (der Fall
+    # "--verify-only + --exclude-from" hat KEINE bindende Schicht und wird
+    # deshalb in der CLI abgelehnt). Diese Schicht darf also FAIL setzen, aber
+    # nie allein ein PASS tragen. Wer hier "_Binding=1" ergaenzt, hebt Ruling 5
+    # still auf.
+    case "$_VerifyState" in
+        befunde)
+            printf ' Verify          : BEFUNDE - Quelle und Ziel sind NICHT gleich (%s/verify.log)\n' "${_LogDir%/}"
+            _Fail=1
+            ;;
+        sauber)
+            printf ' Verify          : Vergleichslauf ohne Befunde\n'
+            ;;
+        *)
+            :
+            ;;
+    esac
+
     # DIE REGEL, positiv formuliert und an genau EINER Stelle (Re-Review Task 8):
     # PASS setzt mindestens eine BINDENDE Beweisschicht voraus. Bindend ist eine
     # Schicht nur, wenn ihr Ergebnis "$_Fail" setzen KANN - die Chunk-
@@ -1330,13 +1446,662 @@ w2u_report() {
     return "$_Fail"
 }
 
+# ---------------------------------------------------------------------------
+# CLI, Preflight, Ablaufsteuerung (Spec 5.1/5.2).
+# ---------------------------------------------------------------------------
+
+# Holt den Wert einer Option und faengt die zwei Faelle ab, an denen ein
+# naiver "$2"-Zugriff scheitert. Sie muessen BEIDE einzeln stehen - jede fuer
+# sich sieht wie ein Sonderfall aus, ihr Produkt ist der Fehler:
+#   a) die Option steht am ENDE der Befehlszeile: "$2" ist unter "set -u" ein
+#      "unbound variable" mitten im Parser (Abbruch ohne verwertbare Meldung),
+#      und ohne set -u ein leerer Wert, mit dem der Lauf weiterliefe;
+#   b) der Option folgt die NAECHSTE OPTION: "--jobs --dry-run" wuerde
+#      "--dry-run" als Wert verschlucken - die Option waere weg, der Wert
+#      Unsinn, und beides faellt erst Stunden spaeter auf.
+# Der Wert kommt ueber eine Variable zurueck, NICHT ueber eine
+# Kommandosubstitution: w2u_die beendete darin nur die Subshell, der Aufrufer
+# liefe mit leerem Wert weiter (dieselbe Falle wie in w2u_decompose).
+w2u_take_arg() {
+    local _Opt="$1" _Val="${2-}"
+    if [ -z "$_Val" ]; then
+        w2u_die "Option $_Opt braucht ein Argument, hat aber keines bekommen"
+    fi
+    case "$_Val" in
+        -*)
+            w2u_die "Option $_Opt braucht ein Argument, bekam aber die Option '$_Val' - fehlt der Wert?"
+            ;;
+    esac
+    _ArgVal="$_Val"
+}
+
+# Schaltet den Transfer auf EINEN Strom um - die einzige Stelle, die das tut.
+# <grund> nennt, warum die parallele Phase nicht laufen kann.
+#
+# Drei Dinge gehoeren zusammen und deshalb in EINE Funktion (aufgerufen aus dem
+# Parser UND aus dem Preflight - zwei Stellen, an denen die Umschaltung noetig
+# werden kann, und getrennte Kopien liefen garantiert auseinander):
+#
+# 1) Der Rueckfall wird ANGESAGT. Wer dieses Werkzeug benutzt, tut es wegen der
+#    Parallelitaet; still auf einen Strom zurueckzufallen waere dieselbe
+#    Fehlerklasse wie der lautlose Ausfall, gegen den der Modulwurzel-Fix steht.
+# 2) Ohne Zerlegung gibt es KEINE Chunk-Buchfuehrung. Das Urteil haengt dann
+#    allein am Dateizahl-Vergleich - und faellt der auch weg (--no-verify, oder
+#    --exclude-from, das ihn zu einer blossen Orientierung macht), bleibt keine
+#    bindende Beweisschicht und der Lauf koennte nur FAIL melden. Dieselbe Lage
+#    wie bei Ruling 5, nur aus anderen Faktoren: also gleich ablehnen statt nach
+#    Stunden FAIL zu melden.
+# 3) --verify-only ist ausgenommen: dieser Modus uebertraegt ohnehin nichts, die
+#    Aufrufform spielt dort keine Rolle.
+w2u_einstroemig() {
+    local _Grund="$1" _Weg="$2"
+    _ParMode="einstroemig"
+    _ParDst=""
+    if [ "$_VerifyOnly" -eq 1 ]; then
+        return 0
+    fi
+    if [ "$_DryRun" -eq 0 ]; then
+        if [ "$_DoVerify" -eq 0 ]; then
+            w2u_die "Diese Aufrufform uebertraegt einstroemig ($_Grund), es gibt also keine Chunk-Buchfuehrung. Zusammen mit --no-verify bliebe KEINE bindende Beweisschicht - der Bericht koennte nur FAIL melden. Entweder --no-verify weglassen, oder parallel uebertragen: $_Weg"
+        fi
+        if [ -n "$_ExcludeFrom" ]; then
+            w2u_die "Diese Aufrufform uebertraegt einstroemig ($_Grund), es gibt also keine Chunk-Buchfuehrung; mit --exclude-from ist zugleich der Dateizahl-Vergleich nur orientierend. Es bliebe keine bindende Beweisschicht, der Lauf endete zwangslaeufig mit FAIL. Parallel uebertragen, dann traegt die Chunk-Buchfuehrung das Urteil auch mit Ausschluessen: $_Weg"
+        fi
+    fi
+    w2u_warn "Diese Aufrufform uebertraegt EINSTROEMIG, nicht parallel: $_Grund. Der Transfer laeuft vollstaendig und wird verifiziert, dauert aber laenger. Weil es ohne Zerlegung keine Chunk-Buchfuehrung gibt, haengt das Urteil allein am Dateizahl-Vergleich - laesst der sich nicht ermitteln, meldet der Bericht FAIL. $_Weg"
+}
+
+# Setzt _SrcUrl, _DstDir, _DstRoot und die Optionen.
+#
+# Zielpfad-Semantik wie bei rsync: der Slash am ENDE DER QUELLE entscheidet,
+# nicht der am Ziel.
+#
+# Die Kombinationspruefungen am Ende sind der eigentliche Inhalt dieser
+# Funktion. Die Lehre aus den beiden PASS-Loechern in w2u_report: die Fehler
+# entstehen nicht an einzelnen Flaggen, sondern an ihren PRODUKTEN. Deshalb
+# steht hier eine ausdrueckliche Regel, wann eine Kombination abgelehnt wird:
+#
+#   ABGELEHNT wird sie, wenn sie kein tragfaehiges Urteil erzeugen KANN, oder
+#   wenn ihre Wirkung dem widerspricht, was der Anwender ausdruecklich verlangt
+#   hat (er bekaeme weniger Pruefung, als er angefordert hat, und merkt es nicht).
+#   GEWARNT wird, wenn eine Option wirkungslos bleibt, der Lauf aber ehrlich
+#   ist - also kein Urteil faellt, das jemanden zum Verschrotten der Quelle
+#   verleiten koennte.
+#
+# Abgelehnt wird beim PARSEN, nicht nach Stunden Arbeit: ein Lauf, der
+# strukturell nur FAIL melden kann, darf nicht erst den ganzen Bestand lesen.
+w2u_parse_args() {
+    local _Pos=0 _Base _Rest _SrcHost _SrcModule
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --jobs)         w2u_take_arg "$1" "${2-}"; _JobCnt="$_ArgVal"; shift 2 ;;
+            --exclude-from) w2u_take_arg "$1" "${2-}"; _ExcludeFrom="$_ArgVal"; shift 2 ;;
+            --log-dir)      w2u_take_arg "$1" "${2-}"; _LogDir="$_ArgVal"; shift 2 ;;
+            --rsync)        w2u_take_arg "$1" "${2-}"; _RsyncBin="$_ArgVal"; shift 2 ;;
+            --verify-only)  _VerifyOnly=1; shift ;;
+            --no-verify)    _DoVerify=0; shift ;;
+            --checksum)     _DoChecksum=1; shift ;;
+            --dry-run)      _DryRun=1; shift ;;
+            --version)      printf 'win2unix pull.sh %s\n' "$W2U_VERSION"; exit 0 ;;
+            -h|--help)      w2u_usage; exit 0 ;;
+            -*)             w2u_die "unbekannte Option: $1" ;;
+            *)
+                if [ "$_Pos" -eq 0 ]; then
+                    _SrcUrl="$1"
+                elif [ "$_Pos" -eq 1 ]; then
+                    _DstDir="$1"
+                else
+                    w2u_die "zu viele Argumente: $1"
+                fi
+                _Pos=$((_Pos + 1))
+                shift
+                ;;
+        esac
+    done
+
+    [ -n "$_SrcUrl" ] || { w2u_usage; exit 2; }
+    [ -n "$_DstDir" ] || { w2u_usage; exit 2; }
+    # Zuerst numerisch pruefen: die Kombinationspruefungen unten rechnen mit
+    # _JobCnt, und ein "-eq" auf "abc" waere ein roher Shell-Fehler statt einer
+    # Meldung.
+    case "$_JobCnt" in
+        ''|*[!0-9]*) w2u_die "--jobs braucht eine Zahl, bekam: $_JobCnt" ;;
+    esac
+    case "$_SrcUrl" in
+        rsync://*) : ;;
+        *) w2u_die "Quelle muss mit rsync:// beginnen, bekam: $_SrcUrl" ;;
+    esac
+
+    # ---- Zielpfad-Semantik wie bei rsync ---------------------------------
+    # Doppelte Schraegstriche im PFADTEIL der URL zusammenziehen (das "//" des
+    # Schemas bleibt unangetastet). Ohne das wuerde "rsync://h/e//Archiv" den
+    # modul-relativen Praefix zu "/Archiv" machen, und die Kuerzung des Ziels
+    # ginge nie auf - der Lauf fiele stillschweigend auf einstroemig zurueck.
+    # "tr -s" statt einer Muster-Ersetzung: in bash 3.2 landen die
+    # Maskierungszeichen aus "${v//\/\//\/}" im Ergebnis (nachgemessen:
+    # "rsync://10.0.0.1\/e\"), und eine Falle in der Pfadberechnung ist genau
+    # das, was hier NICHT passieren darf.
+    _Rest="$(printf '%s' "${_SrcUrl#rsync://}" | tr -s '/')" \
+        || w2u_die "Quell-URL nicht normalisierbar: $_SrcUrl"
+    _SrcUrl="rsync://$_Rest"
+    # Erst die Schraegstriche am ZIEL abschneiden (mehrere sind erlaubt, "/"
+    # bleibt "/"), dann anhand der QUELLE entscheiden.
+    while [ "$_DstDir" != "/" ] && [ "${_DstDir%/}" != "$_DstDir" ]; do
+        _DstDir="${_DstDir%/}"
+    done
+    case "$_SrcUrl" in
+        */)
+            # Inhalt direkt ins Ziel. Auch hier koennen mehrere Schraegstriche
+            # stehen ("…/Archiv//"), sonst bliebe einer im Pfad stehen und
+            # jeder daraus gebaute URL haette einen doppelten.
+            while [ "${_SrcUrl%/}" != "$_SrcUrl" ]; do
+                _SrcUrl="${_SrcUrl%/}"
+            done
+            _DstRoot="$_DstDir"
+            ;;
+        *)
+            _Base="$(basename "$_SrcUrl")"
+            if [ "$_DstDir" = "/" ]; then
+                _DstRoot="/$_Base"
+            else
+                _DstRoot="$_DstDir/$_Base"
+            fi
+            ;;
+    esac
+    # Erst NACH dem Abschneiden pruefbar: "rsync://10.0.0.1/" ist ohne den
+    # Schraegstrich nur noch ein Host ohne Modul, und ein Transfer der
+    # Daemon-Wurzel gibt es nicht. Ohne diese Pruefung waere _DstRoot
+    # "<ziel>/10.0.0.1" und der Lauf liefe erst beim Listing auf.
+    case "${_SrcUrl#rsync://}" in
+        */*) : ;;
+        *)   w2u_die "Quelle braucht Host UND Modul: rsync://<host>/<modul>[/<pfad>], bekam: $_SrcUrl" ;;
+    esac
+
+    # ---- Modulwurzel, Praefix, Pfade der parallelen Phase -----------------
+    # Siehe die Herleitung im Kopf bei _SrcRoot: die Worker MUESSEN die
+    # Modulwurzel als Quelle bekommen, sonst uebertragen sie nichts.
+    _Rest="${_SrcUrl#rsync://}"
+    _SrcHost="${_Rest%%/*}"
+    _Rest="${_Rest#*/}"
+    _SrcModule="${_Rest%%/*}"
+    case "$_Rest" in
+        */*) _SrcPrefix="${_Rest#*/}" ;;
+        *)   _SrcPrefix="" ;;
+    esac
+    _SrcRoot="rsync://$_SrcHost/$_SrcModule"
+    _ParSrc="$_SrcRoot"
+    # _ParDst ist definiert durch "_ParDst/<praefix> == _DstRoot". Praktisch:
+    # _DstRoot von hinten um den Praefix kuerzen. Geht das nicht exakt auf,
+    # gibt es KEIN Ziel, in das die modul-relativen Eintraege passen - dann
+    # laeuft der Transfer einstroemig ueber den Sweep. Das Anfuehrungszeichen
+    # im Muster ist Pflicht: ein Praefix mit *, ? oder [ waere sonst ein Glob.
+    if [ -z "$_SrcPrefix" ]; then
+        _ParDst="$_DstRoot"
+        _ParMode="parallel"
+    elif [ "${_DstRoot%"/$_SrcPrefix"}" != "$_DstRoot" ]; then
+        _ParDst="${_DstRoot%"/$_SrcPrefix"}"
+        [ -n "$_ParDst" ] || _ParDst="/"
+        _ParMode="parallel"
+    else
+        w2u_einstroemig \
+            "das Ziel '$_DstRoot' endet nicht auf '/$_SrcPrefix', die modul-relativen Eintraege passen also in kein Verzeichnis" \
+            "Volle Parallelitaet gibt es mit einer Quelle OHNE abschliessenden Schraegstrich, deren letzter Pfadteil das Ziel bildet - z.B. 'pull.sh $_SrcRoot/$_SrcPrefix <ziel>'."
+    fi
+
+    # ---- Flag-Kombinationen: ABGELEHNT ------------------------------------
+    if [ "$_VerifyOnly" -eq 1 ] && [ "$_DoVerify" -eq 0 ]; then
+        # CONTROLLER-RULING 4.1: nachgewiesenes Loch. Der eine Lauf soll NUR
+        # pruefen, der andere gar nicht - zusammen bleibt weder
+        # Chunk-Buchfuehrung noch Dateizahl-Vergleich, also keine bindende
+        # Beweisschicht. w2u_report riegelt das seit Task 8 zusaetzlich ab;
+        # hier soll die sinnlose Kombination gar nicht erst starten.
+        w2u_die "--verify-only und --no-verify widersprechen sich: der eine Lauf soll NUR pruefen, der andere gar nicht. Uebrig bliebe ein Lauf ohne jede bindende Beweisschicht - der Bericht koennte nur FAIL melden. Eines von beiden weglassen."
+    fi
+    if [ "$_VerifyOnly" -eq 1 ] && [ -n "$_ExcludeFrom" ]; then
+        # CONTROLLER-RULING 5: bei aktiven Ausschluessen ist der
+        # Dateizahl-Vergleich nur orientierend und damit nicht bindend; ohne
+        # Uebertragung gibt es zugleich keine Chunk-Buchfuehrung. Der Lauf
+        # koennte nach der ganzen Pruefzeit nur FAIL melden - und dieses FAIL
+        # saegte nichts ueber die Daten aus.
+        w2u_die "--verify-only zusammen mit --exclude-from kann kein bindendes Urteil faellen: bei aktiven Ausschluessen sind die Dateizahlen nur orientierend, und ohne Uebertragung gibt es keine Chunk-Buchfuehrung. Der Lauf endete nach der gesamten Pruefzeit zwangslaeufig mit FAIL, ohne etwas ueber die Daten zu sagen. Entweder ohne --exclude-from pruefen, oder einen vollen Lauf fahren - dessen Chunk-Buchfuehrung traegt das Urteil auch mit Ausschluessen."
+    fi
+    if [ "$_VerifyOnly" -eq 1 ] && [ "$_DryRun" -eq 1 ]; then
+        w2u_die "--verify-only und --dry-run sind zwei verschiedene Betriebsarten; eine von beiden wuerde stillschweigend ignoriert. Eines von beiden weglassen."
+    fi
+    if [ "$_DoVerify" -eq 0 ] && [ "$_DoChecksum" -eq 1 ]; then
+        # Nicht bloss nutzlos, sondern irrefuehrend: wer --checksum tippt, will
+        # die STAERKSTE Pruefung und bekaeme gar keine.
+        w2u_die "--checksum verstaerkt genau die Verifikation, die --no-verify abschaltet - zusammen bewirkt --checksum NICHTS. Wer Byte-Gleichheit belegt haben will, laesst --no-verify weg."
+    fi
+
+    # ---- Flag-Kombinationen: nur GEWARNT ----------------------------------
+    # Der Unterschied zur Ablehnung oben: ein Trockenlauf faellt kein Urteil
+    # und uebertraegt nichts. Niemand kann sich durch ihn zum Verschrotten der
+    # Quelle verleiten lassen - deshalb reicht hier der Hinweis.
+    if [ "$_DryRun" -eq 1 ]; then
+        if [ "$_DoChecksum" -eq 1 ]; then
+            w2u_warn "--checksum bleibt im Trockenlauf wirkungslos"
+        fi
+        if [ "$_DoVerify" -eq 0 ]; then
+            w2u_warn "--no-verify bleibt im Trockenlauf wirkungslos"
+        fi
+        if [ "$_JobCnt" -gt 0 ]; then
+            w2u_warn "--jobs bleibt im Trockenlauf wirkungslos - es wird nichts uebertragen"
+        fi
+    fi
+    if [ "$_VerifyOnly" -eq 1 ] && [ "$_JobCnt" -gt 0 ]; then
+        w2u_warn "--jobs bleibt im Verify-Only-Lauf wirkungslos - es wird nichts uebertragen"
+    fi
+    if [ "$_VerifyOnly" -eq 0 ] && [ "$_DryRun" -eq 0 ] && [ "$_DoVerify" -eq 0 ]; then
+        w2u_warn "--no-verify: der Vergleich mit der Quelle entfaellt. Ein PASS heisst dann nur noch 'jeder Chunk hat rc 0 gemeldet' - nicht 'Quelle und Ziel sind gleich'."
+    fi
+}
+
+# Loest einen Pfad zu einem absoluten Pfad OHNE "." und ".." auf, und ohne ihn
+# anzulegen. Ergebnis in $_AbsPath, leer wenn nicht aufloesbar.
+#
+# Warum nicht einfach "cd $_LogDir && pwd -P": das setzt voraus, dass das
+# Verzeichnis schon da ist - und genau das Anlegen ist es, was hier erst NACH
+# der Pruefung passieren darf (sonst legt ein abgelehntes --log-dir im
+# Trockenlauf noch Verzeichnisse an). Rueckgabe ueber eine Variable, aus
+# demselben Grund wie bei w2u_take_arg.
+#
+# REVIEW-FUND, in beide Richtungen reproduziert: den noch nicht existierenden
+# Rest einfach LEXIKALISCH anzuhaengen, geht falsch, sobald darin ".." steht.
+# "<ziel>/foo/../Archiv/logs" saehe fuer den Vergleich nach "ausserhalb" aus,
+# waehrend "mkdir -p" es anschliessend INNERHALB des verglichenen Baums anlegt -
+# der Lauf uebertraegt Stunden und faellt am Ende am Dateizahl-Vergleich auf
+# FAIL (Ruling 3). Umgekehrt wuerde "<ziel>/Archiv/x/../../aussen" grundlos
+# abgelehnt, obwohl es kanonisch draussen liegt. Und ".." ist kein Sonderfall
+# fuer Bastler: "--log-dir ../logs" ist der normale Aufruf aus einem
+# Arbeitsverzeichnis heraus.
+#
+# Deshalb wird Segment fuer Segment gelaufen: "." faellt weg, ".." nimmt ein
+# Segment zurueck (bis hoechstens zur Wurzel), alles andere wird angehaengt -
+# und SOBALD der Zwischenstand wirklich existiert, uebernimmt "cd/pwd -P" die
+# Aufloesung. Damit loest das Betriebssystem alles, was es aufloesen kann
+# (Symlinks eingeschlossen, genau wie beim spaeteren mkdir), und nur der
+# wirklich noch nicht existierende Rest wird rein rechnerisch behandelt.
+# Zerlegt wird per Parameter-Expansion statt per IFS-Wortzerlegung: die
+# braeuchte "set -f" gegen Glob-Zeichen im Pfad, und eine Funktion darf die
+# Shell-Optionen ihres Aufrufers nicht anfassen (Ruling aus Task 6).
+w2u_abs_path() {
+    local _P="$1" _Rest _Seg _Cur
+    _AbsPath=""
+    [ -n "$_P" ] || return 0
+    case "$_P" in
+        /*) : ;;
+        *)  _P="$PWD/$_P" ;;
+    esac
+    _Cur="/"
+    _Rest="${_P#/}"
+    while [ -n "$_Rest" ]; do
+        _Seg="${_Rest%%/*}"
+        case "$_Rest" in
+            */*) _Rest="${_Rest#*/}" ;;
+            *)   _Rest="" ;;
+        esac
+        case "$_Seg" in
+            ''|.)
+                continue
+                ;;
+            ..)
+                _Cur="${_Cur%/*}"
+                [ -n "$_Cur" ] || _Cur="/"
+                ;;
+            *)
+                if [ "$_Cur" = "/" ]; then
+                    _Cur="/$_Seg"
+                else
+                    _Cur="$_Cur/$_Seg"
+                fi
+                ;;
+        esac
+        if [ -d "$_Cur" ]; then
+            _Cur="$(cd "$_Cur" 2>/dev/null && pwd -P)" || _Cur=""
+            if [ -z "$_Cur" ]; then
+                return 0
+            fi
+        fi
+    done
+    _AbsPath="$_Cur"
+    return 0
+}
+
+# Preflight (Spec 5.2). Alles, was den Lauf strukturell unmoeglich macht, wird
+# HIER laut - nicht nach der ersten Stunde Uebertragung.
+w2u_preflight() {
+    local _Version _VersionAll _Nl _LogAbs _DstAbs _Rc=0
+    w2u_find_rsync
+    # KEIN "| head -1" (nachgemessen, sonst stirbt hier JEDER Lauf): head
+    # schliesst die Pipe nach der ersten Zeile, GNU rsync 3.5 schreibt aber
+    # noch viele weitere und bekommt dafuer SIGPIPE. Unter dem "pipefail" aus
+    # main() ist damit die ganze Zuweisung rc 141, unter errexit endet der Lauf
+    # - vor der ersten Ausgabezeile, also voellig stumm. Dieselbe Falle ist in
+    # tests/lib/daemon.sh dokumentiert; die Loesung ist dieselbe: einmal
+    # vollstaendig einlesen, danach ohne Pipe schneiden.
+    _Nl="
+"
+    _VersionAll="$("$_RsyncBin" --version 2>&1)" || _VersionAll=""
+    _Version="${_VersionAll%%"$_Nl"*}"
+    w2u_log "rsync: $_RsyncBin ($_Version)"
+    case "$_Version" in
+        *openrsync*) w2u_log "openrsync erkannt - kein --info=progress2, kein --iconv (beides unkritisch)" ;;
+    esac
+
+    [ -d "$_DstDir" ] || w2u_die "Zielverzeichnis existiert nicht: $_DstDir"
+    # Schreibrecht nur verlangen, wo auch geschrieben wird: ein --verify-only
+    # gegen ein schreibgeschuetzt gemountetes Archiv ist ein voellig
+    # legitimer Anwendungsfall und darf nicht an dieser Pruefung sterben.
+    if [ "$_VerifyOnly" -eq 0 ]; then
+        [ -w "$_DstDir" ] || w2u_die "Zielverzeichnis nicht beschreibbar: $_DstDir"
+    fi
+    [ -z "$_ExcludeFrom" ] || [ -r "$_ExcludeFrom" ] || w2u_die "Ausschlussdatei nicht lesbar: $_ExcludeFrom"
+
+    "$_RsyncBin" --list-only -d "$_SrcUrl/" >/dev/null 2>&1 \
+        || w2u_die "Quelle nicht erreichbar: $_SrcUrl (laeuft START-RSYNC-SERVER.cmd? Port 873 offen?)"
+
+    # CONTROLLER-RULING: verankerte Ausschlussmuster werden ABGELEHNT, nicht
+    # umgeschrieben.
+    #
+    # Ausschluesse gelten relativ zur WURZEL DES TRANSFERS. Die ist seit dem
+    # Modulwurzel-Fix in der parallelen Phase $_ParSrc, in Sweep und Verify
+    # dagegen $_SrcUrl - ein "/Bild" meint also zwei verschiedene Stellen,
+    # sobald ein modul-relativer Praefix im Spiel ist. Nur der FUEHRENDE
+    # Schraegstrich ist davon betroffen: er verankert an der Transferwurzel.
+    # Muster ohne ihn ("*.tmp", "Bild/x") vergleicht rsync gegen das Ende des
+    # Pfades und sind damit von der Wurzel unabhaengig.
+    #
+    # Warum ablehnen statt umschreiben: eine Umschreibung ("/X" -> "/praefix/X")
+    # muesste die ganze Filtersyntax treffen (+/- Regeln, Negationen,
+    # Verzeichnis-Schraegstriche). Trifft sie daneben, schliesst der Lauf MEHR
+    # aus als gewollt - und das ist Datenverlust in einem Werkzeug, dessen
+    # Quelle danach verschrottet wird, mit dem Fehlerbild "eine Datei fehlt".
+    # Ein abgelehnter Lauf kostet eine Minute.
+    #
+    # Ohne Praefix (Quelle IST die Modulwurzel) sind verankerte Muster
+    # eindeutig - beide Wurzeln sind dieselbe - und bleiben erlaubt. Ebenso im
+    # Verify-Only-Lauf: dort laeuft keine parallele Phase, es gibt also nur
+    # eine Wurzel.
+    if [ -n "$_ExcludeFrom" ] && [ -n "$_SrcPrefix" ] \
+       && [ "$_ParMode" = "parallel" ] && [ "$_VerifyOnly" -eq 0 ]; then
+        _Rc=0
+        # Kommentare (# oder ;), Leerzeilen und CRLF-Enden sind KEINE Muster -
+        # eine Ausschlussdatei mit "# /Bild" darf keinen Lauf kosten. Die
+        # beiden Kommentar-Zeilen unten koennen bei DIESER Pruefung nicht
+        # zuschlagen (was mit "#" beginnt, beginnt nicht mit "/") - sie stehen
+        # als Riegel fuer jeden, der die Erkennung spaeter lockert; eine
+        # naivere Form ("steht irgendwo ein Schraegstrich?") laege sofort
+        # falsch, und der zugehoerige Test faengt genau das ab.
+        # Keine Intervall-Quantoren: BSD-awk kann sie nicht.
+        awk '
+            {
+                sub(/\r$/, "")
+                _L = $0
+                sub(/^[ \t]+/, "", _L)
+                if (_L == "") { next }
+                if (_L ~ /^[#;]/) { next }
+                sub(/^[-+][ \t]*/, "", _L)
+                if (_L ~ /^\//) { _N++ }
+            }
+            END { exit (_N > 0 ? 0 : 1) }
+        ' "$_ExcludeFrom" || _Rc=$?
+        if [ "$_Rc" -eq 0 ] && [ "$_DryRun" -eq 1 ]; then
+            # Eigene Regel, gleiche Begruendung wie bei den Flag-Kombinationen:
+            # ein Trockenlauf uebertraegt nichts und faellt kein Urteil, also
+            # warnt er, statt abzulehnen.
+            w2u_warn "In $_ExcludeFrom stehen VERANKERTE Muster (mit fuehrendem Schraegstrich); ein echter Lauf mit dieser Quelle wuerde deshalb abgelehnt."
+        elif [ "$_Rc" -eq 0 ]; then
+            w2u_die "In $_ExcludeFrom stehen VERANKERTE Muster (mit fuehrendem Schraegstrich), und die Quelle hat den modul-relativen Praefix '$_SrcPrefix'. Ein '/xyz' meint in der parallelen Phase (Wurzel $_ParSrc) etwas anderes als in Sweep und Verify (Wurzel $_SrcUrl) - ausgeschlossen wuerde je nach Phase Verschiedenes. Zwei Auswege: die Muster OHNE fuehrenden Schraegstrich schreiben (dann gelten sie ueberall gleich), oder gegen die Modulwurzel laufen ('pull.sh $_SrcRoot <ziel>'), wo der Anker eindeutig ist. Umgeschrieben wird hier bewusst nichts: ein daneben getroffenes Muster schliesst zu viel aus, und das faellt erst auf, wenn die Quelle schon verschrottet ist."
+        elif [ "$_Rc" -ne 1 ]; then
+            w2u_die "Ausschlussdatei $_ExcludeFrom nicht auswertbar (awk rc $_Rc)"
+        fi
+    fi
+
+    if [ "$_VerifyOnly" -eq 1 ]; then
+        # Ohne Zielbaum gibt es nichts zu vergleichen. Der Lauf wuerde sonst
+        # die volle Pruefzeit brauchen und am Ende "remote N / lokal 0" melden -
+        # richtig, aber teuer erkauft.
+        [ -d "$_DstRoot" ] || w2u_die "--verify-only, aber am Ziel gibt es nichts zu pruefen: $_DstRoot existiert nicht"
+    fi
+    # ---- Logverzeichnis ---------------------------------------------------
+    # CONTROLLER-RULING 3: $_LogDir darf NICHT unterhalb von $_DstRoot liegen.
+    # Der Bericht vergleicht die Zahl regulaerer Dateien remote gegen lokal;
+    # Logdateien im verglichenen Baum sind lokale Dateien ohne Gegenstueck auf
+    # der Quelle, und JEDER vollstaendige Lauf fiele falsch auf FAIL. Die
+    # Vorgabe ist deshalb ein eigenes Verzeichnis ausserhalb des verglichenen
+    # Baums - und ausserhalb von $_TmpDir, damit die Logs den Lauf ueberleben
+    # und die FAIL-Zeile des Berichts auf ein existierendes Verzeichnis zeigt.
+    #
+    # Reihenfolge (Review-Fund): GEPRUEFT WIRD, BEVOR ANGELEGT WIRD. Ein
+    # "mkdir -p" auf ein abgelehntes --log-dir im Zielbaum legte als
+    # Nebenwirkung auch $_DstRoot an - ausgerechnet im Trockenlauf, der nichts
+    # anlegen darf, und beide Verzeichnisse blieben liegen (ein fremdes
+    # Logverzeichnis raeumt w2u_cleanup zu Recht nie weg).
+    if [ -z "$_LogDir" ]; then
+        _LogDir="$(mktemp -d "${TMPDIR:-/tmp}/win2unix-logs.XXXXXXXX")" \
+            || w2u_die "Logverzeichnis nicht anlegbar"
+        _LogDirOwned=1
+    fi
+    # Auch ein selbst angegebenes Logverzeichnis muss draussen bleiben. Der
+    # Ausschluss in w2u_count_local schuetzt nur den LAUFENDEN Lauf: ein
+    # spaeterer Lauf mit anderem Logverzeichnis zaehlt diese Dateien mit und
+    # faellt falsch auf FAIL. Verglichen werden AUFGELOESTE Pfade (sonst
+    # entkaeme jede relative Schreibweise der Pruefung) - und aufgeloest wird
+    # ohne anzulegen, siehe w2u_abs_path.
+    w2u_abs_path "$_LogDir"; _LogAbs="$_AbsPath"
+    w2u_abs_path "$_DstRoot"; _DstAbs="$_AbsPath"
+    if [ -n "$_LogAbs" ] && [ -n "$_DstAbs" ]; then
+        case "$_LogAbs/" in
+            "$_DstAbs"/*)
+                w2u_die "--log-dir liegt im Zielbaum ($_LogAbs unter $_DstAbs): die Logdateien wuerden als lokale Dateien mitgezaehlt, und ein spaeterer Lauf faellt dadurch falsch auf FAIL. Logverzeichnis ausserhalb des Ziels waehlen."
+                ;;
+        esac
+    fi
+    if [ "$_LogDirOwned" -eq 0 ]; then
+        mkdir -p "$_LogDir" || w2u_die "Logverzeichnis nicht anlegbar: $_LogDir"
+    fi
+    # "mkdir -p" liefert 0 fuer ein bereits existierendes Verzeichnis, auch fuer
+    # ein schreibgeschuetztes. Ohne diese Zeile stuerbe der Lauf erst spaeter an
+    # einer fehlgeschlagenen Umleitung, und die Diagnose zeigte auf rsync statt
+    # auf das Logverzeichnis.
+    [ -w "$_LogDir" ] || w2u_die "Logverzeichnis nicht beschreibbar: $_LogDir"
+    w2u_log "Logs: $_LogDir"
+
+    # Angelegt wird nur, wenn wirklich uebertragen wird: ein Trockenlauf, der
+    # Verzeichnisse anlegt, ist kein Trockenlauf.
+    if [ "$_VerifyOnly" -eq 0 ] && [ "$_DryRun" -eq 0 ]; then
+        mkdir -p "$_DstRoot"
+        # _ParDst ist per Konstruktion ein VORFAHRE von _DstRoot - bei der
+        # Schraegstrich-Form kann das ein Verzeichnis sein, das der Anwender nie
+        # genannt hat und das die Pruefung oben nie gesehen hat. Dorthin
+        # schreiben die Worker. Was nicht beschreibbar ist, wird nicht
+        # stillschweigend versucht: dann laeuft der Transfer einstroemig, und
+        # der Anwender erfaehrt es.
+        if [ "$_ParMode" = "parallel" ]; then
+            if [ ! -d "$_ParDst" ] || [ ! -w "$_ParDst" ]; then
+                w2u_einstroemig \
+                    "das Ziel der parallelen Phase '$_ParDst' (der Teil von '$_DstRoot' oberhalb von '$_SrcPrefix') ist nicht beschreibbar" \
+                    "Der Zielpfad selbst stimmt bereits - es fehlen die Rechte: entweder '$_ParDst' beschreibbar machen, oder ein Ziel waehlen, dessen entsprechender Vorfahre beschreibbar ist."
+            fi
+        fi
+    fi
+
+}
+
+# Fuehrt den Vergleichslauf aus und haelt sein Ergebnis fuer den Bericht fest.
+#
+# CONTROLLER-RULING 2: der Ausgang darf NICHT mit "|| true" verworfen werden,
+# sonst druckt w2u_report ein PASS, nachdem der Verify Befunde ausgegeben hat.
+# Geprueft werden BEIDE Formen - der rc UND die Ausgabe. w2u_verify meldet
+# Befunde ueber beides; wer nur eine Form prueft, verliert die andere, sobald
+# jemand an w2u_verify schraubt. Genau dieses Produkt zweier je einzeln
+# gepruefter Formen war die Fehlerklasse der Tasks 7 und 8.
+w2u_verify_step() {
+    local _Rc=0
+    w2u_log "Verifikation (Vergleichslauf gegen die Quelle)"
+    w2u_verify > "$_LogDir/verify.log" 2>&1 || _Rc=$?
+    if [ "$_Rc" -ne 0 ] || [ -s "$_LogDir/verify.log" ]; then
+        _VerifyState="befunde"
+        w2u_warn "Verify meldet Abweichungen (rc $_Rc), erste Zeilen:"
+        head -50 "$_LogDir/verify.log" >&2
+    else
+        _VerifyState="sauber"
+    fi
+}
+
+# Aufraeumen am Ende JEDES Weges aus main() heraus - auch aus w2u_die, auch
+# nach einem Signal.
+#
+# Das Arbeitsverzeichnis geht immer, es enthaelt nur Zwischenstaende. Das
+# Logverzeichnis nur dann, wenn WIR es angelegt haben UND der Lauf sauber war:
+# nach einem FAIL sind die Logs die einzige Spur, warum, und der Bericht nennt
+# genau diesen Pfad. Ein per --log-dir angegebenes Verzeichnis wird nie
+# geloescht - es koennte auf alles Moegliche zeigen.
+w2u_cleanup() {
+    local _Rc=$? _LogEmpty=0
+    if [ -n "$_TmpDir" ] && [ -d "$_TmpDir" ]; then
+        rm -rf "$_TmpDir"
+    fi
+    if [ -n "$_LogDir" ] && [ -d "$_LogDir" ]; then
+        if [ -z "$(ls -A "$_LogDir" 2>/dev/null)" ]; then
+            _LogEmpty=1
+        fi
+        # Ein LEERES eigenes Logverzeichnis geht auch nach einem Fehlschlag:
+        # scheitert der Lauf vor der ersten Uebertragung (Listing der Quelle
+        # bricht ab), bliebe sonst bei jedem Versuch ein leeres Verzeichnis
+        # zurueck, und die Meldung verspraeche Logs, die es nicht gibt.
+        if [ "$_LogDirOwned" -eq 1 ] && { [ "$_Rc" -eq 0 ] || [ "$_LogEmpty" -eq 1 ]; }; then
+            rm -rf "$_LogDir"
+        else
+            printf '[%s] Logs bleiben liegen: %s\n' "$(date '+%H:%M:%S')" "$_LogDir" >&2
+        fi
+    fi
+    return "$_Rc"
+}
+
+# Abbruch von aussen. Der Lauf ist an jeder Stelle wiederaufnehmbar - rsync
+# holt beim naechsten Mal nur, was fehlt -, deshalb ist hier nichts zu retten,
+# sondern nur aufzuraeumen und das klar zu sagen.
+#
+# Die Kinder gehoeren zur Prozessgruppe dieses Skripts: ein Ctrl-C am Terminal
+# erreicht sie damit ohnehin selbst. Wird dagegen gezielt nur diesem Prozess ein
+# TERM geschickt, laeuft der Rest weiter - "pkill -P $$" beendet dann die
+# DIREKTEN Kinder, also den laufenden xargs; dessen eigene rsync-Kinder erreicht
+# es nicht, die beendet xargs beim Sterben oder sie laufen ihren Chunk zu Ende.
+# ANNAHME: pkill existiert (BSD und Linux haben es); fehlt es, bleibt es beim
+# Aufraeumen. WAS SIE BRICHT: ein Vordergrund-Kind laeuft noch, waehrend das
+# Signal kommt - bash fuehrt den Trap erst danach aus, dann ist das Kind
+# bereits fertig.
+w2u_on_signal() {
+    w2u_warn "abgebrochen - derselbe Aufruf setzt fort, bereits uebertragene Dateien bleiben liegen"
+    if command -v pkill >/dev/null 2>&1; then
+        pkill -TERM -P $$ >/dev/null 2>&1 || true
+    fi
+    exit 130
+}
+
 main() {
     set -euo pipefail
     if [ "$#" -eq 0 ]; then
         w2u_usage
         exit 2
     fi
-    w2u_die "noch nicht implementiert"
+    local _Rc=0 _Cnt=0
+    _StartTs="$(date +%s)"
+    w2u_parse_args "$@"
+
+    # CONTROLLER-RULING (Task 7): $_TmpDir kommt aus mktemp -d und liegt damit
+    # auf einem LOKALEN Dateisystem. Das ist keine Bequemlichkeit: $_ResultFile
+    # wird gleich von bis zu _PMax Prozessen gleichzeitig per ">>" beschrieben,
+    # und die Messung dazu (32 Schreiber, 116.000 Zeilen, kein Verlust) gilt
+    # nur lokal. Das ZIEL dieses Werkzeugs ist oft ein SMB-/NFS-Mount, auf dem
+    # sie nicht gilt - eine zerrissene Zeile dort waere ein fehlgeschlagener
+    # Chunk, den niemand mehr sieht. Die Ergebnisdatei gehoert deshalb NIE
+    # unter $_DstRoot, auch nicht "zu den Logs".
+    _TmpDir="$(mktemp -d "${TMPDIR:-/tmp}/win2unix.XXXXXXXX")"
+    trap 'w2u_cleanup' EXIT
+    trap 'w2u_on_signal' INT TERM
+
+    w2u_preflight
+
+    _ResultFile="$_TmpDir/results"
+    # CONTROLLER-RULING 4.2/4.3: in JEDEM Modus, auch in --verify-only.
+    # w2u_report stuft eine FEHLENDE Ergebnisdatei als Defekt ein (richtig so -
+    # sie ist die einzige Spur eines fehlgeschlagenen Chunks); ohne diese Zeile
+    # fiele jeder Verify-Only-Lauf falsch auf FAIL. Das ">" leert sie zugleich:
+    # Reste aus einem frueheren Lauf waeren fremde Namen im Abgleich.
+    : > "$_ResultFile"
+
+    if [ "$_VerifyOnly" -eq 1 ]; then
+        w2u_log "nur Verifikation - es wird nichts uebertragen"
+        w2u_verify_step
+        _Rc=0
+        w2u_report || _Rc=$?
+        exit "$_Rc"
+    fi
+
+    if [ "$_ParMode" = "parallel" ]; then
+        w2u_log "zerlege $_SrcUrl"
+        w2u_decompose "$_SrcUrl" $((_ThresholdFactor * _PMax)) "$_TmpDir/work"
+
+        if [ "$_DryRun" -eq 1 ]; then
+            # grep -c liefert rc 1 bei null Treffern - unter errexit waere das
+            # das Ende des Laufs, obwohl "keine Arbeitspakete" hier eine Aussage
+            # ist und kein Fehler. rc>1 (Datei unlesbar) bleibt ein Fehler.
+            _Cnt="$(grep -c . "$_TmpDir/work")" || [ $? -eq 1 ] || w2u_die "Arbeitsdatei nicht lesbar: $_TmpDir/work"
+            w2u_log "dry-run: $_Cnt Arbeitspakete, nichts uebertragen"
+            head -20 "$_TmpDir/work"
+            exit 0
+        fi
+
+        # Die Arbeitspakete stehen relativ zu $_SrcUrl - die Worker uebertragen
+        # aber von der MODULWURZEL aus, weil --files-from gegen einen Daemon nur
+        # so funktioniert (Herleitung im Kopf bei _SrcRoot). Deshalb bekommt
+        # jede Zeile hier den modul-relativen Praefix davor. Bewusst an DIESER
+        # Stelle und nicht in w2u_decompose: die Zerlegung bleibt damit das, was
+        # sie ist (eine Liste relativ zur angeforderten Quelle), und ihre
+        # Vollstaendigkeits-Tests messen weiter dasselbe.
+        if [ -n "$_SrcPrefix" ]; then
+            awk -v _P="$_SrcPrefix/" 'length($0) > 0 { print _P $0 }' "$_TmpDir/work" > "$_TmpDir/work.par" \
+                || w2u_die "Arbeitsliste konnte nicht auf modul-relative Pfade umgestellt werden"
+        else
+            cp "$_TmpDir/work" "$_TmpDir/work.par" \
+                || w2u_die "Arbeitsliste konnte nicht kopiert werden"
+        fi
+
+        mkdir -p "$_TmpDir/chunks"
+        w2u_chunk "$_TmpDir/work.par" "$_TmpDir/chunks" "$_PMax" "$_TmpDir/chunks.list"
+        w2u_log "parallele Phase: $_ParSrc/ -> $_ParDst/ (Praefix '${_SrcPrefix:-<keiner>}')"
+        w2u_run_all "$_TmpDir/chunks.list"
+    else
+        # Einstroemig: kein Zerlegen, keine Chunks, keine Buchfuehrung - der
+        # Sweep unten macht die ganze Arbeit. Beim Parsen ist das bereits
+        # angesagt worden; hier steht es noch einmal an der Stelle, an der es
+        # tatsaechlich passiert.
+        if [ "$_DryRun" -eq 1 ]; then
+            w2u_log "dry-run: einstroemige Aufrufform - es wuerde in EINEM rsync-Lauf uebertragen ($_SrcUrl/ -> $_DstRoot/), ohne Zerlegung"
+            exit 0
+        fi
+        w2u_log "einstroemige Uebertragung (keine Zerlegung, keine Chunk-Buchfuehrung) - der Vergleichslauf urteilt"
+    fi
+
+    w2u_log "Sweep-Pass"
+    _Rc=0
+    w2u_sweep >> "$_LogDir/sweep.log" 2>&1 || _Rc=$?
+    if [ "$_Rc" -ne 0 ]; then
+        # Der Sweep ist Reparatur, kein Beweis - sein rc darf den Lauf nicht
+        # abbrechen. Urteilen tun Verify und Bericht.
+        w2u_warn "Sweep meldete rc $_Rc, siehe $_LogDir/sweep.log"
+    fi
+
+    if [ "$_DoVerify" -eq 1 ]; then
+        w2u_verify_step
+    fi
+
+    _Rc=0
+    w2u_report || _Rc=$?
+    exit "$_Rc"
 }
 
 [ "${W2U_LIB_ONLY:-0}" = "1" ] || main "$@"
