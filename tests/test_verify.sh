@@ -322,6 +322,93 @@ rm -f "$_TmpDir/chunks.rest"
 _Out="$(w2u_report 2>&1)"; _Rc=$?
 t_assert_rc 0 "$_Rc" "RULING 2: eine FEHLENDE chunks.rest ist ebenso unerheblich"
 
+# ---------------------------------------------------------------------------
+# MATRIX statt Einzelfall (Re-Review Task 8).
+#
+# Die beiden bisherigen Loecher waren PRODUKTE zweier je einzeln geprueften
+# Formen: erst "--verify-only --no-verify", dann "--verify-only
+# --exclude-from". Ein dritter Einzeltest faende das dritte Produkt wieder
+# nicht. Deshalb alle 16 Kombinationen der vier Achsen, jede gegen die EINE
+# Frage: kann dieser Zustand PASS liefern, ohne dass irgendetwas BINDEND
+# verglichen wurde?
+#
+# Die Erwartung ist hier bewusst aus der REGEL abgeleitet und nicht aus dem
+# Code abgelesen:
+#   * Ein Lauf ohne Chunkliste, der nicht als --verify-only erklaert ist, hat
+#     seinen Massstab verloren -> FAIL, unabhaengig von allem anderen.
+#   * Sonst braucht es mindestens eine bindende Schicht: die Chunk-Buchfuehrung
+#     (Chunkliste vorhanden) ODER den Dateizahl-Vergleich, und der bindet nur
+#     ohne --no-verify UND ohne aktive Ausschluesse (dort ist er ausdruecklich
+#     nur orientierend).
+# Ergibt 9 x PASS und 7 x FAIL.
+#
+# Der Baum am Ziel ist an dieser Stelle vollstaendig (3/3), die Zahlen stimmen
+# also ueberall - was hier FAIL erzeugt, ist ausschliesslich das Fehlen einer
+# bindenden Schicht, nicht eine echte Abweichung.
+_MatrixFail=0
+for _Row in \
+    "1 1 1 1 0" "1 1 1 0 0" "1 1 0 1 0" "1 1 0 0 0" \
+    "1 0 1 1 0" "1 0 1 0 0" "1 0 0 1 0" "1 0 0 0 0" \
+    "0 1 1 1 1" "0 1 1 0 1" "0 1 0 1 0" "0 1 0 0 1" \
+    "0 0 1 1 1" "0 0 1 0 1" "0 0 0 1 1" "0 0 0 0 1"
+do
+    set -- $_Row
+    _HasList="$1"; _Dv="$2"; _Ex="$3"; _Vo="$4"; _Exp="$5"
+    if [ "$_HasList" = "1" ]; then
+        _ChunkListFile="$_TmpDir/chunks.list"
+        printf '%s\n' "$_TmpDir/chunks/chunk.aa" > "$_ChunkListFile"
+        printf 'chunk.aa\t0\t1\n' > "$_ResultFile"
+    else
+        _ChunkListFile=""
+        : > "$_ResultFile"
+    fi
+    _DoVerify="$_Dv"
+    if [ "$_Ex" = "1" ]; then
+        _ExcludeFrom="$_TmpDir/excludes.txt"
+        printf '%s\n' "nichts-davon" > "$_ExcludeFrom"
+    else
+        _ExcludeFrom=""
+    fi
+    _VerifyOnly="$_Vo"
+    _Out="$(w2u_report 2>&1)"; _Rc=$?
+    t_assert_rc "$_Exp" "$_Rc" "Matrix: Liste=$_HasList DoVerify=$_Dv Ausschluesse=$_Ex VerifyOnly=$_Vo"
+    # Jedes FAIL dieser Matrix muss aus der Bindungs-Regel oder aus dem
+    # fehlenden Massstab kommen - nie aus einem zufaellig anderen Grund.
+    if [ "$_Exp" = "1" ]; then
+        case "$_Out" in
+            *"KEINE Beweisschicht war bindend"*|*"Massstab fehlt"*) : ;;
+            *) _MatrixFail=$((_MatrixFail + 1)) ;;
+        esac
+    fi
+done
+t_assert_eq "0" "$_MatrixFail" "jedes FAIL der Matrix wird mit der Bindungs-Regel oder dem fehlenden Massstab begruendet"
+
+# Der konkret gemeldete Fall noch einmal einzeln, mit Blick auf den Text:
+# "--verify-only" plus "--exclude-from" ist ein voellig normaler Aufruf.
+_ChunkListFile=""
+: > "$_ResultFile"
+_DoVerify=1
+_VerifyOnly=1
+_ExcludeFrom="$_TmpDir/excludes.txt"
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 1 "$_Rc" "REGRESSION: --verify-only mit --exclude-from ergibt FAIL (der Zahlenvergleich traegt dort kein Urteil)"
+t_assert_contains "$_Out" "traegt kein Urteil" "der Bericht sagt, dass der orientierende Vergleich nichts entscheidet"
+t_assert_contains "$_Out" "nichts geprueft" "und benennt die Konsequenz"
+
+# Gegenprobe, damit die Regel nicht einfach alles rot faerbt: derselbe Lauf
+# ohne Ausschluesse hat mit dem Zahlenvergleich eine bindende Schicht.
+_ExcludeFrom=""
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "derselbe Verify-Only-Lauf OHNE Ausschluesse ergibt PASS - der Zahlenvergleich bindet dort"
+
+# Zustand fuer die folgenden Bloecke wiederherstellen
+_VerifyOnly=0
+_DoVerify=1
+_ExcludeFrom=""
+printf '%s\n' "$_TmpDir/chunks/chunk.aa" > "$_TmpDir/chunks.list"
+_ChunkListFile="$_TmpDir/chunks.list"
+printf 'chunk.aa\t0\t1\n' > "$_ResultFile"
+
 # --- Dateizahl-Vergleich ---------------------------------------------------
 mv "$_DstRoot/Bildarchiv/direkt_datei.txt" "$_TmpDir/beiseite.txt"
 _Out="$(w2u_report 2>&1)"; _Rc=$?

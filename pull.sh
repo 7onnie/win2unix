@@ -1021,7 +1021,7 @@ w2u_report() {
     local _Chunks=0 _MissCnt=0 _DupCnt=0 _UnkCnt=0
     local _Missing="" _Dupes="" _Unknown="" _Recon=""
     local _ResultState="ok" _ListState="ok"
-    local _Dur=-1 _Now _Remote="" _Local="" _Rc=0 _Detail=0
+    local _Dur=-1 _Now _Remote="" _Local="" _Rc=0 _Detail=0 _Binding=0
 
     # ---- Ergebnisdatei: existiert / lesbar / auswertbar? --------------------
     # "existiert nicht" und "ist leer" duerfen nicht zusammenfallen (gleiche
@@ -1115,6 +1115,9 @@ w2u_report() {
         if [ "$_Rc" -ne 0 ]; then
             _ListState="ist nicht auswertbar"
         else
+            # HIER, und nur hier, hat die Chunk-Buchfuehrung tatsaechlich
+            # verglichen - nicht dort, wo ein Vergleich bloss angestossen wird.
+            _Binding=1
             _MissCnt="$(printf '%s\n' "$_Recon" | awk -F'\t' '$1 == "M" { _N++ } END { print _N + 0 }')"
             _UnkCnt="$(printf '%s\n' "$_Recon" | awk -F'\t' '$1 == "U" { _N++ } END { print _N + 0 }')"
             _DupCnt="$(printf '%s\n' "$_Recon" | awk -F'\t' '$1 == "D" { _N++ } END { print _N + 0 }')"
@@ -1130,24 +1133,20 @@ w2u_report() {
     if [ "$_ListState" != "ok" ] && [ "$_ListState" != "unbekannt" ]; then
         _Fail=1
     fi
-    # CRITICAL (Review Task 8): ohne Chunkliste gibt es KEINE Chunk-Buchfuehrung.
-    # Das ist nur zulaessig, wenn der Lauf ausdruecklich als --verify-only
-    # erklaert ist UND die Dateizahlen tatsaechlich verglichen werden. Sonst
-    # bliebe von den drei Schichten keine einzige uebrig, und der Bericht
-    # meldete "PASS - Transfer vollstaendig" auf: Buchfuehrung keine,
-    # Dateizahlen keine. Erreichbar ueber "--verify-only --no-verify"; beide
-    # Optionen sind dokumentiert, und ein Parser, der die Kombination ablehnt,
-    # ist der zweite Riegel, nicht dieser hier.
+    # Ohne Chunkliste gibt es keine Chunk-Buchfuehrung. Zwei Aussagen, die die
+    # allgemeine Bindungs-Regel weiter unten NICHT abdeckt, weil sie nicht von
+    # "es wurde nichts geprueft" handeln, sondern von "die Buchfuehrung ist
+    # widerspruechlich":
     if [ "$_ListState" = "unbekannt" ]; then
-        # Ergebniszeilen ohne Massstab: wieviele es haetten sein muessen, ist
-        # nicht feststellbar - und nicht feststellbar ist kein PASS.
+        # a) Ergebniszeilen ohne Massstab: wieviele es haetten sein muessen, ist
+        #    nicht feststellbar - und nicht feststellbar ist kein PASS.
         if [ "$_Lines" -gt 0 ]; then
             _Fail=1
         fi
+        # b) Ein Lauf, der zerlegen sollte, dessen Massstab aber fehlt: die
+        #    Registrierung in w2u_chunk ging verloren. Nur der ausdrueckliche
+        #    --verify-only-Lauf darf ueberhaupt ohne Chunkliste dastehen.
         if [ "$_VerifyOnly" != "1" ]; then
-            _Fail=1
-        fi
-        if [ "$_DoVerify" != "1" ]; then
             _Fail=1
         fi
     fi
@@ -1210,9 +1209,6 @@ w2u_report() {
             fi
             if [ "$_VerifyOnly" != "1" ]; then
                 printf '   Ohne --verify-only ist das ein Lauf, der zerlegen sollte und dessen Massstab fehlt.\n'
-            fi
-            if [ "$_DoVerify" != "1" ]; then
-                printf '   Zusammen mit --no-verify bleibt KEINE Beweisschicht uebrig - dafuer gibt es kein PASS.\n'
             fi
             ;;
         *)
@@ -1286,16 +1282,42 @@ w2u_report() {
         _Local="$(w2u_count_local)"
         printf ' Dateizahl       : remote %s / lokal %s\n' "${_Remote:-?}" "${_Local:-?}"
         if [ -n "$_ExcludeFrom" ]; then
-            printf '   (Hinweis: Ausschluesse aktiv, Zahlen nur orientierend)\n'
+            # Ausdruecklich NICHT bindend: bei aktiven Ausschluessen sind die
+            # Zahlen wirklich nur orientierend. Die Konsequenz daraus ist nicht
+            # "dann ignorieren wir sie", sondern "dann traegt dieser Vergleich
+            # das Urteil nicht" - und war er der einzige, traegt es niemand.
+            printf '   (Hinweis: Ausschluesse aktiv, Zahlen nur orientierend - dieser Vergleich traegt kein Urteil)\n'
         elif [ -z "$_Remote" ] || [ -z "$_Local" ]; then
             printf '   Dateizahl nicht ermittelbar - die Vollstaendigkeit ist damit NICHT bestaetigt\n'
             _Fail=1
-        elif [ "$_Remote" != "$_Local" ]; then
-            printf '   ABWEICHUNG in der Dateizahl!\n'
-            _Fail=1
+        else
+            # Erst hier wurden zwei belastbare Zahlen wirklich verglichen.
+            _Binding=1
+            if [ "$_Remote" != "$_Local" ]; then
+                printf '   ABWEICHUNG in der Dateizahl!\n'
+                _Fail=1
+            fi
         fi
     else
         printf ' Dateizahl       : Vergleich uebersprungen (--no-verify)\n'
+    fi
+
+    # DIE REGEL, positiv formuliert und an genau EINER Stelle (Re-Review Task 8):
+    # PASS setzt mindestens eine BINDENDE Beweisschicht voraus. Bindend ist eine
+    # Schicht nur, wenn ihr Ergebnis "$_Fail" setzen KANN - die Chunk-
+    # Buchfuehrung also wirklich Namensmengen verglichen hat, oder zwei
+    # belastbare Dateizahlen wirklich gegeneinander standen. Ein Vergleich, der
+    # nur angestossen und dann als "orientierend" entwertet wurde, ist keine.
+    #
+    # Diese Regel ersetzt das Sammeln von Ausnahmen. Die beiden Loecher davor
+    # ("--verify-only --no-verify", danach "--verify-only --exclude-from") waren
+    # PRODUKTE zweier je einzeln gepruefter Formen; die naechste Kombination
+    # waere wieder eine gewesen. Wer hier eine Schicht hinzufuegt, muss nur an
+    # der Stelle, an der sie wirklich vergleicht, "_Binding=1" setzen.
+    if [ "$_Binding" -eq 0 ]; then
+        _Fail=1
+        printf '\n KEINE Beweisschicht war bindend - PASS waere eine Behauptung.\n'
+        printf '   Dieser Lauf hat nichts Falsches gefunden, aber auch nichts geprueft.\n'
     fi
 
     printf '\n'
