@@ -268,17 +268,33 @@ w2u_decompose() {
 # Eine feste Chunkgroesse waere falsch: 308 Pakete ergaeben nur 4 Chunks fuer
 # 8 Worker. Ziel ist deutlich mehr Chunks als Worker, damit xargs etwas zu
 # verteilen hat.
+#
+# split-Suffixlaenge und rc-Pruefung (Review nach Task 5): BSD split vergibt
+# ohne "-a" nur 2 Buchstaben Suffix (aa..zz, 676 Dateien) und bricht danach mit
+# "too many files" (rc 65) ab - laesst die bereits geschriebenen 676 Chunks
+# aber stehen. Ohne rc-Pruefung wuerde "ls" diesen unvollstaendigen Chunk-Satz
+# trotzdem einsammeln und der Rest der Arbeitsliste ginge STILL verloren -
+# nachgemessen: 700 Arbeitspakete bei Chunkgroesse 1 ergaben nur 676 Dateien,
+# 24 Pakete fehlten, rc 65 kam zurueck und wurde nur bisher nicht geprueft. Im
+# Zielprojekt ist stiller Datenverlust der einzige nicht behebbare Fehler, weil
+# die Windows-Quelle nach dem Transfer verschrottet wird. "-a 4" hebt die
+# Grenze auf 456.976 Dateien an, ersetzt aber NICHT die rc-Pruefung: split kann
+# auch aus anderen Gruenden scheitern (z.B. voller Zieldatentraeger), und jeder
+# unbemerkte Fehlschlag hier bedeutet fehlende Dateien am Ziel. Der rc wird
+# direkt an "split" gehaengt (kein Pipe, keine Command-Substitution dazwischen),
+# damit er nicht verlorengeht.
 w2u_chunk() {
     local _WorkFile="$1" _ChunkDir="$2" _PMaxLocal="$3" _ListOut="$4"
-    local _Total _Divisor _Size
-    _Total="$(grep -c . "$_WorkFile" || true)"
+    local _Total _Divisor _Size _Rc
+    _Total="$(grep -c . "$_WorkFile")" || [ $? -eq 1 ] || w2u_die "Arbeitsdatei $_WorkFile nicht lesbar"
     [ "$_Total" -gt 0 ] || w2u_die "keine Arbeitspakete - ist der Quellpfad richtig?"
     _Divisor=$((_ThresholdFactor * _PMaxLocal))
     _Size=$(( (_Total + _Divisor - 1) / _Divisor ))
-    [ "$_Size" -lt 1 ] && _Size=1
     [ "$_Size" -gt "$_ChunkMax" ] && _Size="$_ChunkMax"
     rm -f "$_ChunkDir"/chunk.*
-    split -l "$_Size" "$_WorkFile" "$_ChunkDir/chunk."
+    _Rc=0
+    split -a 4 -l "$_Size" "$_WorkFile" "$_ChunkDir/chunk." || _Rc=$?
+    [ "$_Rc" -eq 0 ] || w2u_die "split fehlgeschlagen (rc $_Rc) - Chunks waeren unvollstaendig"
     ls "$_ChunkDir"/chunk.* > "$_ListOut"
     w2u_log "$_Total Arbeitspakete, $_Size je Chunk, $(grep -c . "$_ListOut") Chunks"
 }
