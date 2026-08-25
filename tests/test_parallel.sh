@@ -235,6 +235,11 @@ t_assert_eq "28" "$(cut -f1 "$_ResultFile" | sort -u | grep -c .)" "jeder Chunkn
 # uebertragen) und _LogDir (Logs landeten im Wurzelverzeichnis).
 _TimeoutHits="$(grep -c -- "--timeout=$_RsyncTimeout" "$_StubBin/args.chunk.r0001" || true)"
 t_assert_eq "1" "$_TimeoutHits" "der Worker bekommt --timeout MIT Wert ($_RsyncTimeout) - _RsyncTimeout ist wirklich exportiert"
+# Kein --stats: seine Ausgabe liest niemand (gemessen wird ueber "du -sk", weil
+# openrsync und GNU rsync verschiedene Stats-Formate schreiben - so steht es
+# auch im Kopf von w2u_autotune). Eine Option im argv, deren Ausgabe niemand
+# auswertet, verspricht dem naechsten Leser etwas, was nicht stimmt.
+t_assert_eq "0" "$(grep -cx -- "--stats" "$_StubBin/args.chunk.r0001" || true)" "kein --stats im argv des Workers - die Ausgabe wuerde ohnehin niemand lesen"
 t_assert_eq "0" "$(cut -f2 "$_ResultFile" | grep -vc '^0$' || true)" "kein Stub-Chunk mit Exit != 0 (belegt nebenbei, dass _LogDir im Worker gesetzt ist - sonst schlaege die Log-Umleitung fehl)"
 [ -f "$_LogDir/chunk.r0001.1.log" ] && _LogDa=ja || _LogDa=nein
 t_assert_eq "ja" "$_LogDa" "das Versuchs-Log liegt in \$_LogDir, nicht im Wurzelverzeichnis"

@@ -625,7 +625,26 @@ rm -f "$_FakeBinDir"/calls.count "$_FakeBinDir"/call.*.args
 _DoChecksum=1
 w2u_verify >/dev/null 2>&1
 t_assert_eq "1" "$(grep -cx -- "-c" "$_FakeBinDir/call.1.args")" "--checksum setzt -c im argv des Verify"
+
+# Der BERICHT muss sagen, WAS verglichen wurde. "Vergleichslauf ohne Befunde"
+# stand bisher gleichlautend da, mit und ohne --checksum - und der Unterschied
+# ist erheblich: ohne -c faellt eine inhaltlich veraenderte Datei gleicher
+# Groesse und Zeit nicht auf. Wer den Bericht spaeter liest (er liegt seit dem
+# Abschluss-Review als report.txt), muss wissen, welche der beiden Aussagen er
+# in der Hand hat.
+_SaveVerifyState="$_VerifyState"
+_VerifyState="sauber"
+_Out="$(w2u_report 2>&1)"
+t_assert_contains "$_Out" "Verglichen wurden INHALTE" "mit --checksum nennt der Bericht den Inhaltsvergleich"
 _DoChecksum=0
+_Out="$(w2u_report 2>&1)"
+t_assert_contains "$_Out" "NICHT die Inhalte" "ohne --checksum sagt der Bericht ausdruecklich, dass die Inhalte NICHT verglichen wurden"
+case "$_Out" in
+    *"Verglichen wurden INHALTE"*) _Has=ja ;;
+    *)                             _Has=nein ;;
+esac
+t_assert_eq "nein" "$_Has" "und behauptet nicht das Gegenteil"
+_VerifyState="$_SaveVerifyState"
 _ExcludeFrom=""
 
 # rc 0 UND trotzdem keine verstandene Listing-Zeile: der Stub endet mit 0 und

@@ -336,6 +336,36 @@ t_assert_contains "$_Out" "WARNUNG" "im Trockenlauf wirkungslose Optionen warnen
 _reset_opts
 
 # --- Preflight ----------------------------------------------------------------
+# _RsyncTimeout war der einzige Zahlen-Regler ohne case-Pruefung. Er landet als
+# "--timeout=$_RsyncTimeout" im argv von vier verschiedenen rsync-Aufrufen;
+# gemessen wurde, dass GNU rsync einen leeren Wert schluckt (kein Timeout mehr,
+# also Haenger statt Retry) und openrsync ihn ablehnt (jeder Chunk scheitert) -
+# zwei Fehlerbilder aus einem Konfigurationsfehler, beide mit dem Finger auf
+# rsync statt auf die Ursache. Geprueft wird in beide Richtungen: die Ablehnung
+# muss kommen, UND ein gueltiger Wert darf nicht daran haengen.
+_Rc=0
+_Out="$(W2U_LIB_ONLY=1 bash -c '. "$1"; _RsyncTimeout="abc"; w2u_preflight' _ "$_Root/pull.sh" 2>&1)" || _Rc=$?
+t_assert_rc 1 "$_Rc" "nicht-numerisches _RsyncTimeout bricht im Preflight ab"
+t_assert_contains "$_Out" "_RsyncTimeout" "und benennt den Regler"
+# Der rc allein pinnt hier nichts: ohne die Pruefung stirbt derselbe Aufruf
+# zwei Schritte spaeter am fehlenden Zielverzeichnis, wieder mit rc 1. Gepinnt
+# wird deshalb die STELLE - die Pruefung steht vor w2u_find_rsync, also darf
+# dessen Versionszeile noch nicht in der Ausgabe stehen.
+case "$_Out" in
+    *"rsync: "*) _Has=ja ;;
+    *)           _Has=nein ;;
+esac
+t_assert_eq "nein" "$_Has" "und zwar als ERSTES - keine Zeile aus dem restlichen Preflight davor"
+_Rc=0
+_Out="$(W2U_LIB_ONLY=1 bash -c '. "$1"; _RsyncTimeout=""; w2u_preflight' _ "$_Root/pull.sh" 2>&1)" || _Rc=$?
+t_assert_rc 1 "$_Rc" "LEERES _RsyncTimeout ebenso (GNU rsync wuerde es schlucken und ohne Timeout laufen)"
+_Out="$(W2U_LIB_ONLY=1 bash -c '. "$1"; _RsyncTimeout=300; w2u_preflight' _ "$_Root/pull.sh" 2>&1 || true)"
+case "$_Out" in
+    *_RsyncTimeout*) _Has=ja ;;
+    *)               _Has=nein ;;
+esac
+t_assert_eq "nein" "$_Has" "ein gueltiger Wert scheitert NICHT an dieser Pruefung (sie greift nicht zu weit)"
+
 _Out="$(bash "$_Root/pull.sh" --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp/gibtsnicht" 2>&1)"; _Rc=$?
 t_assert_rc 1 "$_Rc" "fehlendes Zielverzeichnis bricht ab"
 t_assert_contains "$_Out" "Zielverzeichnis" "fehlendes Zielverzeichnis wird benannt"
