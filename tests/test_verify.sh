@@ -492,6 +492,54 @@ t_assert_rc 1 "$_Rc" "nicht ermittelbare Dateizahl -> FAIL"
 t_assert_contains "$_Out" "nicht ermittelbar" "der Grund wird benannt"
 _SrcUrl="$_SaveUrl"
 
+# --- Widerspruch: alle Chunks melden Erfolg, am Ziel liegt nichts ----------
+# Die letzte Tuer, die --no-verify offen laesst: dort traegt die
+# Chunk-Buchfuehrung das Urteil allein, und "jeder Chunk hat rc 0 gemeldet" ist
+# ein Signal, das in diesem Projekt nachweislich gelogen hat (openrsync liefert
+# rc 0 und uebertraegt nichts). Ein Widerspruch ist kein PASS.
+#
+# Drei Faelle, und die letzten zwei sind der Beweis, dass die Regel nicht
+# einfach jeden Lauf ohne Zuwachs rot faerbt - denn genau so sieht eine
+# WIEDERAUFNAHME aus, und die ist eine harte Zusage (Spec 1.3).
+_SaveDstRoot="$_DstRoot"
+_SaveVerify="$_DoVerify"
+_DoVerify=0
+mkdir -p "$_TmpDir/leer-ziel"
+_DstRoot="$_TmpDir/leer-ziel"
+_ParKbBefore=100
+_ParKbAfter=100
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 1 "$_Rc" "Chunks mit rc 0, aber null Zuwachs und keine Datei am Ziel -> FAIL"
+t_assert_contains "$_Out" "WIDERSPRUCH" "der Widerspruch wird benannt"
+t_assert_contains "$_Out" "NICHTS ans Ziel gebracht" "und im Klartext erklaert"
+
+# Fall 2: dieselbe Lage, aber am Ziel liegt etwas - das ist eine
+# Wiederaufnahme ueber einen vollstaendigen Baum und voellig normal.
+printf 'da\n' > "$_DstRoot/schon-da.txt"
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "null Zuwachs bei vorhandenen Dateien ist eine Wiederaufnahme -> PASS"
+case "$_Out" in
+    *WIDERSPRUCH*) _Has=ja ;;
+    *)             _Has=nein ;;
+esac
+t_assert_eq "nein" "$_Has" "und wird nicht als Widerspruch gemeldet"
+
+# Fall 3: leeres Ziel, aber gemessener Zuwachs - kein Widerspruch (die Zahlen
+# widersprechen sich nicht, dann urteilt diese Schicht nicht).
+rm -f "$_DstRoot/schon-da.txt"
+_ParKbAfter=500
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "gemessener Zuwachs ist kein Widerspruch, auch ohne gezaehlte Dateien"
+
+# Und ohne Messpunkte (einstroemiger Lauf, --verify-only, altes Verhalten)
+# urteilt die Schicht ueberhaupt nicht - "nicht gemessen" ist kein Befund.
+_ParKbBefore=""
+_ParKbAfter=""
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "ohne Messpunkte faellt diese Schicht kein Urteil"
+_DstRoot="$_SaveDstRoot"
+_DoVerify="$_SaveVerify"
+
 # --- Shell-Optionen und errexit --------------------------------------------
 # Gleiche Zusicherung wie fuer w2u_run_chunk (Task 6): keine Funktion darf die
 # Shell-Optionen ihres Aufrufers veraendern. "$-" ohne Kommandosubstitution,

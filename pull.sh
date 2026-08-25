@@ -93,6 +93,12 @@ _ChunkListFile=""     # von w2u_chunk gesetzt; der Abschlussbericht gleicht die
                       # Liste meldet w2u_report FAIL, weil dann unbekannt ist,
                       # wieviele es haetten sein muessen.
 _StartTs=0
+# Belegte KB am Ziel unmittelbar VOR und NACH der parallelen Phase. Leer heisst
+# "nicht gemessen" (kein paralleler Lauf) oder "nicht ermittelbar" (du lieferte
+# keine Zahl) - beides ist KEIN Messwert und fuehrt zu keinem Urteil. Wozu:
+# siehe die Widerspruchspruefung in w2u_report.
+_ParKbBefore=""
+_ParKbAfter=""
 _LogDirOwned=0        # 1 = das Logverzeichnis stammt aus unserem mktemp und
                       # darf am Ende geloescht werden. Ein per --log-dir
                       # angegebenes Verzeichnis gehoert dem Anwender und wird
@@ -1227,7 +1233,7 @@ w2u_report() {
     local _Missing="" _Dupes="" _Unknown="" _Recon=""
     local _ResultState="ok" _ListState="ok"
     local _Dur=-1 _Now _Remote="" _Local="" _Rc=0 _Detail=0 _Binding=0
-    local _NdFile="" _NdRc=0 _NdMiss=0 _NdOrph=0 _NdExtra=0
+    local _NdFile="" _NdRc=0 _NdMiss=0 _NdOrph=0 _NdExtra=0 _GrowFiles=""
 
     # ---- Ergebnisdatei: existiert / lesbar / auswertbar? --------------------
     # "existiert nicht" und "ist leer" duerfen nicht zusammenfallen (gleiche
@@ -1615,6 +1621,48 @@ w2u_report() {
         fi
     else
         printf ' Dateizahl       : Vergleich uebersprungen (--no-verify)\n'
+    fi
+
+    # ---- Widerspruch: alle Chunks melden Erfolg, am Ziel liegt nichts -------
+    # Die eine Tuer, die --no-verify noch offen laesst: dort setzt die
+    # Chunk-Buchfuehrung allein "_Binding=1", ein PASS heisst dann nur "jeder
+    # Chunk hat rc 0 gemeldet" - und genau dieses Signal hat in diesem Projekt
+    # gelogen (openrsync liefert rc 0 und uebertraegt nichts, siehe Kopf bei
+    # _SrcRoot). Ein Widerspruch ist kein PASS, also gehoert er hierher.
+    #
+    # Zwei Bedingungen MUESSEN zusammenkommen, sonst waere das ein falsches FAIL
+    # auf einem voellig normalen Weg:
+    #   - das Ziel ist um NULL KB gewachsen, UND
+    #   - am Ziel steht keine einzige regulaere Datei.
+    # Die zweite Bedingung ist es, die die Wiederaufnahme rettet: ein zweiter
+    # Lauf ueber einen vollstaendigen Zielbaum uebertraegt legitim null Bytes -
+    # dort liegen aber Dateien, und der Lauf bleibt PASS. Trockenlauf und
+    # --verify-only sind ausgenommen (sie uebertragen nichts, das ist kein
+    # Widerspruch, sondern ihr Zweck).
+    #
+    # "$_Local" wird wiederverwendet, wenn der Bericht die Zahl schon hat, sonst
+    # neu ermittelt - unter --no-verify ist sie leer, und leer heisst "nicht
+    # ermittelbar". Auf einer LEEREN Zeichenkette ist der Vergleich mit "0"
+    # falsch, die Pruefung schweigt dann also: keine Aussage statt einer
+    # erfundenen. Verlassen darf sich darauf niemand, deshalb steht es hier.
+    #
+    # ANNAHME: eine Quelle enthaelt mindestens eine regulaere Datei. WAS SIE
+    # BRICHT: ein Quellbaum aus ausschliesslich leeren Verzeichnissen - der
+    # bekaeme hier ein falsches FAIL. Bewusst so: dieser Baum ist pathologisch,
+    # und die Richtung des Irrtums ist die richtige.
+    if [ "$_VerifyOnly" != "1" ] && [ "$_DryRun" != "1" ] && [ "$_ParMode" = "parallel" ] \
+       && [ "$_ResultState" = "ok" ] && [ "$_ListState" = "ok" ] \
+       && [ "$_Lines" -gt 0 ] && [ "$_Bad" -eq 0 ] && [ "$_Malformed" -eq 0 ] \
+       && [ -n "$_ParKbBefore" ] && [ -n "$_ParKbAfter" ] && [ "$_ParKbAfter" -le "$_ParKbBefore" ]; then
+        _GrowFiles="$_Local"
+        [ -n "$_GrowFiles" ] || _GrowFiles="$(w2u_count_local)"
+        if [ "$_GrowFiles" = "0" ]; then
+            printf '\n WIDERSPRUCH: alle %s Chunks melden rc 0, aber die parallele Phase hat NICHTS ans Ziel gebracht\n' "$_Lines"
+            printf '   (Ziel davor %s KB, danach %s KB, und keine einzige Datei am Ziel).\n' "$_ParKbBefore" "$_ParKbAfter"
+            printf '   Ein rc 0 ohne uebertragene Daten ist in diesem Projekt gemessen worden -\n'
+            printf '   "jeder Chunk meldet Erfolg" ist damit allein kein Nachweis.\n'
+            _Fail=1
+        fi
     fi
 
     # CONTROLLER-RULING 2 (Task 8, umgesetzt in Task 9): der Ausgang des
@@ -2391,7 +2439,15 @@ main() {
         mkdir -p "$_TmpDir/chunks"
         w2u_chunk "$_TmpDir/work.par" "$_TmpDir/chunks" "$_PMax" "$_TmpDir/chunks.list"
         w2u_log "parallele Phase: $_ParSrc/ -> $_ParDst/ (Praefix '${_SrcPrefix:-<keiner>}')"
+        # Zwei Messpunkte um die ganze Phase. Sie kosten je ein "du -sk" (dieselbe
+        # Funktion, die die Auto-Messung ohnehin benutzt) und sind die Grundlage
+        # der Widerspruchspruefung im Bericht: Chunks, die alle Erfolg melden,
+        # waehrend am Ziel nichts angekommen ist. Genau dieses Bild wurde in
+        # diesem Projekt gemessen (openrsync liefert rc 0 und uebertraegt
+        # nichts, siehe Kopf bei _SrcRoot).
+        _ParKbBefore="$(w2u_dst_kb)"
         w2u_run_all "$_TmpDir/chunks.list"
+        _ParKbAfter="$(w2u_dst_kb)"
     else
         # Einstroemig: kein Zerlegen, keine Chunks, keine Buchfuehrung - der
         # Sweep unten macht die ganze Arbeit. Beim Parsen ist das bereits
