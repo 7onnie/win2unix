@@ -39,11 +39,17 @@ _Cfg="$(mktemp -d)"
 _Cfg2="$(mktemp -d)"
 _Cfg3="$(mktemp -d)"
 
+# JEDE gestartete Daemon-PID, auch die nicht uebernommenen. Vorher raeumte das
+# Cleanup nur ueber die pid-Dateien auf - ein Daemon, der bindet, aber im
+# Wartefenster keine pid-Datei zeigt, war danach unkillbar und lief bis zum
+# Reboot weiter. Gemessen: 14 verwaiste Daemons nach einer Serie Testlaeufe, die
+# anschliessend die Ports der naechsten Laeufe belegten.
+W_Pids=""
+
 w_cleanup() {
-    local _D _Pid
-    for _D in "$_Cfg" "$_Cfg2" "$_Cfg3"; do
-        _Pid="$(cat "$_D/rsyncd.pid" 2>/dev/null)"
-        [ -n "$_Pid" ] && kill "$_Pid" 2>/dev/null
+    local _P
+    for _P in $W_Pids; do
+        kill "$_P" 2>/dev/null
     done
     rm -rf "$_Src" "$_Src2" "$_Dst" "$_Cfg" "$_Cfg2" "$_Cfg3"
 }
@@ -102,7 +108,7 @@ w_build_multi() {
 # log im Head-Template RELATIV stehen - auf Windows ist das der Bundle-Ordner.
 w_start() {
     local _Dir="$1" _Eol="${2:-lf}" _Build="${3:-w_build_conf}"
-    local _I=0 _Port
+    local _I=0 _J=0 _Port _Pid
     while [ "$_I" -lt 10 ]; do
         _Port="$_PortNext"
         _PortNext=$(( _PortNext + 1 ))
@@ -119,15 +125,35 @@ w_start() {
         # stdin ein SOCKET - jeder Agenten-/CI-Runner ohne Terminal -, geht es in
         # den inetd-Modus, daemonisiert nie, schreibt nie rsyncd.pid, und der Test
         # HAENGT statt zu scheitern. Gemessen: 38 s ohne eine einzige Assert-Zeile.
-        # Ausgabe in eine DATEI, nicht in $(...): der abgeloeste Daemon erbt stdout
-        # und haelt die Pipe offen - eine Kommandosubstitution wartet dann ewig.
-        ( cd "$_Dir" && "$D_Bin" --daemon --config="$_Dir/rsyncd.conf" < /dev/null ) \
-            > "$_Dir/start.err" 2>&1
-        sleep 1
+        # Ausgabe in eine DATEI, nicht in $(...): der Daemon erbt stdout und haelt
+        # die Pipe offen - eine Kommandosubstitution wartet dort ewig.
+        # Gestartet wird mit --no-detach, genau wie START-RSYNC-SERVER.cmd es tut,
+        # und im Hintergrund: damit ist $! die PID des Daemons SELBST (exec, kein
+        # fork), das Cleanup hat einen Griff auf ihn, und geprueft wird dieselbe
+        # Aufrufform wie die ausgelieferte.
+        ( cd "$_Dir" && exec "$D_Bin" --daemon --no-detach --config="$_Dir/rsyncd.conf" ) \
+            < /dev/null > "$_Dir/start.err" 2>&1 &
+        _Pid=$!
+        W_Pids="$W_Pids $_Pid"
+        # Warten statt raten. Ein festes "sleep 1" war hier ein Rennen: auf einer
+        # belasteten Maschine schreibt der Daemon die pid-Datei spaeter, der
+        # Versuch galt als gescheitert, der Daemon lief aber weiter, und der
+        # naechste Kandidatenport wurde probiert - bis zu zehn lebende Daemons pro
+        # Lauf, und am Ende ein Skip, der nach Umgebungsproblem aussah statt nach
+        # Testfehler. Aufgehoert wird auch, wenn der Daemon schon gestorben ist
+        # (Port belegt) - dann ist Warten sinnlos.
+        _J=0
+        while [ "$_J" -lt 25 ]; do
+            [ -f "$_Dir/rsyncd.pid" ] && break
+            kill -0 "$_Pid" 2>/dev/null || break
+            sleep 0.2
+            _J=$(( _J + 1 ))
+        done
         if [ -f "$_Dir/rsyncd.pid" ]; then
             W_Port="$_Port"
             return 0
         fi
+        kill "$_Pid" 2>/dev/null
     done
     return 1
 }
