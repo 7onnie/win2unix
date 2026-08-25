@@ -422,6 +422,29 @@ w2u_run_chunk() {
     done
     [ "$_Try" -gt "$_MaxRetry" ] && _Try="$_MaxRetry"
 
+    # CONTROLLER-RULING 2 (Task 7): dieses ">>" laeuft ab Task 7 aus bis zu
+    # _PMax parallelen Prozessen gleichzeitig, und diese Zeile ist die EINZIGE
+    # Stelle, an der ein fehlgeschlagener Chunk je sichtbar wird. Die Frage, ob
+    # der Append das aushaelt, wurde nachgemessen statt angenommen:
+    #
+    #   - reale Zeilenlaenge (19-23 Byte), 8 / 16 / 32 / 64 gleichzeitige
+    #     Schreiber, ueber 116.000 Zeilen: kein Zeilenverlust, keine vermischte
+    #     Zeile, Byteanzahl exakt wie erwartet.
+    #   - Die Grenze wurde eingegabelt und liegt bei GENAU 1024 Byte je Zeile
+    #     (1024 sauber, 1029 zerrissen) - das ist der stdio-Puffer, nicht
+    #     PIPE_BUF. Die reale Zeile hat damit Faktor 44 Luft.
+    #   - Oberhalb der Grenze ist die Schadensform luecklos zaehlbar-unsichtbar:
+    #     Zeilenzahl UND Byteanzahl blieben korrekt, nur der Inhalt war
+    #     vermischt (16.000 Zeilen, davon 10.643 unversehrt). Eine Pruefung, die
+    #     nur zaehlt, wuerde das nie sehen; der Test in tests/test_parallel.sh
+    #     prueft deshalb das Format jeder Zeile.
+    #
+    # ANNAHME, unter der das gilt: eine Ergebniszeile bleibt deutlich unter
+    # 1 KB, und $_ResultFile liegt auf einem LOKALEN Dateisystem (gemessen auf
+    # APFS). Wer das Zeilenformat aufblaeht oder $_ResultFile auf eine
+    # SMB-/NFS-Freigabe legt - moeglich, weil _LogDir per Vorgabe unter dem
+    # Zielverzeichnis entsteht und das Ziel ein Mount sein kann - hebt die
+    # Grundlage auf; dann gehoert je Chunk eine eigene Ergebnisdatei her.
     printf '%s\t%s\t%s\n' "$_Name" "$_Rc" "$_Try" >> "$_ResultFile" \
         || w2u_log "WARNUNG: Ergebniszeile fuer $_Name konnte nicht geschrieben werden (rc/Versuche: $_Rc/$_Try)"
     return 0
