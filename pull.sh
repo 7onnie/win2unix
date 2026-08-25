@@ -485,6 +485,21 @@ w2u_run_chunk() {
 # Konfiguration bekaeme dann eine Ergebniszeile, die im Abschlussbericht wie
 # erledigt aussieht.
 #
+# "-S 4096" ist kein Feintuning, sondern eine Notwendigkeit. BSD-xargs begrenzt
+# die Ersetzung hinter "-I" per Vorgabe auf 255 Byte; genau nachgemessen: ein
+# 254 Byte langer Chunkpfad laeuft, ab 255 Byte kommt "xargs: command line cannot
+# be assembled, too long" und rc 1. Der Schaden ist dabei NICHT auf den langen
+# Pfad beschraenkt - xargs bricht an dieser Stelle die ganze Liste ab (Probe mit
+# kurz/lang/kurz: nur der erste Chunk lief, der dritte nie). Und weil ein
+# gestorbener Worker denselben rc 1 liefert, saehe der Abbruch der halben
+# Chunkliste aus wie ein einzelner kaputter Chunk.
+# Erreichbar ist das ueber den Pfad des Arbeitsverzeichnisses, nicht ueber den
+# Chunknamen (der ist "chunk.aaaa"): liegt $_TmpDir unter einem tiefen Ziel
+# (Kundenordner auf einem Volume), sind 255 Byte schnell voll. 4096 ist das
+# Vierfache von PATH_MAX (auf dieser Maschine 1024, nachgemessen mit getconf) -
+# ein einzelner absoluter Pfad kann die Grenze damit strukturell nicht mehr
+# reissen. Getestet ist beides zusammen: langer Pfad UND Leerzeichen darin.
+#
 # "${BASH:-bash}" statt "bash": $BASH ist der Pfad genau des Interpreters, der
 # gerade laeuft. Das Format, in dem "export -f" Funktionen in die Umgebung legt,
 # ist zwischen bash 3.2 (Apple) und bash 4.3+ (Homebrew) verschieden - startet
@@ -504,7 +519,7 @@ w2u_run_list() {
 
     export _RsyncBin _SrcUrl _DstRoot _LogDir _ResultFile _MaxRetry _RetryPause _ExcludeFrom _RsyncTimeout
     export -f w2u_run_chunk w2u_die w2u_log
-    xargs -P "$_Jobs" -I {} "${BASH:-bash}" -c 'w2u_run_chunk "$1"' _ {} < "$_ListFile" || _Rc=$?
+    xargs -P "$_Jobs" -S 4096 -I {} "${BASH:-bash}" -c 'w2u_run_chunk "$1"' _ {} < "$_ListFile" || _Rc=$?
     if [ "$_Rc" -ne 0 ]; then
         w2u_warn "xargs meldete rc $_Rc - mindestens ein Worker ist vorzeitig gestorben (w2u_run_chunk selbst liefert immer 0). Diese Chunks haben KEINE Ergebniszeile; der Abschlussbericht muss sie als fehlend erkennen."
     fi
@@ -686,7 +701,7 @@ w2u_autotune() {
 
         # _Dur ist hier >= _ProbeMinSecs >= 1, die Division ist sicher.
         _Rate=$((_Kb / _Dur))
-        _Measured=1
+        _Measured=$((_Measured + 1))
         w2u_log "Messung P=$_P: ${_Rate} KB/s (${_Kb} KB in ${_Dur}s)"
         if [ "$_Rate" -gt $((_BestRate + _BestRate / 7)) ]; then
             _BestRate="$_Rate"
@@ -697,10 +712,18 @@ w2u_autotune() {
         fi
     done
 
+    # Drei Faelle, drei verschiedene Aussagen - der mittlere ist der, der sich
+    # sonst als Messergebnis verkleiden wuerde: bei GENAU EINER verwertbaren
+    # Runde gab es nichts zu vergleichen. _BestRate startet bei 0, die erste
+    # verwertbare Runde gewinnt den Vergleich also immer, egal wie sie ausfiel.
+    # Die Zahl ist dann trotzdem die beste verfuegbare - aber sie ist die Rate
+    # der einzigen Runde, die zustande kam, und kein Optimum.
     if [ "$_Measured" -eq 0 ]; then
         w2u_log "keine verwertbare Messung zustande gekommen - benutze den Vorgabewert P=$_BestP (KEIN Messergebnis; --jobs N setzt den Wert fest)"
+    elif [ "$_Measured" -eq 1 ]; then
+        w2u_log "nur EINE verwertbare Runde (P=$_BestP bei ${_BestRate} KB/s) - kein Vergleich moeglich, das ist kein gemessenes Optimum"
     else
-        w2u_log "gemessenes Optimum: P=$_BestP bei ${_BestRate} KB/s"
+        w2u_log "gemessenes Optimum aus $_Measured verwertbaren Runden: P=$_BestP bei ${_BestRate} KB/s"
     fi
     printf '%s\n' "$_BestP"
 }

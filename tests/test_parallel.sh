@@ -232,6 +232,33 @@ _ExcludeFrom=""
 _stub_reset
 
 # ---------------------------------------------------------------------------
+# Langer Chunkpfad. BSD-xargs begrenzt die "-I"-Ersetzung per Vorgabe auf
+# 255 Byte (nachgemessen: 254 laeuft, 255 nicht) und bricht dann die GANZE
+# restliche Liste ab - nicht nur den langen Eintrag. Der Chunkname selbst ist
+# kurz ("chunk.aaaa"), erreichbar wird die Grenze ueber den Pfad des
+# Arbeitsverzeichnisses; wo das produktiv liegt, entscheidet erst main().
+# Deshalb steht hinter dem langen Chunk absichtlich noch ein kurzer: er belegt,
+# dass die Liste weiterlaeuft statt an der Stelle abzureissen.
+_LongDir="$_TmpDir/$(printf 'l%.0s' 1 2 3 4 5 6 7 8 9 0)$(printf 'a%.0s' 1 2 3 4 5)"
+_I=0
+while [ "$_I" -lt 12 ]; do
+    _LongDir="$_LongDir/verzeichnisebene-mit-langem-namen-$_I"
+    _I=$((_I + 1))
+done
+mkdir -p "$_LongDir/mit leerzeichen"
+printf 'paket-lang\n' > "$_LongDir/mit leerzeichen/chunk.lang"
+printf '%s\n' "$_LongDir/mit leerzeichen/chunk.lang" > "$_TmpDir/list_lang"
+head -n 1 "$_TmpDir/list2" >> "$_TmpDir/list_lang"
+_LongLen="$(printf '%s' "$_LongDir/mit leerzeichen/chunk.lang" | wc -c | tr -d ' ')"
+[ "$_LongLen" -gt 255 ] && _LongOk=ja || _LongOk=nein
+t_assert_eq "ja" "$_LongOk" "Testaufbau: der Chunkpfad ist wirklich laenger als die 255-Byte-Grenze von xargs (${_LongLen} Byte)"
+_stub_reset
+: > "$_ResultFile"
+w2u_run_list "$_TmpDir/list_lang" 2
+t_assert_eq "2" "$(grep -c . "$_ResultFile")" "ein Chunkpfad ueber 255 Byte wird uebertragen UND der Chunk dahinter ebenfalls (xargs reisst die Liste nicht ab)"
+t_assert_eq "1" "$(cut -f1 "$_ResultFile" | grep -c '^chunk\.lang$')" "der lange Chunk selbst hat eine Ergebniszeile"
+
+# ---------------------------------------------------------------------------
 # Ungueltige Parallelitaet muss abgelehnt werden. "-P 0" heisst bei BSD-xargs
 # UNBEGRENZT viele Prozesse - auf einer Quelle mit drehender Platte waere das
 # das Gegenteil dessen, was die Messung erreichen soll.
@@ -403,6 +430,23 @@ t_assert_eq "4" "$_BestD" "eine Runde mit Wiederholung zaehlt nicht als Messwert
 t_assert_contains "$(cat "$_TmpDir/tuneD.log")" "wiederholt" "der Grund (Wiederholung) steht im Log"
 t_assert_eq "1" "$(cut -f3 "$_ResultFile" | grep -cv '^1$' || true)" "Szenario D: genau eine Ergebniszeile weist mehr als einen Versuch aus - das ist das Signal, an dem die Runde verworfen wird"
 _stub_reset
+
+# --- Szenario D2: nur EINE verwertbare Runde ist kein Optimum ---------------
+# _BestRate startet bei 0, die erste verwertbare Runde gewinnt den Vergleich
+# also immer - auch wenn sie die einzige war. Der zurueckgegebene Wert ist dann
+# in Ordnung (mehr Information gibt es nicht), die Beschriftung "gemessenes
+# Optimum" waere es nicht: verglichen wurde nichts.
+_SavedPMax="$_PMax"
+_PMax=4
+_stub_reset
+printf '%s\n' "chunk.r0001" > "$_StubBin/fail_once"
+: > "$_ResultFile"
+_set_plan "100 110 200 210" "0 5000 10000"
+_BestD2="$(w2u_autotune "$_TmpDir/list2" 2> "$_TmpDir/tuneD2.log")"
+_stub_reset
+t_assert_eq "4" "$_BestD2" "Szenario D2: die einzige verwertbare Runde bestimmt den Wert"
+t_assert_contains "$(cat "$_TmpDir/tuneD2.log")" "kein gemessenes Optimum" "Szenario D2: eine einzelne Runde wird NICHT als Optimum ausgegeben"
+_PMax="$_SavedPMax"
 
 # --- Szenario E: du liefert keine Zahl --------------------------------------
 _stub_reset
