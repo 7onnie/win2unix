@@ -59,6 +59,8 @@ echo geheim > "$_Src/System Volume Information/tracking.log.blf"
 mkdir -p "$_Src/\$RECYCLE.BIN"
 echo geloescht > "$_Src/\$RECYCLE.BIN/muell.txt"
 echo auslagerung > "$_Src/pagefile.sys"
+echo ruhezustand > "$_Src/hiberfil.sys"
+echo swap > "$_Src/swapfile.sys"
 echo dump > "$_Src/DumpStack.log.tmp"
 
 # Startport aus der PID streuen statt fest: ein fester Port kollidiert bei
@@ -176,8 +178,14 @@ t_assert_contains "$_Out" "datei.txt" "Transfer-Pfad funktioniert, lock file ist
 # greifen. Mit der Nicht-Wildcard-Form zerfaellt das Muster in drei nutzlose
 # Woerter und der Ordner taucht hier wieder auf.
 w_assert_absent "$_Out" "System Volume Information" "exclude greift trotz Leerzeichen im Namen"
-w_assert_absent "$_Out" "RECYCLE" "exclude deckt beide Schreibweisen des Papierkorbs"
-w_assert_absent "$_Out" "pagefile.sys" "exclude haelt die Auslagerungsdatei zurueck"
+# Nur $RECYCLE.BIN hat hier eine Fixture. Die zweite Schreibweise
+# $Recycle.Bin liesse sich auf einem case-insensitiven Dateisystem gar nicht
+# als zweiter Eintrag anlegen - sie steht im Template fuer NTFS-Namen, die
+# Cygwin so ausliefert, und ist hier ehrlich ungetestet.
+w_assert_absent "$_Out" "RECYCLE" "exclude haelt \$RECYCLE.BIN zurueck"
+w_assert_absent "$_Out" "pagefile.sys" "exclude haelt pagefile.sys zurueck"
+w_assert_absent "$_Out" "hiberfil.sys" "exclude haelt hiberfil.sys zurueck"
+w_assert_absent "$_Out" "swapfile.sys" "exclude haelt swapfile.sys zurueck"
 w_assert_absent "$_Out" "DumpStack.log" "exclude haelt DumpStack.log* zurueck"
 
 # read only ist die einzige Sicherung dagegen, dass ein Fehlgriff auf der

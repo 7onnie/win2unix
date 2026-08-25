@@ -14,6 +14,12 @@ title win2unix - rsync-Server
 ::   - Energiesparen/Standby/Platten-Timeout im aktiven Schema auf "nie"
 :: Beides wird im Fenster angezeigt, wenn es passiert.
 ::
+:: Argumente (normalerweise keine - Doppelklick):
+::   elevated         setzt die .cmd selbst beim Neustart mit Adminrechten
+::   ohne-admin-test  ueberspringt die Rechte-Pruefung. Nur wenn die Erkennung
+::                    auf dieser Maschine falsch negativ ist: sonst laeuft der
+::                    Server ohne Adminrechte und laesst STILL Profile aus.
+::
 :: Annahmen (siehe .superpowers/.../task-11-report.md fuer die Begruendung):
 ::   - Windows 7 / Server 2008 R2 oder neuer. Grund: PowerShell 2.0 (fuer die
 ::     Templates und die WMI-Abfragen) und "netsh advfirewall".
@@ -54,9 +60,21 @@ if not exist "bin\rsync.exe" (
 ::        braucht: ist der abgeschaltet, schlaegt es AUCH als Administrator
 ::        fehl. "fsutil dirty query" braucht ihn nicht und scheitert ohne
 ::        Adminrechte an Access Denied. Eine der beiden muss durchgehen.
+::        Falsch NEGATIV waere sonst eine Sackgasse: der elevierte Lauf bricht
+::        ab, der Rat "Als Administrator ausfuehren" setzt kein Argument, also
+::        wieder Elevation, wieder Abbruch. Deshalb der dokumentierte Ausweg
+::        "ohne-admin-test" - auf einer Maschine, deren Daten der ganze Zweck
+::        sind, ist ein Notausgang billiger als ein unerreichbarer Server.
 set "_IsAdmin=nein"
-net session >nul 2>&1
-if not errorlevel 1 set "_IsAdmin=ja"
+if /i "%~1"=="ohne-admin-test" (
+    set "_IsAdmin=ja"
+    echo  [!] Rechte-Pruefung per Argument uebersprungen. Laeuft dieses Fenster
+    echo      NICHT als Administrator, fehlen im Ergebnis still fremde
+    echo      Benutzerprofile - danach ist die Quelle verschrottet.
+) else (
+    net session >nul 2>&1
+    if not errorlevel 1 set "_IsAdmin=ja"
+)
 if "!_IsAdmin!"=="nein" (
     fsutil dirty query %SystemDrive% >nul 2>&1
     if not errorlevel 1 set "_IsAdmin=ja"
@@ -68,8 +86,10 @@ if "!_IsAdmin!"=="nein" (
     rem sonst unbegrenzt selbst neu starten.
     if "%~1"=="elevated" (
         echo  [!] Auch nach der Rechte-Anfrage keine Administrator-Rechte erkannt.
-        echo      Bitte per Rechtsklick "Als Administrator ausfuehren" starten.
-        echo      Ohne Adminrechte werden fremde Benutzerprofile STILL uebersprungen.
+        echo      Bitte ein cmd-Fenster per Rechtsklick als Administrator oeffnen
+        echo      und darin starten:  START-RSYNC-SERVER.cmd ohne-admin-test
+        echo      Das ueberspringt die Pruefung, nicht die Rechte: ohne Adminrechte
+        echo      werden fremde Benutzerprofile STILL uebersprungen.
         echo.
         pause
         exit /b 1
@@ -156,6 +176,13 @@ if "!_IpCnt!"=="0" (
     echo      gesetzt ^(jeder im Netz darf lesen^).
 )
 echo  [+] hosts allow = !_Allow!
+:: Die zwei degradierten Pfade ziehen bewusst in entgegengesetzte Richtungen:
+:: keine IPv4-Adresse -> 0.0.0.0/0, also maximal offen; eine Adresse in einem
+:: Netz WEITER als /24 -> auf dieses /24 festgenagelt, in dem die Gegenseite
+:: unter Umstaenden nicht liegt. Grund fuer die Asymmetrie: im ersten Fall ist
+:: nichts bekannt, im zweiten etwas Belastbares, und /24 ist die Annahme, die
+:: in kleinen Netzen fast immer stimmt. Beide Faelle stehen im Fenster; wer
+:: mit /16 arbeitet, korrigiert die Zeile in rsyncd.conf und startet neu.
 
 :: --- 5. Laufwerke ermitteln. DriveType=3 sind die fest eingebauten Platten.
 ::        Volume-Labels werden auf ASCII-Grundzeichen reduziert: sie landen in
@@ -200,6 +227,45 @@ if "!_DrvCnt!"=="0" (
     exit /b 1
 )
 
+:: --- 5b. Riegel fuer die letzte lieferentscheidende Annahme: dass Cygwin die
+::         Laufwerke unter /cygdrive/<x>/ einhaengt. Stimmt der Prefix nicht,
+::         startet der Daemon, das Fenster meldet "laeuft", und die Module sind
+::         LEER - der Anwender erfaehrt es erst von der Gegenseite. Geprueft
+::         wird mit dem mitgelieferten Binary, ohne Daemon, ohne Netz und ohne
+::         Rekursion (--list-only auf einer Wurzel ist sofort fertig).
+::         Gemessen auf dem Entwickler-Mac mit rsync 3.5.0: vorhandenes
+::         Verzeichnis rc 0, fehlendes rc 23 samt change_dir-Meldung.
+set "_FirstDrv="
+for /f "usebackq tokens=1 delims=|" %%A in ("w2u-drives.tmp") do (
+    if not defined _FirstDrv set "_FirstDrv=%%A"
+)
+echo  [+] Pruefe den Cygwin-Laufwerkspfad /cygdrive/!_FirstDrv!/ ...
+del /q "w2u-probe.tmp" >nul 2>&1
+bin\rsync.exe --list-only "/cygdrive/!_FirstDrv!/" >"w2u-probe.tmp" 2>&1
+if errorlevel 1 (
+    rem Nicht jeder rc ungleich 0 ist der gesuchte Fehler. Auf einer Windows-
+    rem Wurzel liegen Eintraege, die selbst ein Administrator nicht lesen darf
+    rem (System Volume Information gehoert nur SYSTEM); rsync quittiert das mit
+    rem rc 23, obwohl der Prefix stimmt. Abgebrochen wird deshalb nur beim
+    rem eindeutigen Befund "change_dir" - so heisst es, wenn das Verzeichnis
+    rem selbst nicht existiert, also der /cygdrive-Prefix falsch ist.
+    findstr /L /C:"change_dir" "w2u-probe.tmp" >nul
+    if not errorlevel 1 (
+        echo  [!] /cygdrive/!_FirstDrv!/ existiert fuer rsync.exe nicht. Die Module
+        echo      waeren leer, deshalb wird NICHTS gestartet. rsync sagte:
+        type "w2u-probe.tmp"
+        echo.
+        pause
+        exit /b 1
+    )
+    echo  [i]   Probelesen meldete Fehler, aber das Verzeichnis existiert -
+    echo        einzelne unlesbare Eintraege sind auf einer Windows-Wurzel normal.
+    echo        Ausschluesse in rsyncd.module.template halten sie ohnehin heraus.
+    echo        rsync sagte:
+    type "w2u-probe.tmp"
+)
+del /q "w2u-probe.tmp" >nul 2>&1
+
 :: --- 6. rsyncd.conf aus den Templates bauen. Die Templates sind dieselben
 ::        Dateien, gegen die tests/test_rsyncd_conf.sh einen echten Daemon
 ::        startet - deshalb stehen sie nicht hier drin. Wer sie hier inlinet,
@@ -207,6 +273,17 @@ if "!_DrvCnt!"=="0" (
 ::        Geschrieben wird mit LF. Gemessen wurde, dass rsync auch CRLF frisst;
 ::        LF macht die Frage aber egal - auch nach einem Notepad-Speichern.
 echo  [+] Erzeuge rsyncd.conf ^(!_DrvCnt! Laufwerk^(e^)^)...
+:: Die alte Datei MUSS vorher weg. WriteAllText ueberschreibt nur bei
+:: Erfolg: scheitert das ReadAllText auf dem Template (geloescht, vom
+:: Virenscanner gesperrt, PowerShell-Fehler), bliebe die rsyncd.conf des
+:: VORIGEN Laufs liegen, der "if not exist"-Riegel unten waere eine
+:: Tautologie, und die Modul-Schleife haengte nur an. Bedient wuerden dann
+:: die neuen Module (bei doppeltem [c] gewinnt der letzte Block), aber der
+:: globale Kopf waere der ALTE - also das "hosts allow" der vorigen
+:: Maschine, waehrend das Fenster oben das neu berechnete Subnetz gemeldet
+:: hat. Das Bundle wandert per USB-Stick ueber mehrere Kisten in
+:: verschiedenen Subnetzen; genau dieser Fall ist hier der Normalfall.
+del /q "rsyncd.conf" >nul 2>&1
 powershell -NoProfile -Command "$t = [IO.File]::ReadAllText('%~dp0rsyncd.head.template') -replace '@HOSTSALLOW@', '!_Allow!'; [IO.File]::WriteAllText('%~dp0rsyncd.conf', ($t -replace ([char]13 + [char]10), [string][char]10))"
 if not exist "rsyncd.conf" (
     echo  [!] rsyncd.conf konnte nicht erzeugt werden - fehlt rsyncd.head.template?

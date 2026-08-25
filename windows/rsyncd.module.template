@@ -1,4 +1,7 @@
-# Ein Block je erkanntem Laufwerk; @DRIVE@/@PATH@/@LABEL@ setzt die .cmd ein.
+# Ein Block je erkanntem Laufwerk. Die drei Platzhalter DRIVE, PATH und LABEL
+# (jeweils in @-Klammern, hier absichtlich ohne Sigel geschrieben) setzt die
+# .cmd ein - stuende sie hier mit Sigel, ersetzte sie sich selbst mitten im
+# Kommentar, und zwar in jedem Block der erzeugten rsyncd.conf.
 # exclude ist eine WHITESPACE-getrennte Liste OHNE Quoting - "System Volume
 # Information" wuerde in drei nutzlose Muster zerfallen; Wildcards matchen auch
 # Leerzeichen. Papierkorb in beiden Schreibweisen, weil Cygwin die Namen so
