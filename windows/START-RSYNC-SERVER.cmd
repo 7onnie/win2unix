@@ -245,7 +245,7 @@ bin\rsync.exe --list-only "/cygdrive/!_FirstDrv!/" >"w2u-probe.tmp" 2>&1
 if errorlevel 1 (
     rem Nicht jeder rc ungleich 0 ist der gesuchte Fehler. Auf einer Windows-
     rem Wurzel liegen Eintraege, die selbst ein Administrator nicht lesen darf
-    rem (System Volume Information gehoert nur SYSTEM); rsync quittiert das mit
+    rem - System Volume Information gehoert nur SYSTEM. rsync quittiert das mit
     rem rc 23, obwohl der Prefix stimmt. Abgebrochen wird deshalb nur beim
     rem eindeutigen Befund "change_dir" - so heisst es, wenn das Verzeichnis
     rem selbst nicht existiert, also der /cygdrive-Prefix falsch ist.
