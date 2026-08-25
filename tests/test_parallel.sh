@@ -304,20 +304,30 @@ t_assert_eq "1" "$(cut -f1 "$_ResultFile" | grep -c '^chunk\.lang$')" "der lange
 # ---------------------------------------------------------------------------
 _GnuXargsDir="$_TmpDir/gnu-xargs"
 mkdir -p "$_GnuXargsDir"
-cat > "$_GnuXargsDir/xargs" <<'GX_EOF'
+# Das ECHTE xargs wird VOR der PATH-Aenderung gesucht und in den Ersatz
+# eingebacken. Kein fester Pfad: "/usr/bin/xargs" stimmt auf macOS und den
+# meisten Linuxen, aber nicht ueberall (NixOS hat unter /usr/bin nur env) - und
+# ausgerechnet dieser Test soll das GNU-userland abdecken. Ein Ersatz, der den
+# Weiterleitungspfad nicht findet, faellt aus einem Grund durch, der mit "-S"
+# nichts zu tun hat.
+_RealXargs="$(command -v xargs)"
+[ -n "$_RealXargs" ] && _RealXargsOk=ja || _RealXargsOk=nein
+t_assert_eq "ja" "$_RealXargsOk" "Testaufbau: das echte xargs ist im PATH gefunden ($_RealXargs)"
+cat > "$_GnuXargsDir/xargs" <<GX_EOF
 #!/bin/bash
 # Ersatz fuer ein GNU-findutils-xargs: lehnt "-S" mit derselben Meldung und
 # demselben rc ab und leitet alles andere an das echte xargs weiter. Der
-# Weiterleitungspfad ist ABSOLUT - ueber PATH fand dieser Ersatz sich selbst.
-for _A in "$@"; do
-    case "$_A" in
+# Weiterleitungspfad steht fest im Skript - ueber PATH fand dieser Ersatz sich
+# selbst.
+for _A in "\$@"; do
+    case "\$_A" in
         -S|-S*)
-            printf "xargs: invalid option -- 'S'\n" >&2
+            printf "xargs: invalid option -- 'S'\\n" >&2
             exit 1
             ;;
     esac
 done
-exec /usr/bin/xargs "$@"
+exec "$_RealXargs" "\$@"
 GX_EOF
 chmod +x "$_GnuXargsDir/xargs"
 
@@ -365,6 +375,16 @@ t_assert_eq "1" "$_JobsRc" "nicht-numerische Parallelitaet wird abgelehnt"
 _MissRc=0
 _MissErr="$(w2u_run_list "$_TmpDir/gibt-es-nicht.list" 2 2>&1)" || _MissRc=$?
 t_assert_eq "1" "$_MissRc" "eine nicht existierende Chunkliste bricht ab, statt still 0 zu liefern"
+
+# Ein VERZEICHNIS vervollstaendigt das Trio, das dieser Guard trennen soll:
+# fehlend / kaputt / leer. Es existiert (-e), ist lesbar (-r) und ist nicht leer
+# (-s) - es kaeme also durch, xargs bekaeme null Chunks und der Lauf saehe wie
+# "nichts mehr zu tun" aus. Genau das Bild, gegen das die zwei Zeilen darueber
+# stehen.
+_DirRc=0
+_DirErr="$(w2u_run_list "$_TmpDir" 2 2>&1)" || _DirRc=$?
+t_assert_eq "1" "$_DirRc" "ein VERZEICHNIS als Chunkliste bricht ab, statt als leere Liste durchzugehen"
+t_assert_contains "$_DirErr" "keine regulaere Datei" "und nennt den Grund"
 t_assert_contains "$_MissErr" "existiert nicht" "der Grund unterscheidet 'existiert nicht' von 'ist leer'"
 
 : > "$_TmpDir/leer.list"

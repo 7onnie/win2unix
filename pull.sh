@@ -1231,6 +1231,13 @@ w2u_name_diff() {
         return 1
     fi
     _Args=( -r --list-only "--timeout=$_RsyncTimeout" )
+    # Der Ausschluss-Arm ist heute NICHT erreichbar: der einzige Aufrufer steht
+    # im else-Zweig hinter "[ -n "$_ExcludeFrom" ]", auf diesem Pfad sind die
+    # Ausschluesse also immer leer. Er bleibt trotzdem stehen, weil er zur
+    # Bedingung gehoert, unter der dieser Vergleich ueberhaupt stimmt: WENN je
+    # mit Ausschluessen verglichen wird, muessen sie fuer beide Seiten gelten -
+    # sonst waere jede ausgeschlossene Datei eine Fehlstelle. Wer das Tor
+    # verschiebt, soll den Arm schon vorfinden und nicht erst den Fehler.
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" > "$_Rem" 2>/dev/null || _Rc=$?
     if [ "$_Rc" -eq 0 ]; then
