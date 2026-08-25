@@ -542,6 +542,27 @@ w2u_run_chunk() {
 # entscheidet main(). 4096 ist das Vierfache von PATH_MAX - ein einzelner
 # absoluter Pfad kann die Grenze damit strukturell nicht mehr reissen.
 #
+# Diese Option gibt es aber NUR bei BSD/macOS. GNU-findutils-xargs kennt kein
+# "-S" ueberhaupt und bricht schon am Optionen-Parsen ab ("xargs: invalid
+# option -- 'S'"), also BEVOR ein einziger Worker startet - auf jedem
+# GNU/Linux-Ziel, das das README zusagt, waere kein Chunk uebertragen worden.
+# GNU hat die 255-Byte-Grenze der "-I"-Ersetzung nicht, braucht die Option also
+# auch nicht. Deshalb wird sie GEMESSEN statt angenommen: ein Probelauf mit
+# genau dieser Option entscheidet, ob sie ins argv kommt.
+#
+# Das Ergebnis wird NICHT zwischengespeichert. Ein Cache waere genau dann
+# falsch, wenn er zaehlt (ein anderes xargs im PATH als beim ersten Aufruf),
+# und die Kosten sind ein einzelner fork je PHASE - gegen einen Transfer von
+# hunderten GB ist das nicht messbar. Getragen wird die Option in einem ARRAY,
+# nicht in einer Variablen: eine leere Variable waere unter "set -u" ein leeres
+# ARGUMENT ("xargs -P 4 '' -I {}") und damit ein Fehler statt einer
+# Auslassung. Die "+"-Form der Expansion ist Pflicht - "${_Arr[@]}" auf einem
+# leeren Array ist unter bash 3.2 mit set -u "unbound variable".
+#
+# "-I {}" bleibt in jedem Fall stehen: "-n 1" waere die naheliegende
+# Alternative, zerlegt aber an Leerzeichen - und $TMPDIR (also der Pfad jedes
+# Chunks) darf Leerzeichen enthalten.
+#
 # "${BASH:-bash}": das Umgebungsformat von "export -f" unterscheidet sich
 # zwischen bash 3.2 (Apple) und 4.3+ (Homebrew). Startete ein Skript unter
 # Homebrew-bash seine Worker mit /bin/bash, importierte das Kind die Funktionen
@@ -549,6 +570,7 @@ w2u_run_chunk() {
 # Interpreter wie der laufende und laesst die Frage nicht aufkommen.
 w2u_run_list() {
     local _ListFile="$1" _Jobs="$2" _Rc=0 _Missing="" _MissCnt=0 _Done=""
+    local _XargsRepl
     # "-P 0" heisst bei BSD-xargs UNBEGRENZT viele Prozesse - auf einer Quelle
     # mit drehender Platte das Gegenteil dessen, was die Messung erreichen soll.
     case "$_Jobs" in
@@ -571,7 +593,16 @@ w2u_run_list() {
     # w2u_run_chunk laesse jeden Chunk ohne Ergebniszeile scheitern.
     export _RsyncBin _ParSrc _ParDst _LogDir _ResultFile _MaxRetry _RetryPause _ExcludeFrom _RsyncTimeout
     export -f w2u_run_chunk w2u_die w2u_log
-    xargs -P "$_Jobs" -S 4096 -I {} "${BASH:-bash}" -c 'w2u_run_chunk "$1"' _ {} < "$_ListFile" || _Rc=$?
+    # Einmal je Phase nachsehen, ob dieses xargs "-S" kennt (siehe oben).
+    # "true" statt eines echten Kommandos: der Probelauf darf nichts tun, nur
+    # das Optionen-Parsen ausloesen. Ein fehlendes xargs (rc 127) landet
+    # ebenfalls im GNU-Zweig - der echte Aufruf unten scheitert dann ohnehin,
+    # und zwar sichtbar.
+    _XargsRepl=( )
+    if printf 'x\n' | xargs -S 4096 -I {} true >/dev/null 2>&1; then
+        _XargsRepl=( -S 4096 )      # BSD: hebt die 255-Byte-Grenze der -I-Ersetzung
+    fi                              # GNU: kennt -S nicht und hat die Grenze nicht
+    xargs -P "$_Jobs" ${_XargsRepl[@]+"${_XargsRepl[@]}"} -I {} "${BASH:-bash}" -c 'w2u_run_chunk "$1"' _ {} < "$_ListFile" || _Rc=$?
     if [ "$_Rc" -ne 0 ]; then
         w2u_warn "xargs endete mit rc $_Rc - w2u_run_chunk selbst liefert immer 0, also ist mindestens ein Worker vorzeitig gestorben. Bei Signal-Tod (z.B. OOM) und bei Exit 255 liest xargs die Liste danach NICHT weiter."
         # Der Abgleich gehoert hierher und nirgendwo sonst: dies ist die einzige

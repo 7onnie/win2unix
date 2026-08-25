@@ -276,6 +276,68 @@ t_assert_eq "2" "$(grep -c . "$_ResultFile")" "ein Chunkpfad ueber 255 Byte wird
 t_assert_eq "1" "$(cut -f1 "$_ResultFile" | grep -c '^chunk\.lang$')" "der lange Chunk selbst hat eine Ergebniszeile"
 
 # ---------------------------------------------------------------------------
+# GNU-userland: ein xargs OHNE "-S". Das ist die Regression zu dem Fehler, den
+# die Suite auf einem Mac strukturell nicht sehen konnte - sie war gruen WEGEN
+# der Plattform, nicht trotz ihr.
+#
+# "-S replsize" gibt es nur bei BSD/macOS-xargs. GNU-findutils kennt die Option
+# gar nicht und bricht am Optionen-Parsen ab, also BEVOR ein Worker startet:
+# auf jedem GNU/Linux-Ziel (README-Zusage) waere kein einziger Chunk
+# uebertragen worden, der Sweep haette den Baum einstroemig nachgeholt, der
+# Verify saehe sauber aus - und der Bericht meldete trotzdem FAIL, weil jedem
+# Chunk die Ergebniszeile fehlt. Es faellt also sicher aus; die Parallelitaet,
+# also der ganze Zweck dieses Werkzeugs, war auf Linux aber weg.
+#
+# Geprueft wird ueber einen xargs-ERSATZ im PATH, der "-S" genauso ablehnt wie
+# GNU es tut und sonst an das echte xargs weiterleitet. Zwei Dinge machen den
+# Test aussagekraeftig:
+#   - der Aufbau wird selbst nachgemessen (der Ersatz muss "-S" wirklich
+#     ablehnen, sonst pruefte der Test gegen nichts);
+#   - die Chunkpfade sind KURZ. Der Ersatz delegiert an das echte BSD-xargs
+#     ohne "-S", also gilt dessen 255-Byte-Grenze - mit dem langen Pfad von
+#     oben schlaege der Test aus dem falschen Grund fehl.
+# ---------------------------------------------------------------------------
+_GnuXargsDir="$_TmpDir/gnu-xargs"
+mkdir -p "$_GnuXargsDir"
+cat > "$_GnuXargsDir/xargs" <<'GX_EOF'
+#!/bin/bash
+# Ersatz fuer ein GNU-findutils-xargs: lehnt "-S" mit derselben Meldung und
+# demselben rc ab und leitet alles andere an das echte xargs weiter. Der
+# Weiterleitungspfad ist ABSOLUT - ueber PATH fand dieser Ersatz sich selbst.
+for _A in "$@"; do
+    case "$_A" in
+        -S|-S*)
+            printf "xargs: invalid option -- 'S'\n" >&2
+            exit 1
+            ;;
+    esac
+done
+exec /usr/bin/xargs "$@"
+GX_EOF
+chmod +x "$_GnuXargsDir/xargs"
+
+_SavePath="$PATH"
+PATH="$_GnuXargsDir:$PATH"
+_GnuProbeRc=0
+printf 'x\n' | xargs -S 4096 -I {} true >/dev/null 2>&1 || _GnuProbeRc=$?
+_GnuProbeOk=nein
+[ "$_GnuProbeRc" -ne 0 ] && _GnuProbeOk=ja
+t_assert_eq "ja" "$_GnuProbeOk" "Testaufbau: der xargs-Ersatz lehnt '-S' wirklich ab (rc $_GnuProbeRc) - sonst pruefte der Test gegen nichts"
+_stub_reset
+head -n 6 "$_TmpDir/list2" > "$_TmpDir/list_gnu"
+_ResultFile="$_TmpDir/results_gnu"; : > "$_ResultFile"
+_GnuOut="$(w2u_run_list "$_TmpDir/list_gnu" 3 2>&1)"
+PATH="$_SavePath"
+t_assert_eq "6" "$(grep -c . "$_ResultFile")" "mit einem xargs OHNE -S werden alle 6 Chunks abgearbeitet (auf GNU/Linux wuerde sonst KEIN Chunk laufen)"
+t_assert_eq "0" "$(cut -f2 "$_ResultFile" | grep -vc '^0$' || true)" "und zwar fehlerfrei"
+case "$_GnuOut" in
+    *"xargs endete mit rc"*) _GnuWarn=ja ;;
+    *)                       _GnuWarn=nein ;;
+esac
+t_assert_eq "nein" "$_GnuWarn" "kein xargs-Fehler-rc auf GNU-userland (die Option wird gemessen, nicht angenommen)"
+_stub_reset
+
+# ---------------------------------------------------------------------------
 # Ungueltige Parallelitaet muss abgelehnt werden. "-P 0" heisst bei BSD-xargs
 # UNBEGRENZT viele Prozesse - auf einer Quelle mit drehender Platte waere das
 # das Gegenteil dessen, was die Messung erreichen soll.
