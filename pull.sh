@@ -1657,8 +1657,12 @@ w2u_report() {
                     _NdMiss="$(awk -F'\t' '$1 == "R" { _N++ } END { print _N + 0 }' "$_NdFile")" || _NdMiss=""
                     _NdOrph="$(awk -F'\t' '$1 == "T" { _N++ } END { print _N + 0 }' "$_NdFile")" || _NdOrph=""
                     _NdExtra="$(awk -F'\t' '$1 == "L" { _N++ } END { print _N + 0 }' "$_NdFile")" || _NdExtra=""
-                    case "$_NdMiss$_NdOrph$_NdExtra" in
-                        ''|*[!0-9]*)
+                    # "x" trennt die drei Felder: ohne Trenner wuerde ein
+                    # leeres Feld einfach verschwinden (""+"0"+"0" = "00",
+                    # rein numerisch) und der Guard bliebe stumm - genau das
+                    # ist der Bug, den dieser case abfangen soll.
+                    case "x${_NdMiss}x${_NdOrph}x${_NdExtra}" in
+                        *xx*|*[!0-9x]*)
                             printf '   ABWEICHUNG in der Dateizahl!\n'
                             printf '   Welche Dateien abweichen, liess sich NICHT auswerten - Abweichung bleibt bestehen.\n'
                             _Fail=1

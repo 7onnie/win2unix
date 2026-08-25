@@ -458,6 +458,33 @@ case "$_Out" in
 esac
 t_assert_eq "nein" "$_Has" "Fall 1: der Bericht ruft nicht 'ABWEICHUNG', was er zwei Zeilen weiter selbst entkraeftet"
 
+# ---------------------------------------------------------------------------
+# REGRESSION: leeres Feld in einer der drei Zaehl-awks darf NICHT als "nur
+# Ziffern" durchgehen. Der Guard verglich frueher "$_NdMiss$_NdOrph$_NdExtra"
+# ohne Trenner - ein leeres Feld liefert keine Zeichen, also wurde aus
+# "0" + "" + "0" die Kette "00", rein numerisch, und der Guard blieb stumm.
+# Derselbe Zustand (Waise wie in Fall 1, also eine Abweichung liegt vor) wird
+# hier erzwungen, indem genau der Zaehl-awk fuer die Waisen (_NdOrph, Muster
+# $1 == "T") kuenstlich fehlschlaegt und "" statt "1" liefert, waehrend die
+# beiden anderen echten Zaehlungen "0" ergeben - exakt die Kombination, die
+# die Konkatenation nicht von einem sauberen Fall unterscheiden konnte.
+# ---------------------------------------------------------------------------
+awk() {
+    case "$*" in
+        *'$1 == "T" { _N++ } END { print _N + 0 }'*) return 1 ;;
+        *) command awk "$@" ;;
+    esac
+}
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+unset -f awk
+t_assert_rc 1 "$_Rc" "REGRESSION: leeres _NdOrph bei den anderen beiden Zaehlungen auf 0 -> FAIL, nicht PASS"
+case "$_Out" in
+    *"ERGEBNIS: PASS"*) _HasPass=ja ;;
+    *)                  _HasPass=nein ;;
+esac
+t_assert_eq "nein" "$_HasPass" "REGRESSION: der Bericht druckt in diesem Fall kein PASS"
+t_assert_contains "$_Out" "ABWEICHUNG" "REGRESSION: die nicht auswertbare Zaehlung wird als Abweichung gemeldet, nicht verschwiegen"
+
 # Fall 2: dieselbe Waise UND eine wirklich fehlende Datei. Zwei Waisen, damit
 # die ZAHLEN auseinandergehen - eine fehlende Datei plus eine Waise heben sich
 # in der Zahl gegenseitig auf, und dann kommt dieser Vergleich nie zum Zug (das
