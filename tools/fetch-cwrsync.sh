@@ -8,11 +8,25 @@ _CwVersion="6.4.8"
 _Url="https://packages.chocolatey.org/rsync.${_CwVersion}.nupkg"
 _Root="$(cd "$(dirname "$0")/.." && pwd)"
 _Work="$(mktemp -d)"
-trap 'rm -rf "$_Work"' EXIT
+_BinNew="$_Root/windows/bin.new"
+_EtcNew="$_Root/windows/etc.new"
+trap 'rm -rf "$_Work" "$_BinNew" "$_EtcNew"' EXIT
 
-# Erwartete DLLs laut Task-Vorgabe (6.4.8, x64 free). Fest verdrahtet statt nur
-# per Glob kopiert: ein Glob, der nichts trifft, wuerde sonst klaglos ein leeres
-# windows/bin erzeugen und das Skript liefe trotzdem "erfolgreich" durch.
+# Falls ein frueherer Lauf zwischen Staging und dem finalen "mv" abgebrochen
+# ist (z.B. kill -9, das den EXIT-Trap dieses Laufs nicht mehr sehen kann):
+# Reste von einem VORHERIGEN Aufruf vor dem eigenen Lauf wegraeumen, damit
+# "mkdir" unten nicht auf einen halb befuellten Rest trifft.
+rm -rf "$_BinNew" "$_EtcNew"
+
+# Erwartete DLLs laut Task-Vorgabe (6.4.8, x64 free). Diese Liste ist NICHT
+# die Kopierquelle (das war ein Fehler in einer frueheren Fassung: eine feste
+# Liste als alleinige Kopierquelle wuerde bei einem kuenftigen _CwVersion-Bump
+# mit einer zusaetzlichen DLL genau die stille Luecke aufreissen, die diese
+# Pruefung eigentlich verhindern soll - die neue DLL wuerde nie kopiert, aber
+# jede Pruefung gegen diese Liste wuerde trotzdem "bestehen"). Sie ist eine
+# Mindestmenge, die vor dem Kopieren UND nach dem Kopieren gegen das Ergebnis
+# geprueft wird; kopiert wird per Glob (siehe unten), damit eine kuenftige
+# zusaetzliche DLL nie verloren geht.
 _ExpectedDlls="cygwin1.dll cygcrypto-3.dll cygiconv-2.dll cygintl-8.dll cygz.dll cygzstd-1.dll cyglz4-1.dll cygpopt-0.dll cyggcc_s-seh-1.dll cygxxhash-0.dll"
 
 echo "[+] lade $_Url"
@@ -44,7 +58,7 @@ fi
 echo "[+] entpacke aeusseres Paket"
 unzip -q "$_Work/rsync.nupkg" -d "$_Work/nupkg"
 _Inner="$_Work/nupkg/tools/cwrsync_${_CwVersion}_x64_free.zip"
-[ -f "$_Inner" ] || { echo "FEHLER: erwartetes Bundle fehlt: $_Inner"; exit 1; }
+[ -f "$_Inner" ] || { echo "FEHLER: erwartetes Bundle fehlt: $_Inner" >&2; exit 1; }
 
 echo "[+] entpacke inneres cwRsync-Bundle"
 unzip -q "$_Inner" -d "$_Work/cw"
@@ -76,32 +90,36 @@ done
 [ -f "$_Work/nupkg/legal/LICENSE.txt" ] || { echo "FEHLER: legal/LICENSE.txt fehlt im .nupkg." >&2; exit 1; }
 [ -f "$_Work/nupkg/legal/VERIFICATION.txt" ] || { echo "FEHLER: legal/VERIFICATION.txt fehlt im .nupkg." >&2; exit 1; }
 
-echo "[+] uebernehme Binaries"
-# Ab hier wird das bestehende windows/bin und windows/etc geloescht. Alle oben
-# stehenden Pruefungen laufen bewusst VORHER, damit ein Fehlschlag danach
-# (Kopieren, Platte voll, ...) das Repo nicht ohne funktionierende Binaries
-# zuruecklaesst. Ein Fehlschlag ab hier ist trotzdem theoretisch moeglich
-# (z.B. Platte voll waehrend cp) - siehe Verifikation unten, die genau das
-# abfaengt statt nur "Skript durchgelaufen" zu vermelden.
-rm -rf "$_Root/windows/bin" "$_Root/windows/etc"
-mkdir -p "$_Root/windows/bin" "$_Root/windows/etc"
-cp "$_Work/cw/bin/rsync.exe" "$_Root/windows/bin/"
-for _Dll in $_ExpectedDlls
-do
-    cp "$_Work/cw/bin/$_Dll" "$_Root/windows/bin/"
-done
-cp "$_Work/cw/etc/nsswitch.conf" "$_Root/windows/etc/"
-cp "$_Work/nupkg/legal/LICENSE.txt" "$_Root/windows/LICENSE.txt"
-cp "$_Work/nupkg/legal/VERIFICATION.txt" "$_Root/windows/VERIFICATION.txt"
+echo "[+] uebernehme Binaries in Staging-Verzeichnisse"
+# Erst in windows/bin.new und windows/etc.new kopieren, NICHT direkt in
+# windows/bin und windows/etc. Der bestehende Bestand bleibt dabei komplett
+# unberuehrt - ein Fehlschlag beim Kopieren (z.B. Platte voll) bricht das
+# Skript per "set -e" hier ab, bevor irgendetwas Bestehendes geloescht wurde.
+mkdir -p "$_BinNew" "$_EtcNew"
+cp "$_Work/cw/bin/rsync.exe" "$_BinNew/"
+# Kopiert per Glob statt nur die _ExpectedDlls-Liste einzeln zu kopieren:
+# damit geht eine kuenftige, in einer neueren _CwVersion zusaetzlich
+# ausgelieferte DLL nie verloren. Der Glob kann an dieser Stelle nicht leer
+# matchen - die Pruefschleife weiter oben hat schon sichergestellt, dass
+# zumindest alle _ExpectedDlls im entpackten Bundle vorhanden sind, und faellt
+# der Glob trotzdem einmal leer aus, bricht "cp" mit "No such file or
+# directory" laut ab (auf bash 3.2 ohne nullglob wird das Glob-Muster dann
+# woertlich als Dateiname an cp uebergeben) - set -e stoppt das Skript, es
+# entsteht kein leeres bin.new, das unbemerkt durchrutscht.
+cp "$_Work/cw/bin/"cyg*.dll "$_BinNew/"
+cp "$_Work/cw/etc/nsswitch.conf" "$_EtcNew/"
 
-echo "[+] verifiziere Ergebnis"
+echo "[+] verifiziere Staging-Verzeichnisse"
+# Verifikation laeuft gegen bin.new/etc.new, NICHT gegen windows/bin und
+# windows/etc - die existieren zu diesem Zeitpunkt unveraendert vom Beginn des
+# Laufs. Erst wenn diese Pruefung besteht, wird unten destruktiv getauscht.
 # Nicht nur melden dass das Skript durchgelaufen ist, sondern nachsehen, dass
 # es tatsaechlich etwas Brauchbares produziert hat: Dateien da, nicht leer,
 # und rsync.exe ist wirklich ein PE-Executable (Magic "MZ") statt z.B. ein
 # HTML-Fehlerdokument, das zufaellig durch alle bisherigen Pruefungen kam.
 _VerifyFail=0
 
-for _F in "$_Root/windows/bin/rsync.exe" "$_Root/windows/etc/nsswitch.conf" "$_Root/windows/LICENSE.txt" "$_Root/windows/VERIFICATION.txt"
+for _F in "$_BinNew/rsync.exe" "$_EtcNew/nsswitch.conf"
 do
     if [ ! -s "$_F" ]
     then
@@ -112,7 +130,7 @@ done
 
 for _Dll in $_ExpectedDlls
 do
-    _F="$_Root/windows/bin/$_Dll"
+    _F="$_BinNew/$_Dll"
     if [ ! -s "$_F" ]
     then
         echo "FEHLER Verifikation: $_F fehlt oder ist leer." >&2
@@ -120,18 +138,31 @@ do
     fi
 done
 
-_ExeMagic="$(head -c 2 "$_Root/windows/bin/rsync.exe" 2>/dev/null || true)"
+_ExeMagic="$(head -c 2 "$_BinNew/rsync.exe" 2>/dev/null || true)"
 if [ "$_ExeMagic" != "MZ" ]
 then
-    echo "FEHLER Verifikation: windows/bin/rsync.exe ist kein PE-Executable (Magic Bytes: '$_ExeMagic')." >&2
+    echo "FEHLER Verifikation: rsync.exe (Staging) ist kein PE-Executable (Magic Bytes: '$_ExeMagic')." >&2
     _VerifyFail=1
 fi
 
 if [ "$_VerifyFail" -ne 0 ]
 then
-    echo "FEHLER: Verifikation des erzeugten Bundles fehlgeschlagen - siehe oben." >&2
+    echo "FEHLER: Verifikation des erzeugten Bundles fehlgeschlagen - windows/bin und windows/etc bleiben unveraendert." >&2
     exit 1
 fi
+
+echo "[+] uebernehme Lizenzdateien und tausche Staging gegen windows/bin, windows/etc"
+# Legal-Dateien sind reine Overwrites (kein rm -rf davor), deshalb kein
+# eigenes Staging noetig. Der destruktive Teil - rm -rf + mv - steht bewusst
+# als LETZTER Schritt, nachdem alles oben bereits als vollstaendig und
+# gueltig bestaetigt ist. Das Zeitfenster mit einem halb geloeschten
+# windows/bin schrumpft damit auf zwei "mv"-Befehle, die je einzeln atomar
+# sind (selbes Dateisystem, siehe "mktemp -d" bzw. windows/ selbst).
+cp "$_Work/nupkg/legal/LICENSE.txt" "$_Root/windows/LICENSE.txt"
+cp "$_Work/nupkg/legal/VERIFICATION.txt" "$_Root/windows/VERIFICATION.txt"
+rm -rf "$_Root/windows/bin" "$_Root/windows/etc"
+mv "$_BinNew" "$_Root/windows/bin"
+mv "$_EtcNew" "$_Root/windows/etc"
 
 echo "[+] fertig:"
 ls -la "$_Root/windows/bin"
