@@ -423,105 +423,108 @@ w2u_run_chunk() {
     [ "$_Try" -gt "$_MaxRetry" ] && _Try="$_MaxRetry"
 
     # CONTROLLER-RULING 2 (Task 7): dieses ">>" laeuft ab Task 7 aus bis zu
-    # _PMax parallelen Prozessen gleichzeitig, und diese Zeile ist die EINZIGE
-    # Stelle, an der ein fehlgeschlagener Chunk je sichtbar wird. Die Frage, ob
-    # der Append das aushaelt, wurde nachgemessen statt angenommen:
+    # _PMax parallelen Prozessen gleichzeitig und ist die EINZIGE Stelle, an der
+    # ein fehlgeschlagener Chunk sichtbar wird. Nachgemessen, nicht angenommen
+    # (Zahlen im Task-7-Report): der parallele Append haelt.
     #
-    #   - reale Zeilenlaenge (19-23 Byte), 8 / 16 / 32 / 64 gleichzeitige
-    #     Schreiber, ueber 116.000 Zeilen: kein Zeilenverlust, keine vermischte
-    #     Zeile, Byteanzahl exakt wie erwartet.
-    #   - Die Grenze wurde eingegabelt und liegt bei GENAU 1024 Byte je Zeile
-    #     (1024 sauber, 1029 zerrissen) - das ist der stdio-Puffer, nicht
-    #     PIPE_BUF. Die reale Zeile hat damit Faktor 44 Luft.
-    #   - Oberhalb der Grenze ist die Schadensform luecklos zaehlbar-unsichtbar:
-    #     Zeilenzahl UND Byteanzahl blieben korrekt, nur der Inhalt war
-    #     vermischt (16.000 Zeilen, davon 10.643 unversehrt). Eine Pruefung, die
-    #     nur zaehlt, wuerde das nie sehen; der Test in tests/test_parallel.sh
-    #     prueft deshalb das Format jeder Zeile.
-    #
-    # ANNAHME, unter der das gilt: eine Ergebniszeile bleibt deutlich unter
-    # 1 KB, und $_ResultFile liegt auf einem LOKALEN Dateisystem (gemessen auf
-    # APFS). Wer das Zeilenformat aufblaeht oder $_ResultFile auf eine
-    # SMB-/NFS-Freigabe legt - moeglich, weil _LogDir per Vorgabe unter dem
-    # Zielverzeichnis entsteht und das Ziel ein Mount sein kann - hebt die
-    # Grundlage auf; dann gehoert je Chunk eine eigene Ergebnisdatei her.
+    # ANNAHME: Zeilenlaenge deutlich unter 1 KB (real 19-23 Byte, gemessene
+    # Grenze 1024) und $_ResultFile auf einem LOKALEN Dateisystem.
+    # WAS SIE BRICHT: ein aufgeblaehtes Zeilenformat, oder $_ResultFile auf
+    # einer SMB-/NFS-Freigabe - moeglich, weil _LogDir per Vorgabe unter dem
+    # Zielverzeichnis entsteht und das Ziel ein Mount sein kann. Dann gehoert je
+    # Chunk eine eigene Ergebnisdatei her.
+    # Oberhalb der Grenze bleiben Zeilen- UND Byteanzahl korrekt, nur der Inhalt
+    # ist vermischt - eine Pruefung, die zaehlt, ist dafuer blind. Der Test
+    # prueft deshalb das Format jeder Zeile.
     printf '%s\t%s\t%s\n' "$_Name" "$_Rc" "$_Try" >> "$_ResultFile" \
         || w2u_log "WARNUNG: Ergebniszeile fuer $_Name konnte nicht geschrieben werden (rc/Versuche: $_Rc/$_Try)"
     return 0
 }
 
 # Arbeitet eine Chunkliste mit <jobs> parallelen Prozessen ab (Spec 5.5).
+# Messwerte zu allen unten genannten xargs-Eigenschaften: Task-7-Report.
 #
-# CONTROLLER-RULING 1: "xargs -a DATEI" gibt es auf der Zielplattform NICHT
-# (BSD-xargs auf macOS: "xargs: invalid option -- a"). stdin wird deshalb
-# EXPLIZIT aus der Liste umgeleitet. Der Sinn der Constraint "keine Listen ueber
-# stdin" ist damit erfuellt und sogar der eigentliche Punkt: xargs darf nie das
-# geerbte stdin lesen - beim Bootstrap ueber "bash -c "$(curl ...)"" ist das der
-# Skript-Stream selbst.
+# CONTROLLER-RULING 1: "xargs -a DATEI" gibt es auf BSD nicht. stdin wird
+# deshalb EXPLIZIT aus der Liste umgeleitet - das ist auch der eigentliche Punkt
+# der Constraint: xargs darf nie das GEERBTE stdin lesen, beim Bootstrap ueber
+# "bash -c "$(curl ...)"" ist das der Skript-Stream selbst.
 #
 # CONTROLLER-RULING 3 - hier entsteht die Prozessgrenze, auf die sich das
-# Fail-Fast in w2u_run_chunk stuetzt. Drei Dinge muessen dafuer stimmen, alle
-# drei am BSD-xargs dieser Maschine nachgemessen:
+# Fail-Fast in w2u_run_chunk stuetzt. Sie haelt, solange drei Dinge stimmen:
+#   a) je Chunk EIN eigener Prozess ("-I {}" = ein Argument je Aufruf), ein
+#      w2u_die im Worker ist damit "exit 1" nur DIESES Prozesses;
+#   b) xargs macht nach einem Kind mit rc 1 weiter. NICHT so bei rc 255 und bei
+#      Signal-Tod - da hoert xargs auf, die Liste weiterzulesen. w2u_run_chunk
+#      fuehrt intern den Sentinel 255, gibt aber IMMER 0 zurueck; wer daraus je
+#      "return $_Rc" macht, bricht damit den ganzen Lauf ab;
+#   c) der rc von xargs wird abgefangen. Ohne "|| _Rc=$?" risse errexit aus
+#      main() den GESAMTEN Transfer ab, sobald ein Worker stirbt - genau das,
+#      was die Grenze verhindern soll, nur eine Ebene hoeher.
 #
-#   a) Je Chunk EIN eigener bash-Prozess ("-I {}" heisst ein Argument je
-#      Aufruf). Ein w2u_die im Worker ist damit "exit 1" DIESES Prozesses.
-#   b) xargs macht nach einem Kind mit rc 1 weiter (gemessen: 5 Chunks, Chunk 2
-#      stirbt, alle 5 werden trotzdem gestartet). ACHTUNG fuer spaetere Aenderungen:
-#      bei rc 255 ist das anders - da bricht xargs sofort ab ("exited with status
-#      255; aborting", gemessen: nur 3 von 5 liefen). w2u_run_chunk fuehrt intern
-#      den Sentinel 255, gibt aber IMMER 0 zurueck. Wer daraus je "return $_Rc"
-#      macht, verwandelt einen einzelnen Konfigurationsfehler in einen
-#      Komplettabbruch des Laufs.
-#   c) Der rc von xargs wird abgefangen. Ohne "|| _Rc=$?" waere die Grenze aus
-#      (a)/(b) wertlos: xargs liefert nach einem toten Worker rc 1, und unter dem
-#      "set -euo pipefail" aus main() risse errexit den GESAMTEN Transfer ab -
-#      also genau das, was die Grenze verhindern soll, nur eine Ebene hoeher.
+# Exportiert wird, was der Rumpf von w2u_run_chunk braucht - abgeleitet, nicht
+# geschaetzt. Eine fehlende Funktion ist im Kind "command not found" (rc 127)
+# und KEIN exit: die Ausfuehrung liefe hinter dem Guard weiter und der kaputte
+# Chunk bekaeme eine Ergebniszeile, die wie erledigt aussieht.
 #
-# Die exportierte Funktionsliste ist aus dem Rumpf von w2u_run_chunk abgeleitet,
-# nicht geschaetzt: sie ruft w2u_die und w2u_log. Fehlten die beiden hier, waere
-# der Schaden still statt laut - eine nicht existierende Funktion ist im Kind
-# "command not found" (rc 127) und KEIN exit, die Ausfuehrung liefe hinter dem
-# Guard einfach weiter (nachgestellt und bestaetigt). Ein Chunk mit kaputter
-# Konfiguration bekaeme dann eine Ergebniszeile, die im Abschlussbericht wie
-# erledigt aussieht.
+# "-S 4096": BSD-xargs begrenzt die "-I"-Ersetzung per Vorgabe auf 255 Byte und
+# bricht darueber die GANZE restliche Liste ab. Erreichbar ueber den Pfad des
+# Arbeitsverzeichnisses (der Chunkname ist kurz), und wo $_TmpDir liegt,
+# entscheidet main(). 4096 ist das Vierfache von PATH_MAX - ein einzelner
+# absoluter Pfad kann die Grenze damit strukturell nicht mehr reissen.
 #
-# "-S 4096" ist kein Feintuning, sondern eine Notwendigkeit. BSD-xargs begrenzt
-# die Ersetzung hinter "-I" per Vorgabe auf 255 Byte; genau nachgemessen: ein
-# 254 Byte langer Chunkpfad laeuft, ab 255 Byte kommt "xargs: command line cannot
-# be assembled, too long" und rc 1. Der Schaden ist dabei NICHT auf den langen
-# Pfad beschraenkt - xargs bricht an dieser Stelle die ganze Liste ab (Probe mit
-# kurz/lang/kurz: nur der erste Chunk lief, der dritte nie). Und weil ein
-# gestorbener Worker denselben rc 1 liefert, saehe der Abbruch der halben
-# Chunkliste aus wie ein einzelner kaputter Chunk.
-# Erreichbar ist das ueber den Pfad des Arbeitsverzeichnisses, nicht ueber den
-# Chunknamen (der ist "chunk.aaaa"): liegt $_TmpDir unter einem tiefen Ziel
-# (Kundenordner auf einem Volume), sind 255 Byte schnell voll. 4096 ist das
-# Vierfache von PATH_MAX (auf dieser Maschine 1024, nachgemessen mit getconf) -
-# ein einzelner absoluter Pfad kann die Grenze damit strukturell nicht mehr
-# reissen. Getestet ist beides zusammen: langer Pfad UND Leerzeichen darin.
-#
-# "${BASH:-bash}" statt "bash": $BASH ist der Pfad genau des Interpreters, der
-# gerade laeuft. Das Format, in dem "export -f" Funktionen in die Umgebung legt,
-# ist zwischen bash 3.2 (Apple) und bash 4.3+ (Homebrew) verschieden - startet
-# ein Skript unter Homebrew-bash Worker mit /bin/bash, importiert das Kind die
-# Funktionen NICHT und kein einziger Chunk wird uebertragen. Auf dieser Maschine
-# ist nur bash 3.2 installiert, der Versionsmix ist hier also nicht nachstellbar;
-# $BASH ist die Variante, die die Frage strukturell nicht aufkommen laesst.
+# "${BASH:-bash}": das Umgebungsformat von "export -f" unterscheidet sich
+# zwischen bash 3.2 (Apple) und 4.3+ (Homebrew). Startete ein Skript unter
+# Homebrew-bash seine Worker mit /bin/bash, importierte das Kind die Funktionen
+# nicht und kein einziger Chunk wuerde uebertragen. $BASH ist derselbe
+# Interpreter wie der laufende und laesst die Frage nicht aufkommen.
 w2u_run_list() {
-    local _ListFile="$1" _Jobs="$2" _Rc=0
+    local _ListFile="$1" _Jobs="$2" _Rc=0 _Missing="" _MissCnt=0 _Done=""
     # "-P 0" heisst bei BSD-xargs UNBEGRENZT viele Prozesse - auf einer Quelle
     # mit drehender Platte das Gegenteil dessen, was die Messung erreichen soll.
     case "$_Jobs" in
         ''|*[!0-9]*) w2u_die "Parallelitaet ist keine Ganzzahl: '$_Jobs'" ;;
     esac
     [ "$_Jobs" -ge 1 ] || w2u_die "Parallelitaet muss mindestens 1 sein (bekam $_Jobs; '-P 0' waere bei BSD-xargs unbegrenzt)"
+    # "existiert nicht" und "ist leer" duerfen hier NICHT zusammenfallen. Leer
+    # ist legitim (chunks.rest nach einer Messung, die alles verbraucht hat) und
+    # bleibt still. Fehlend oder unlesbar ist ein Defekt - ein stiller rc 0
+    # machte einen Lauf, der NICHTS uebertragen hat, von einem vollstaendigen
+    # ununterscheidbar, und danach wird die Quelle verschrottet. Dieselbe
+    # Verschmelzung wie in w2u_remote_list (Task 3) und beim head weiter unten.
+    [ -e "$_ListFile" ] || w2u_die "Chunkliste $_ListFile existiert nicht - ein stiller rc 0 saehe hier aus wie 'nichts mehr zu tun'"
+    [ -r "$_ListFile" ] || w2u_die "Chunkliste $_ListFile ist nicht lesbar"
     [ -s "$_ListFile" ] || return 0
 
     export _RsyncBin _SrcUrl _DstRoot _LogDir _ResultFile _MaxRetry _RetryPause _ExcludeFrom _RsyncTimeout
     export -f w2u_run_chunk w2u_die w2u_log
     xargs -P "$_Jobs" -S 4096 -I {} "${BASH:-bash}" -c 'w2u_run_chunk "$1"' _ {} < "$_ListFile" || _Rc=$?
     if [ "$_Rc" -ne 0 ]; then
-        w2u_warn "xargs meldete rc $_Rc - mindestens ein Worker ist vorzeitig gestorben (w2u_run_chunk selbst liefert immer 0). Diese Chunks haben KEINE Ergebniszeile; der Abschlussbericht muss sie als fehlend erkennen."
+        w2u_warn "xargs endete mit rc $_Rc - w2u_run_chunk selbst liefert immer 0, also ist mindestens ein Worker vorzeitig gestorben. Bei Signal-Tod (z.B. OOM) und bei Exit 255 liest xargs die Liste danach NICHT weiter."
+        # Der Abgleich gehoert hierher und nirgendwo sonst: dies ist die einzige
+        # Stelle, die beides in der Hand hat - die Eingabeliste und
+        # $_ResultFile. Ohne ihn endete ein Lauf, dessen Chunkliste ab Minute
+        # drei nie mehr angefasst wurde, mit rc 0 und ohne jede Spur, WELCHE
+        # Chunks das waren. Ein Abschlussbericht spaeter hat den Bezug zu dieser
+        # konkreten Liste nicht mehr.
+        # "$_Done" statt "$_ResultFile" direkt, und Unterscheidung ueber
+        # FILENAME statt ueber das uebliche "NR == FNR": beide Abkuerzungen
+        # brechen genau dann, wenn die Ergebnisdatei LEER ist - und leer ist sie
+        # in genau dem Fall, der hier am meisten zaehlt (xargs scheitert schon
+        # am ersten Chunk). "NR == FNR" haelte dann jede Zeile der Chunkliste
+        # fuer eine Ergebniszeile und meldete nichts als fehlend.
+        _Done="$_ResultFile"
+        [ -f "$_Done" ] || _Done="/dev/null"
+        _Missing="$(awk -F'\t' -v _DoneFile="$_Done" '
+            FILENAME == _DoneFile { _Seen[$1] = 1; next }
+            { _N = $0; sub(/^.*\//, "", _N); if (_N != "" && !(_N in _Seen)) print _N }
+        ' "$_Done" "$_ListFile")" || _Missing=""
+        if [ -n "$_Missing" ]; then
+            _MissCnt="$(printf '%s\n' "$_Missing" | grep -c .)" || [ "$?" -eq 1 ] || _MissCnt=0
+        fi
+        if [ "$_MissCnt" -gt 0 ]; then
+            w2u_warn "$_MissCnt Chunk(s) aus $_ListFile haben KEINE Ergebniszeile, wurden also nicht (vollstaendig) uebertragen: $(printf '%s\n' "$_Missing" | head -n 20 | tr '\n' ' ')"
+            [ "$_MissCnt" -gt 20 ] && w2u_warn "... und $((_MissCnt - 20)) weitere; die vollstaendige Liste ergibt sich aus $_ListFile abzueglich Spalte 1 von $_ResultFile"
+        fi
     fi
     return 0
 }
@@ -542,10 +545,13 @@ w2u_dst_kb() {
 }
 
 # Anzahl bereits geschriebener Ergebniszeilen. Marke, um nach einer Probe-Runde
-# GENAU deren Zeilen zu betrachten.
+# GENAU deren Zeilen zu betrachten. Eine noch nicht existierende Ergebnisdatei
+# ist VOR der ersten Runde legitim (0 Zeilen); danach ist sie es nicht mehr -
+# das prueft der Aufrufer, nicht diese Funktion.
 w2u_result_lines() {
     local _Cnt=0
-    if [ -n "$_ResultFile" ] && [ -f "$_ResultFile" ]; then
+    [ -n "$_ResultFile" ] || w2u_die "w2u_result_lines ohne gesetztes _ResultFile - ohne Ergebnisdatei gibt es kein Sicherheitsnetz"
+    if [ -f "$_ResultFile" ]; then
         _Cnt="$(grep -c . "$_ResultFile")" || [ "$?" -eq 1 ] || w2u_die "Ergebnisdatei $_ResultFile nicht lesbar - Wiederholungen in einer Probe-Runde waeren nicht erkennbar"
     fi
     printf '%s\n' "$_Cnt"
@@ -564,31 +570,27 @@ w2u_result_lines() {
 # schreibt "Total received: 636 B", GNU rsync "Total bytes received: 636" - zwei
 # Formate, ein Messfehler mehr als noetig.
 #
-# WAS DIESE MESSUNG NICHT KANN, und warum sie trotzdem so gebaut ist:
+# WAS DIESE MESSUNG NICHT KANN - die Grenzen sind der Grund fuer die
+# Brauchbarkeitsschranken weiter unten:
 #
-# 1) Jede Runde faehrt ANDERE Chunks. Die gemessenen Ordner sind zwischen 3,6 MB
-#    und 41 MB gross (Spec) - eine Stufe kann also aus Gruenden schneller
-#    aussehen, die mit Parallelitaet nichts zu tun haben. Ein kontrolliertes
-#    Experiment waere nur moeglich, wenn dieselben Daten mehrfach uebertragen
-#    wuerden, und das verbietet sich: Probe-Arbeit muss echte Arbeit sein.
-#    Gegenmittel ist deshalb nur die Hoehe der Schwelle - 15 Prozent verlangen
-#    ein deutliches Signal, kein knappes.
-# 2) Die Wanduhr hat Sekundenaufloesung ($_ProbeMinSecs erklaert die Folgen).
-# 3) Eine Runde, in der ein Chunk WIEDERHOLT werden musste, enthaelt die
-#    Retry-Pause aus w2u_run_chunk in ihrer Wanduhr (produktiv bis
-#    _RetryPause * _MaxRetry Sekunden reiner Schlaf). Sie sagt dann etwas ueber
-#    eine gesperrte Windows-Datei aus, nicht ueber Parallelitaet.
-#    Erkannt wird das an der Versuchszahl der neuen Ergebniszeilen, NICHT am
-#    Exit-Code: rc 23/24 ist auf der Windows-Seite die erwartete Signatur
-#    gesperrter Dateien (Spec 5.5) - darauf zu filtern wuerde fast jede Runde
-#    verwerfen.
+# 1) Jede Runde faehrt ANDERE Chunks (Probe-Arbeit muss echte Arbeit sein, also
+#    ist ein kontrolliertes Experiment ausgeschlossen). Eine Stufe kann aus
+#    Gruenden schneller aussehen, die mit Parallelitaet nichts zu tun haben.
+#    Einziges Gegenmittel ist die Hoehe der Schwelle: 15 Prozent verlangen ein
+#    deutliches Signal, kein knappes.
+# 2) Die Wanduhr hat Sekundenaufloesung - siehe _ProbeMinSecs.
+# 3) Eine Runde mit einer WIEDERHOLUNG enthaelt die Retry-Pause aus
+#    w2u_run_chunk (produktiv bis _RetryPause * _MaxRetry Sekunden reiner
+#    Schlaf) und misst dann eine gesperrte Windows-Datei statt Parallelitaet.
+#    Erkannt an der Versuchszahl, NICHT am Exit-Code: rc 23/24 ist die
+#    erwartete Signatur gesperrter Dateien (Spec 5.5), ein Filter darauf wuerde
+#    fast jede Runde verwerfen.
 #
-# In allen drei Faellen gilt dieselbe Regel: eine Runde, die keine belastbare
-# Aussage traegt, wird als "nicht verwertbar" protokolliert und liefert KEINEN
-# Messwert - die Arbeit bleibt aber erledigt. Bleibt am Ende gar keine
-# verwertbare Runde uebrig, wird der Vorgabewert zurueckgegeben und im Log
-# ausdruecklich als Vorgabe und nicht als Messergebnis benannt. Eine falsche
-# Zahl mit Messwert-Anmutung waere hier schlimmer als ein zugegebener Default.
+# Regel in allen Faellen: eine Runde ohne belastbare Aussage wird als "nicht
+# verwertbar" mit Grund protokolliert und liefert KEINEN Messwert - die Arbeit
+# bleibt erledigt. Ohne verwertbare Runde kommt der Vorgabewert zurueck, im Log
+# ausdruecklich als Vorgabe benannt. Eine falsche Zahl mit Messwert-Anmutung
+# waere schlimmer als ein zugegebener Default.
 w2u_autotune() {
     local _ListFile="$1"
     [ -n "$_TmpDir" ] || w2u_die "w2u_autotune ohne gesetztes _TmpDir aufgerufen"
@@ -605,6 +607,11 @@ w2u_autotune() {
     case "$_ProbeMinKb" in
         ''|*[!0-9]*) w2u_die "_ProbeMinKb ist keine Ganzzahl: '$_ProbeMinKb'" ;;
     esac
+    case "$_PMax" in
+        ''|*[!0-9]*) w2u_die "_PMax ist keine Ganzzahl: '$_PMax'" ;;
+    esac
+    [ "$_PMax" -ge 1 ] || w2u_die "_PMax muss mindestens 1 sein (bekam $_PMax)"
+    [ -n "$_ResultFile" ] || w2u_die "w2u_autotune ohne gesetztes _ResultFile - ohne Ergebnisdatei ist nicht feststellbar, ob eine Runde Wiederholungen enthielt"
 
     # Wie in w2u_chunk: Altlasten aus einem vorherigen Lauf im selben
     # Arbeitsverzeichnis wuerden den Vollstaendigkeitsbeweis (Probe-Runden plus
@@ -614,9 +621,13 @@ w2u_autotune() {
     # selbst schlaegt fehl). Aufrufer ist w2u_run_all mit der Chunkliste.
     cp "$_ListFile" "$_Rest" || w2u_die "Restliste $_Rest konnte nicht angelegt werden"
 
+    # Der Vorgabewert darf _PMax nicht ueberschreiten: bei _PMax=1 wird keine
+    # Runde gefahren, und eine zurueckgegebene 2 waere eine Parallelitaet, die
+    # die Konfiguration ausdruecklich ausschliesst.
     local _BestP=2 _BestRate=0 _Measured=0
+    [ "$_PMax" -lt 2 ] && _BestP="$_PMax"
     local _P _Take _Round _Before="" _After _T0 _T1 _Dur _Kb _Rate
-    local _LinesBefore _Retried _Usable _Why
+    local _LinesBefore _Retried _RetryKnown _Usable _Why _Threshold
     for _P in 2 4 8; do
         [ "$_P" -gt "$_PMax" ] && break
         _Take=$((2 * _P))
@@ -656,10 +667,22 @@ w2u_autotune() {
 
         _Dur=$((_T1 - _T0))
         [ "$_Dur" -lt 0 ] && _Dur=0
+        # Nicht als eine Pipeline: scheitert dort das tail, ist der rc von
+        # "kein Treffer" (grep 1) nicht zu unterscheiden, und die Runde galte
+        # als wiederholungsfrei - der Guard waere gegenueber den drei anderen
+        # Datei-Operationen hier invertiert. Fehlt die Ergebnisdatei nach einer
+        # Runde ganz, ist nicht FESTSTELLBAR, ob wiederholt wurde; das ist
+        # nicht dasselbe wie "es wurde nicht wiederholt".
         _Retried=0
-        if [ -n "$_ResultFile" ] && [ -f "$_ResultFile" ]; then
-            _Retried="$(tail -n +$((_LinesBefore + 1)) "$_ResultFile" | cut -f3 | grep -cv '^1$')" \
+        _RetryKnown=1
+        if [ -f "$_ResultFile" ]; then
+            _Rc=0
+            tail -n +$((_LinesBefore + 1)) "$_ResultFile" > "$_TmpDir/runde.ergebnis" || _Rc=$?
+            [ "$_Rc" -eq 0 ] || w2u_die "Ergebniszeilen der Probe-Runde nicht lesbar (tail rc $_Rc)"
+            _Retried="$(cut -f3 "$_TmpDir/runde.ergebnis" | grep -cv '^1$')" \
                 || [ "$?" -eq 1 ] || w2u_die "Versuchszahlen der Probe-Runde nicht lesbar"
+        else
+            _RetryKnown=0
         fi
 
         _Usable=1
@@ -687,6 +710,10 @@ w2u_autotune() {
             _Usable=0
             _Why="nur ${_Kb} KB am Ziel dazugekommen, Mindestmenge ${_ProbeMinKb} KB - vermutlich war das meiste schon vorhanden"
         fi
+        if [ "$_Usable" -eq 1 ] && [ "$_RetryKnown" -eq 0 ]; then
+            _Usable=0
+            _Why="nach der Runde existiert $_ResultFile nicht - ob wiederholt wurde, ist nicht feststellbar"
+        fi
         if [ "$_Usable" -eq 1 ] && [ "$_Retried" -gt 0 ]; then
             _Usable=0
             _Why="$_Retried Chunk(s) mussten wiederholt werden - die Retry-Pausen stecken in der Wanduhr dieser Runde"
@@ -703,11 +730,16 @@ w2u_autotune() {
         _Rate=$((_Kb / _Dur))
         _Measured=$((_Measured + 1))
         w2u_log "Messung P=$_P: ${_Rate} KB/s (${_Kb} KB in ${_Dur}s)"
-        if [ "$_Rate" -gt $((_BestRate + _BestRate / 7)) ]; then
+        # "* 115 / 100" und nicht "+ _BestRate / 7": ein Siebtel sind 14,3
+        # Prozent. Die Spec und die Logzeile sagen 15 - eine Schwelle, die
+        # anders rechnet als sie sich meldet, ist beim Nachvollziehen einer
+        # Entscheidung schlimmer als eine etwas andere Zahl.
+        _Threshold=$((_BestRate * 115 / 100))
+        if [ "$_Rate" -gt "$_Threshold" ]; then
             _BestRate="$_Rate"
             _BestP="$_P"
         else
-            w2u_log "P=$_P bringt gegenueber P=$_BestP (${_BestRate} KB/s) keine 15 Prozent - Eskalation endet hier"
+            w2u_log "P=$_P bringt gegenueber P=$_BestP (${_BestRate} KB/s) keine 15 Prozent (noetig waeren mehr als ${_Threshold} KB/s) - Eskalation endet hier"
             break
         fi
     done
@@ -744,17 +776,13 @@ w2u_run_all() {
         w2u_log "feste Parallelitaet: $_Jobs (Auto-Messung uebersprungen)"
         w2u_run_list "$_ListFile" "$_Jobs"
     else
+        # Kein Fallback auf einen Ersatzwert: unter dem errexit aus main() reisst
+        # ein w2u_die in der Substitution den Lauf schon hier ab, und auf dem
+        # rc-0-Pfad kann w2u_autotune nur eine gueltige Stufe liefern. Ein
+        # Zweig, der etwas anderes behandelt, waere toter Code mit einem
+        # Kommentar, der das Gegenteil des Tatsaechlichen verspricht. Kaeme doch
+        # je etwas Ungueltiges durch, faengt es der Guard in w2u_run_list.
         _Jobs="$(w2u_autotune "$_ListFile")"
-        # stdout von w2u_autotune ist ein Wertekanal. Wuerde dort je etwas
-        # anderes landen, ginge der Wert ungeprueft als "-P" an xargs. Lieber
-        # sichtbar auf den Vorgabewert zurueckfallen als den Lauf abbrechen -
-        # die Restliste ist an dieser Stelle schon geschrieben.
-        case "$_Jobs" in
-            ''|*[!0-9]*|0)
-                w2u_warn "Auto-Messung lieferte '$_Jobs' statt einer Parallelitaet - benutze 2"
-                _Jobs=2
-                ;;
-        esac
         w2u_log "gewaehlte Parallelitaet: $_Jobs"
         w2u_run_list "$_TmpDir/chunks.rest" "$_Jobs"
     fi
