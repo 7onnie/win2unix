@@ -153,6 +153,10 @@ _under() {
 # im laufenden Testprozess nicht die Einstellung des vorherigen erbt.
 _reset_opts() {
     _JobCnt=0
+    # MUSS mit zurueckgesetzt werden: --jobs hebt _PMax an (Spec 5.3), und ein
+    # angehobenes _PMax aus einem vorherigen Aufruf im selben Testprozess
+    # verstellte die Zerlegung aller folgenden Faelle.
+    _PMax=8
     _ExcludeFrom=""
     _LogDir=""
     _RsyncBin=""
@@ -177,6 +181,53 @@ t_assert_eq "$_DstBase" "$_DstRoot" "Quelle mit Slash schreibt direkt ins Ziel"
 
 w2u_parse_args --jobs 6 "rsync://10.0.0.1/e/Archiv" "$_DstBase"
 t_assert_eq "6" "$_JobCnt" "--jobs wird uebernommen"
+
+# --- --jobs hebt _PMax (Spec 5.3) --------------------------------------------
+# P_max ist laut Spec 5.3 "Vorgabe 8 ODER der Wert aus --jobs", und an P_max
+# haengen BEIDE Zahlen der Zerlegung: die Schwelle (4 * P_max) und der
+# Chunk-Divisor. Fehlt die zweite Haelfte, setzt --jobs nur die Zahl der Worker,
+# waehrend weiter fuer 8 zerlegt wird - bei der gemessenen Datenlage (Fall A,
+# 308 Arbeitspakete) sind das 31 Chunks fuer 32 Worker. Weniger Chunks als
+# Worker heisst: mindestens einer bekommt nichts, und Work-Stealing gibt es
+# nicht mehr. Deshalb wird hier nicht nur _PMax geprueft, sondern die Folge
+# daraus - die Chunkzahl gegen die Worker-Zahl.
+_reset_opts
+w2u_parse_args --jobs 32 "rsync://10.0.0.1/e/Archiv" "$_DstBase"
+t_assert_eq "32" "$_PMax" "--jobs 32 hebt _PMax auf 32 (Spec 5.3)"
+_JobsWork="$_Tmp/jobs.work"
+: > "$_JobsWork"
+_I=1
+while [ "$_I" -le 308 ]; do
+    printf 'paket %d\n' "$_I" >> "$_JobsWork"
+    _I=$((_I + 1))
+done
+mkdir -p "$_Tmp/jobs.chunks"
+w2u_chunk "$_JobsWork" "$_Tmp/jobs.chunks" "$_PMax" "$_Tmp/jobs.list" >/dev/null 2>&1
+_JobsChunks="$(grep -c . "$_Tmp/jobs.list")"
+t_assert_eq "103" "$_JobsChunks" "Fall A mit --jobs 32: 103 Chunks (mit ungehobenem _PMax waeren es 31)"
+[ "$_JobsChunks" -gt "$_JobCnt" ] && _MehrAlsWorker=ja || _MehrAlsWorker=nein
+t_assert_eq "ja" "$_MehrAlsWorker" "es gibt mehr Chunks ($_JobsChunks) als Worker ($_JobCnt) - sonst laeuft mindestens einer leer"
+
+# Nur ANHEBEN: ein kleines --jobs darf die Zerlegung nicht groeber machen als
+# die Vorgabe, sonst waere man wieder bei "4 Chunks fuer 8 Worker".
+_reset_opts
+w2u_parse_args --jobs 2 "rsync://10.0.0.1/e/Archiv" "$_DstBase"
+t_assert_eq "8" "$_PMax" "--jobs 2 senkt _PMax NICHT unter die Vorgabe"
+
+# Obergrenze: ohne sie waere "--jobs 10000" gueltig und startete 10000
+# rsync-Prozesse gegen eine alte Windows-Kiste.
+_reset_opts
+# Gegen den rsync-Ersatz und ein vorhandenes Ziel, nicht gegen eine
+# unerreichbare Quelle: sonst liefert der naechste Preflight-Check denselben
+# rc 1 und eine entfernte Ablehnung faellt nicht auf. Als Trockenlauf, damit
+# ohne die Ablehnung nicht wirklich 10000 Prozesse entstehen - der Trockenlauf
+# endet ohne die Ablehnung mit rc 0.
+_Out="$(bash "$_Root/pull.sh" --jobs 10000 --dry-run --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp" 2>&1)"; _Rc=$?
+t_assert_rc 1 "$_Rc" "--jobs 10000 wird abgelehnt (ohne die Ablehnung liefe derselbe Aufruf auf rc 0)"
+t_assert_contains "$_Out" "Obergrenze" "die Ablehnung nennt die Obergrenze"
+_Out="$(bash "$_Root/pull.sh" --jobs 64 --dry-run --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp" 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "--jobs 64 (die Grenze selbst) bleibt erlaubt - die Ablehnung greift nicht zu weit"
+_reset_opts
 
 _Out="$(bash "$_Root/pull.sh" --jobs abc rsync://10.0.0.1/e/x /tmp 2>&1 || true)"
 t_assert_contains "$_Out" "ABBRUCH" "nicht-numerisches --jobs bricht ab"
@@ -513,30 +564,52 @@ w2u_parse_args --verify-only "rsync://10.0.0.1/e/Daten/Archiv" /tmp 2>/dev/null
 t_assert_eq "1" "$_VerifyOnly" "--verify-only bleibt auch in der einstroemigen Aufrufform erlaubt"
 _reset_opts
 
-# Das Ziel der parallelen Phase ist per Konstruktion ein VORFAHRE des
-# Zielverzeichnisses - bei der Schraegstrich-Form ein Verzeichnis, das der
-# Anwender nie genannt hat. Ist es nicht beschreibbar, wird das nicht
-# stillschweigend versucht, sondern einstroemig uebertragen (und gesagt).
+# Geprueft wird das Schreibrecht dort, wo die Worker WIRKLICH schreiben - und
+# das ist das Zielverzeichnis, nicht der Vorfahre "$_ParDst". Die Dateien landen
+# unter "_ParDst/<praefix>", und das IST $_DstRoot.
+#
+# Vorher stand die Pruefung auf dem Vorfahren, und sie war in BEIDE Richtungen
+# falsch (im Abschluss-Review gefunden, hier in beiden Richtungen gepinnt):
+#   a) ein nur-lesbarer VORFAHRE lehnte einen Lauf ab, der funktioniert haette -
+#      mit --no-verify sogar per Abbruch statt per Warnung, weil ohne Zerlegung
+#      keine bindende Beweisschicht bleibt;
+#   b) ein nicht beschreibbares ZIEL fiel gar nicht auf, obwohl genau dort
+#      geschrieben wird.
 mkdir -p "$_Tmp/ro/Archiv"
 chmod 500 "$_Tmp/ro"
 if [ -w "$_Tmp/ro" ]; then
     t_skip "laeuft als root - ein nicht beschreibbares Elternverzeichnis ist so nicht herstellbar"
 else
-    # TMPDIR umgebogen: der Lauf endet mit FAIL (am Ziel liegt nichts), und
-    # nach einem FAIL bleiben die Logs liegen - ohne die Umleitung im echten
-    # TMPDIR des Anwenders.
+    # TMPDIR umgebogen: dieser Lauf endet mit FAIL (die Attrappe uebertraegt
+    # nichts), und nach einem FAIL bleiben die Logs liegen - ohne die Umleitung
+    # im echten TMPDIR des Anwenders.
     mkdir -p "$_Tmp/tmp-ro"
     _Out="$(TMPDIR="$_Tmp/tmp-ro" bash "$_Root/pull.sh" --rsync "$_Fake" "rsync://10.0.0.1/e/Archiv/" "$_Tmp/ro/Archiv" 2>&1 || true)"
-    t_assert_contains "$_Out" "EINSTROEMIG" "nicht beschreibbares _ParDst schaltet auf einstroemig um"
-    t_assert_contains "$_Out" "nicht beschreibbar" "und nennt den Grund"
+    case "$_Out" in
+        *EINSTROEMIG*) _Has=ja ;;
+        *)             _Has=nein ;;
+    esac
+    t_assert_eq "nein" "$_Has" "a) nur-lesbarer VORFAHRE, beschreibbares Ziel: KEIN Rueckfall - dort schreibt niemand hinein"
+    t_assert_contains "$_Out" "parallele Phase" "a) die parallele Phase laeuft"
+
+    # b) Jetzt das ZIEL selbst. Erreichbar nur ohne abschliessenden
+    # Schraegstrich an der Quelle: bei der Schraegstrich-Form ist $_DstRoot das
+    # genannte Zielverzeichnis, und dessen Schreibrecht prueft der Preflight
+    # schon weiter oben ab.
+    mkdir -p "$_Tmp/ro2/Daten/Archiv" "$_Tmp/tmp-ro2"
+    chmod 500 "$_Tmp/ro2/Daten/Archiv"
+    _Out="$(TMPDIR="$_Tmp/tmp-ro2" bash "$_Root/pull.sh" --rsync "$_Fake" "rsync://10.0.0.1/e/Daten/Archiv" "$_Tmp/ro2/Daten" 2>&1 || true)"
+    chmod 700 "$_Tmp/ro2/Daten/Archiv"
+    t_assert_contains "$_Out" "EINSTROEMIG" "b) nicht beschreibbares ZIEL schaltet auf einstroemig um"
+    t_assert_contains "$_Out" "nicht beschreibbar" "b) und nennt den Grund"
     # Der Rat muss zum Grund passen: hier stimmt der Zielpfad bereits, es fehlen
     # die Rechte - "waehle ein Ziel, das auf den Praefix endet" waere Unsinn.
-    t_assert_contains "$_Out" "es fehlen die Rechte" "und einen Rat, der zum Grund passt"
+    t_assert_contains "$_Out" "es fehlen die Rechte" "b) und einen Rat, der zum Grund passt"
     case "$_Out" in
         *"OHNE abschliessenden Schraegstrich"*) _Has=ja ;;
         *)                                      _Has=nein ;;
     esac
-    t_assert_eq "nein" "$_Has" "und NICHT den Rat aus dem anderen Fall"
+    t_assert_eq "nein" "$_Has" "b) und NICHT den Rat aus dem anderen Fall"
 fi
 chmod 700 "$_Tmp/ro"
 

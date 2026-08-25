@@ -37,7 +37,11 @@ _Src="$(mktemp -d)"
 _Dst="$(mktemp -d)"
 _Dst2="$(mktemp -d)"
 _Dst3="$(mktemp -d)"
-trap 'd_stop; rm -rf "$_Src" "$_Dst" "$_Dst2" "$_Dst3"' EXIT
+_Dst4="$(mktemp -d)"
+_Dst5="$(mktemp -d)"
+# "chmod -R u+w" vor dem Loeschen: zwei Faelle unten setzen einen Vorfahren
+# absichtlich auf nur-lesen, und ein "rm -rf" kaeme dort nicht durch.
+trap 'd_stop; chmod -R u+w "$_Dst4" "$_Dst5" 2>/dev/null; rm -rf "$_Src" "$_Dst" "$_Dst2" "$_Dst3" "$_Dst4" "$_Dst5"' EXIT
 
 # Prueft, dass eine Zeichenkette NICHT vorkommt. Bewusst hier und nicht in
 # testlib.sh: dieser Test braucht sie, die anderen zehn nicht, und eine
@@ -222,5 +226,56 @@ t_assert_eq "" "$(diff -r "$_Src/Daten/SonoGDT" "$_Dst3/Daten/SonoGDT" 2>&1)" "t
 # Zahlen verschieden - waehrend diff -r trotzdem sauber waere.
 t_assert_eq "31" "$(find "$_Dst3/Daten/SonoGDT" -type f | wc -l | tr -d ' ')" "tiefer Praefix: 31 Dateien im erwarteten Unterbaum"
 t_assert_eq "31" "$(find "$_Dst3" -type f | wc -l | tr -d ' ')" "tiefer Praefix: KEINE Datei ausserhalb des erwarteten Unterbaums"
+
+# ---- Lauf 7: nicht beschreibbarer VORFAHRE, beschreibbares Ziel -------------
+# Die Worker schreiben nach "_ParDst/<praefix>", und das IST das
+# Zielverzeichnis. Auf den VORFAHREN _ParDst brauchen sie kein Schreibrecht,
+# solange die Praefix-Kette schon existiert. Der Preflight pruefte trotzdem den
+# Vorfahren und lehnte damit einen Lauf ab, der funktioniert haette - mit
+# --no-verify nicht als Warnung, sondern per Abbruch (w2u_einstroemig stirbt
+# dort, weil ohne Zerlegung keine bindende Beweisschicht bleibt).
+#
+# Aufbau: Quelle 'Daten/SonoGDT' (zweisegmentiger Praefix, also _ParDst = die
+# Wurzel des Zielbaums und NICHT das genannte Zielverzeichnis - nur so ist der
+# Fall ueberhaupt erreichbar; bei einsegmentigem Praefix faengt ihn die
+# "-w $_DstDir"-Pruefung schon vorher ab). Vorfahre nur-lesen, Ziel schreibbar.
+#
+# Als root wirkungslos (Rechte werden ignoriert) - dieselbe Ausnahme wie in
+# tests/test_chunk.sh.
+if [ "$(id -u)" -eq 0 ]; then
+    t_skip "laeuft als root - ein nicht beschreibbarer Vorfahre ist wirkungslos"
+else
+    mkdir -p "$_Dst4/Daten/SonoGDT"
+    chmod 555 "$_Dst4"
+    _Out="$(bash "$_Root/pull.sh" --jobs 4 "$D_Url/Daten/SonoGDT" "$_Dst4/Daten" 2>&1)"
+    _Rc=$?
+    chmod 755 "$_Dst4"
+    t_assert_rc 0 "$_Rc" "nur-lesbarer Vorfahre, beschreibbares Ziel: Lauf endet mit rc 0"
+    t_assert_contains "$_Out" "ERGEBNIS: PASS" "und meldet PASS"
+    t_assert_contains "$_Out" "parallele Phase:" "die parallele Phase laeuft wirklich - der Vorfahre ist nicht ihr Schreibziel"
+    e_assert_absent "$_Out" "EINSTROEMIG" "kein Rueckfall auf einen Strom wegen eines Vorfahren, in den niemand schreibt"
+    t_assert_eq "31" "$(find "$_Dst4/Daten/SonoGDT" -type f | wc -l | tr -d ' ')" "alle 31 Dateien im Unterbaum angekommen"
+
+    # Dieselbe Aufrufform mit --no-verify: vorher war das ein ABBRUCH im
+    # Preflight, nicht bloss eine Warnung. Ein Lauf, der parallel geht, darf
+    # daran nicht sterben.
+    mkdir -p "$_Dst5/Daten/SonoGDT"
+    chmod 555 "$_Dst5"
+    _Out="$(bash "$_Root/pull.sh" --no-verify --jobs 4 "$D_Url/Daten/SonoGDT" "$_Dst5/Daten" 2>&1)"
+    _Rc=$?
+    chmod 755 "$_Dst5"
+    t_assert_rc 0 "$_Rc" "dieselbe Form mit --no-verify laeuft durch (vorher: Abbruch im Preflight)"
+    t_assert_contains "$_Out" "parallele Phase:" "--no-verify: die parallele Phase laeuft"
+    t_assert_eq "31" "$(find "$_Dst5/Daten/SonoGDT" -type f | wc -l | tr -d ' ')" "--no-verify: alle 31 Dateien angekommen"
+
+    # Gegenprobe, damit die gelockerte Pruefung nicht einfach alles durchlaesst:
+    # ist das ZIEL SELBST nicht beschreibbar, muss der Rueckfall weiterhin
+    # kommen - dort schreiben die Worker wirklich hinein.
+    mkdir -p "$_Dst4/nurlesen/Daten/SonoGDT"
+    chmod 555 "$_Dst4/nurlesen/Daten/SonoGDT"
+    _Out="$(bash "$_Root/pull.sh" --jobs 4 "$D_Url/Daten/SonoGDT" "$_Dst4/nurlesen/Daten" 2>&1)"
+    chmod 755 "$_Dst4/nurlesen/Daten/SonoGDT"
+    t_assert_contains "$_Out" "EINSTROEMIG" "nicht beschreibbares ZIEL: der Rueckfall kommt weiterhin - und wird angesagt"
+fi
 
 t_summary

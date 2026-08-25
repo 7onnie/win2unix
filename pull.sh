@@ -13,7 +13,17 @@ W2U_VERSION="0.1.0"
 
 # ---------- Konfiguration (Zero-Touch: alles hier, keine Rueckfragen) ----------
 _JobCnt=0              # 0 = Auto-Messung (Spec 5.4)
-_PMax=8                # hoechste Parallelitaet, die die Messung probiert
+_PMax=8                # hoechste Parallelitaet, die die Messung probiert - und
+                       # der Massstab fuer Zerlegungsschwelle und Chunkgroesse
+                       # (Spec 5.3). "--jobs N" hebt diesen Wert an, wenn N
+                       # groesser ist; siehe w2u_parse_args.
+_JobsMax=64            # Obergrenze fuer --jobs. Ohne sie waere "--jobs 10000"
+                       # gueltig und startete 10000 rsync-Prozesse gegen EINE
+                       # alte Windows-Kiste - das ist kein Tuning mehr, das ist
+                       # ein Tippfehler mit Folgen. 64 liegt weit oberhalb
+                       # jedes gemessenen Optimums (die Messung eskaliert bis 8)
+                       # und weit unterhalb dessen, was eine Quelle mit
+                       # drehender Platte noch bedienen kann.
 _MaxRetry=3
 _RetryPause=5          # Sekunden, waechst linear mit dem Versuch
 _RsyncTimeout=300      # Sekunden ohne I/O, ab da bricht rsync selbst ab statt zu
@@ -1784,6 +1794,23 @@ w2u_parse_args() {
     case "$_JobCnt" in
         ''|*[!0-9]*) w2u_die "--jobs braucht eine Zahl, bekam: $_JobCnt" ;;
     esac
+    if [ "$_JobCnt" -gt "$_JobsMax" ]; then
+        w2u_die "--jobs $_JobCnt ist zu viel (Obergrenze $_JobsMax): es wuerden $_JobCnt rsync-Prozesse gleichzeitig auf EINE alte Windows-Kiste losgehen. Die Auto-Messung eskaliert bis 8; alles darueber ist Handarbeit, und ab hier ist es ein Tippfehler."
+    fi
+    # Spec 5.3: SCHWELLE = 4 * P_max, und P_max ist "Vorgabe 8 ODER der Wert aus
+    # --jobs". Genau diese zweite Haelfte fehlte (Fund im Abschluss-Review):
+    # _JobCnt setzte nur die Zahl der Worker, waehrend Zerlegungsschwelle und
+    # Chunkgroesse weiter mit 8 rechneten. Nachgerechnet an der gemessenen
+    # Datenlage (Fall A, 308 Arbeitspakete) ergab "--jobs 32" damit 31 Chunks -
+    # WENIGER Chunks als Worker, also mindestens ein Worker ohne Arbeit und kein
+    # Work-Stealing mehr. Genau das, was die Formel aus Spec 5.5 verhindern
+    # soll. Mit angehobenem _PMax sind es 103 Chunks auf 32 Worker.
+    # Nur ANHEBEN, nie senken: "--jobs 2" darf die Zerlegung nicht groeber
+    # machen als die Vorgabe - grobe Chunks sind der Weg zurueck zum Fall
+    # "4 Chunks fuer 8 Worker", von dem w2u_chunk handelt.
+    if [ "$_JobCnt" -gt "$_PMax" ]; then
+        _PMax="$_JobCnt"
+    fi
     case "$_SrcUrl" in
         rsync://*) : ;;
         *) w2u_die "Quelle muss mit rsync:// beginnen, bekam: $_SrcUrl" ;;
@@ -2149,17 +2176,33 @@ w2u_preflight() {
     # Verzeichnisse anlegt, ist kein Trockenlauf.
     if [ "$_VerifyOnly" -eq 0 ] && [ "$_DryRun" -eq 0 ]; then
         mkdir -p "$_DstRoot"
-        # _ParDst ist per Konstruktion ein VORFAHRE von _DstRoot - bei der
-        # Schraegstrich-Form kann das ein Verzeichnis sein, das der Anwender nie
-        # genannt hat und das die Pruefung oben nie gesehen hat. Dorthin
-        # schreiben die Worker. Was nicht beschreibbar ist, wird nicht
-        # stillschweigend versucht: dann laeuft der Transfer einstroemig, und
-        # der Anwender erfaehrt es.
+        # Geprueft wird, wo die Worker WIRKLICH schreiben - und das ist
+        # $_DstRoot, nicht $_ParDst.
+        #
+        # Fund im Abschluss-Review: hier stand die Pruefung auf $_ParDst, also
+        # auf einem VORFAHREN von $_DstRoot. Die Dateien landen aber unter
+        # "_ParDst/<praefix>", und das IST _DstRoot - eben von "mkdir -p"
+        # angelegt oder schon vorhanden. Schreibrecht auf den Vorfahren braucht
+        # dafuer niemand: existiert die Praefix-Kette, traegt _DstRoot allein.
+        # Der Preis der zu strengen Pruefung war kein Schoenheitsfehler: mit
+        # --no-verify STIRBT w2u_einstroemig (keine bindende Beweisschicht),
+        # ein Lauf, der parallel funktioniert haette, wurde also im Preflight
+        # abgelehnt.
+        #
+        # Der Fall, in dem der Vorfahre wirklich zaehlt - eine noch FEHLENDE
+        # Praefix-Ebene unter einem nicht beschreibbaren Vorfahren - kommt hier
+        # nie an: dann waere schon das "mkdir -p" oben gescheitert und der Lauf
+        # unter dem errexit aus main() dort beendet. Uebrig bleibt genau die
+        # Frage, die zaehlt: darf in _DstRoot geschrieben werden?
+        # ANNAHME: die Praefix-Verzeichnisse zwischen _ParDst und _DstRoot sind
+        # durchquerbar (x-Recht). WAS SIE BRICHT: ein Vorfahre ohne x-Recht -
+        # dann kommt aber auch das "mkdir -p" und der Sweep nicht durch, das
+        # faellt also laut und nicht still aus.
         if [ "$_ParMode" = "parallel" ]; then
-            if [ ! -d "$_ParDst" ] || [ ! -w "$_ParDst" ]; then
+            if [ ! -d "$_DstRoot" ] || [ ! -w "$_DstRoot" ]; then
                 w2u_einstroemig \
-                    "das Ziel der parallelen Phase '$_ParDst' (der Teil von '$_DstRoot' oberhalb von '$_SrcPrefix') ist nicht beschreibbar" \
-                    "Der Zielpfad selbst stimmt bereits - es fehlen die Rechte: entweder '$_ParDst' beschreibbar machen, oder ein Ziel waehlen, dessen entsprechender Vorfahre beschreibbar ist."
+                    "das Zielverzeichnis '$_DstRoot', in das die Worker schreiben, ist nicht beschreibbar" \
+                    "Der Zielpfad selbst stimmt bereits - es fehlen die Rechte: '$_DstRoot' beschreibbar machen."
             fi
         fi
     fi
