@@ -869,6 +869,9 @@ w2u_verify() {
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     _Raw="$("$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" "$_DstRoot/" 2>&1)" || _Rc=$?
     _Out="$(printf '%s\n' "$_Raw" | grep -Ev '^\.d\.\.t[.]* \./$' || true)"
+    # Die Meldung auf STDOUT ist Verdrahtung, nicht Kosmetik: main() entscheidet
+    # im Normalpfad an "[ -s verify.log ]", also an der AUSGABE, nicht am rc.
+    # Wer sie zu "return 1 genuegt" aufraeumt, haengt die rc-Pruefung still ab.
     if [ "$_Rc" -ne 0 ]; then
         printf 'VERIFY NICHT MOEGLICH: der Vergleichslauf endete mit rc %s - eine leere Ausgabe ist hier KEIN Beweis fuer Gleichheit\n' "$_Rc"
         if [ -n "$_Out" ]; then
@@ -922,7 +925,9 @@ w2u_count_remote() {
 # ($_DstRoot/.win2unix-logs, siehe main()), und mitgezaehlt waere die lokale
 # Zahl in JEDEM produktiven Lauf groesser als die entfernte - ein garantiertes
 # falsches FAIL. Bei leerem $_LogDir passt "-path ''" auf nichts, der Ausdruck
-# bleibt also auch ohne Logverzeichnis korrekt.
+# bleibt also auch ohne Logverzeichnis korrekt. Der abgeschnittene Schraegstrich
+# ist kein Schoenheitsfehler: "--log-dir /pfad/" kommt vom Nutzer, und mit
+# Schraegstrich passte "-path" nicht mehr - die Logs waeren wieder in der Zahl.
 w2u_count_local() {
     local _List _Rc=0 _Cnt=""
     if [ ! -d "$_DstRoot" ]; then
@@ -934,7 +939,7 @@ w2u_count_local() {
         printf '%s\n' ""
         return 0
     fi
-    find "$_DstRoot" -path "$_LogDir" -prune -o -type f -print > "$_List" 2>/dev/null || _Rc=$?
+    find "$_DstRoot" -path "${_LogDir%/}" -prune -o -type f -print > "$_List" 2>/dev/null || _Rc=$?
     if [ "$_Rc" -eq 0 ]; then
         _Cnt="$(awk 'END { print NR + 0 }' "$_List")" || _Cnt=""
     fi

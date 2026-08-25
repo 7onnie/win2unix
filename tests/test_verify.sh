@@ -108,6 +108,11 @@ t_assert_eq "3" "$(w2u_count_local)" "Logverzeichnis unter dem Ziel wird NICHT m
 _SaveLogDir="$_LogDir"
 _LogDir=""
 t_assert_eq "4" "$(w2u_count_local)" "Gegenprobe: ohne Ausschluss waere die Logdatei mitgezaehlt worden (der Ausschluss tut also etwas)"
+# "--log-dir /pfad/" kommt vom Nutzer: mit abschliessendem Schraegstrich passte
+# "-path" nicht mehr, und die Logs waeren wieder in der Zahl - ein falsches FAIL
+# in jedem Lauf, der die Option so schreibt.
+_LogDir="$_SaveLogDir/"
+t_assert_eq "3" "$(w2u_count_local)" "Logverzeichnis mit abschliessendem Schraegstrich wird ebenso ausgeschlossen"
 _LogDir="$_SaveLogDir"
 
 # Eine Zahl, die nicht ermittelt werden konnte, ist LEER - nicht 0. Eine 0 waere
@@ -157,6 +162,18 @@ _Out="$(w2u_report 2>&1)"; _Rc=$?
 t_assert_rc 1 "$_Rc" "RULING 1: weniger Ergebniszeilen als Chunks MUSS FAIL liefern"
 t_assert_contains "$_Out" "OHNE ERGEBNISZEILE" "der Bericht sagt im Klartext, dass Ergebnisse fehlen"
 t_assert_contains "$_Out" "chunk.ab" "der Bericht nennt den Chunk, dessen Ergebnis fehlt"
+
+# Der Fall, in dem am meisten fehlt: die Ergebnisdatei EXISTIERT, ist aber leer
+# (xargs starb am ersten Chunk, der Worker-Pool kam nie hoch). Genau hier bricht
+# das uebliche awk-Idiom "NR == FNR" - es hielte dann jede Zeile der Chunkliste
+# fuer eine Ergebniszeile und meldete NICHTS als fehlend. Ohne diesen Assert
+# bliebe diese Mutation gruen, weil jeder andere Abgleichstest eine nichtleere
+# Ergebnisdatei benutzt.
+: > "$_ResultFile"
+_Out="$(w2u_report 2>&1)"; _Rc=$?
+t_assert_rc 1 "$_Rc" "LEERE Ergebnisdatei bei 2 Chunks -> FAIL (kein einziger Chunk wurde protokolliert)"
+t_assert_contains "$_Out" "chunk.aa" "beide Chunks werden als fehlend genannt"
+t_assert_contains "$_Out" "chunk.ab" "auch der zweite"
 
 # Zaehlen allein genuegt nicht: zwei Zeilen fuer chunk.aa und keine fuer
 # chunk.ab ergeben dieselbe Zeilenzahl wie ein sauberer Lauf. Eine Summe kann
