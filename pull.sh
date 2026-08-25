@@ -45,6 +45,12 @@ _DstDir=""
 _DstRoot=""
 _TmpDir=""
 _ResultFile=""
+_ChunkListFile=""     # von w2u_chunk gesetzt; der Abschlussbericht gleicht die
+                      # Ergebniszeilen gegen GENAU diese Liste ab. Leer heisst
+                      # "es wurde nie zerlegt" (Verify-Only) - und NICHT
+                      # "null Chunks erwartet": mit Ergebniszeilen aber ohne
+                      # Liste meldet w2u_report FAIL, weil dann unbekannt ist,
+                      # wieviele es haetten sein muessen.
 _StartTs=0
 
 w2u_log()  { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
@@ -308,6 +314,16 @@ w2u_chunk() {
     split -a 4 -l "$_Size" "$_WorkFile" "$_ChunkDir/chunk." || _Rc=$?
     [ "$_Rc" -eq 0 ] || w2u_die "split fehlgeschlagen (rc $_Rc) - Chunks waeren unvollstaendig"
     ls "$_ChunkDir"/chunk.* > "$_ListOut"
+    # Registrierung an der ENTSTEHUNGSSTELLE, nicht beim Aufrufer: der
+    # Abschlussbericht (Task 8) gleicht die Ergebniszeilen gegen genau diese
+    # Liste ab, und ein Aufrufer, der die Zuweisung vergisst, haette einen
+    # Bericht ohne Vergleichsmassstab. ANNAHME: es gibt hoechstens eine gueltige
+    # Chunkliste je Lauf (ein spaeterer w2u_chunk-Aufruf ueberschreibt die
+    # Registrierung, so wie er die Chunks selbst neu erzeugt). WAS SIE BRICHT:
+    # zwei parallele Zerlegungen in einem Prozess - gaebe es die, muesste der
+    # Bericht mehrere Listen kennen. Wird diese Zeile entfernt, meldet
+    # w2u_report FAIL ("Ergebniszeilen ohne bekannte Chunkliste"), nie PASS.
+    _ChunkListFile="$_ListOut"
     w2u_log "$_Total Arbeitspakete, $_Size je Chunk, $(grep -c . "$_ListOut") Chunks"
 }
 
@@ -787,6 +803,430 @@ w2u_run_all() {
         w2u_run_list "$_TmpDir/chunks.rest" "$_Jobs"
     fi
     _JobCnt="$_Jobs"
+}
+
+# ---------------------------------------------------------------------------
+# Sweep, Verifikation, Abschlussbericht (Spec 5.6/5.7/9.5).
+#
+# Alles davor bewegt Daten, dieser Abschnitt stellt fest, OB sie angekommen
+# sind. Sein Ergebnis ist ein einzelnes PASS/FAIL, und auf ein PASS folgt das
+# Verschrotten der Windows-Quelle - es gibt kein zweites Hinsehen. Daraus
+# folgt die Regel, der hier jede Einzelentscheidung gehorcht: was nicht
+# geprueft werden KONNTE, wird als Fehler gemeldet, niemals als "in Ordnung".
+# Ein falsches FAIL kostet einen Nachmittag, ein falsches PASS die Daten.
+#
+# Drei Schichten, jede faengt, was die anderen nicht sehen:
+#   Sweep    - repariert Verzeichnis-mtimes und holt, was die Zerlegung ausliess
+#   Verify   - beweist die Gleichheit von Quelle und Ziel
+#   Bericht  - wertet die Exit-Codes aus, die einzige Spur der Chunks, die
+#              fehlschlugen waehrend der Lauf weiterlief
+# ---------------------------------------------------------------------------
+
+# Einzelner vollstaendiger, NICHT paralleler Lauf ueber den Baum (Spec 5.6).
+# Die Daten liegen schon, das ist im Wesentlichen ein Metadaten-Durchlauf.
+# Gemessen an genau dem Baum, den tests/test_verify.sh aufbaut: vor dem Sweep
+# meldet der Verify die zwei Luecken, die eine Zerlegung nach Verzeichnissen
+# strukturell hinterlaesst - eine Datei DIREKT in einem aufgeteilten
+# Verzeichnis und ein leeres Verzeichnis - plus die mtime der Wurzel; danach
+# ist seine Ausgabe leer.
+#
+# --exclude-from MUSS mit: ohne die Ausschluesse holte ausgerechnet der Sweep
+# alles wieder her, was die Chunks bewusst ausgelassen haben.
+# --timeout aus demselben Grund wie in w2u_run_chunk: ohne Timeout wird aus
+# einem haengenden Daemon ein Haenger statt eines Abbruchs.
+# Der rc ist der des rsync; der Aufrufer entscheidet, was er damit tut (main
+# warnt und laesst den Verify urteilen - der Sweep ist Reparatur, nicht Beweis).
+w2u_sweep() {
+    local _Args
+    _Args=( -rlt -W --partial --numeric-ids "--timeout=$_RsyncTimeout" )
+    [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
+    "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" "$_DstRoot/"
+}
+
+# Struktur-Verify (Spec 5.7): ein Trockenlauf, dessen Erwartung LEERE Ausgabe
+# ist. Jede Zeile ist ein Befund, rc 1 heisst "nicht sauber".
+#
+# Gefiltert wird AUSSCHLIESSLICH die mtime der Wurzel selbst ("./"): sie ist
+# systematisch (das Ziel ist oft ein Mountpunkt, dessen mtime nicht gesetzt
+# werden kann) und harmlos. Wer pauschal alle .d-Zeilen wegwirft, wirft jeden
+# echten Verzeichnisbefund mit weg - genau diese Mutation pinnt der Test mit
+# einer verstellten mtime eines UNTERverzeichnisses. Die Punktzahl im
+# Itemize-String ist versionsabhaengig (nachgemessen: openrsync 9 Zeichen,
+# GNU rsync 3.5 11 Zeichen), deshalb der offene Quantor.
+#
+# Der rc des rsync darf NICHT verworfen werden - das ist hier die zentrale
+# Falle: stirbt der Vergleichslauf (Daemon weg, Timeout, Verbindungsabbruch),
+# ist seine Ausgabe womoeglich leer, und "keine Ausgabe" saehe dann aus wie
+# "alles gleich". Ein nicht durchgefuehrter Vergleich ist ein Befund, kein
+# Freispruch. Preis dieser Strenge: rc 24 (Quelldateien sind waehrend des Laufs
+# verschwunden) erzeugt auf einer lebenden Windows-Kiste ein FAIL, obwohl nichts
+# fehlt. Das ist die gewollte Seite der Asymmetrie - ein Nachmittag Nachsehen
+# statt vernichteter Daten.
+w2u_verify() {
+    local _Args _Out _Raw _Rc=0
+    _Args=( -rlt -W -n -i "--timeout=$_RsyncTimeout" )
+    [ "$_DoChecksum" = "1" ] && _Args=( "${_Args[@]}" -c )
+    [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
+    _Raw="$("$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" "$_DstRoot/" 2>&1)" || _Rc=$?
+    _Out="$(printf '%s\n' "$_Raw" | grep -Ev '^\.d\.\.t[.]* \./$' || true)"
+    if [ "$_Rc" -ne 0 ]; then
+        printf 'VERIFY NICHT MOEGLICH: der Vergleichslauf endete mit rc %s - eine leere Ausgabe ist hier KEIN Beweis fuer Gleichheit\n' "$_Rc"
+        if [ -n "$_Out" ]; then
+            printf '%s\n' "$_Out"
+        fi
+        return 1
+    fi
+    if [ -n "$_Out" ]; then
+        printf '%s\n' "$_Out"
+        return 1
+    fi
+    return 0
+}
+
+# Anzahl regulaerer Dateien in der Quelle, oder eine LEERE Ausgabe, wenn sie
+# sich nicht ermitteln laesst (gleiches Muster wie w2u_dst_kb): eine 0 waere
+# eine Zahl, mit der der Bericht weiterrechnete, und aus einem gescheiterten
+# Listing wuerde ein Messwert - im schlimmsten Fall "remote 0 / lokal 0, passt".
+#
+# Das Listing geht in eine Datei statt durch eine Pipe, damit der rc des rsync
+# unverfaelscht ankommt: in "rsync | zaehler" haengt der sichtbare rc von
+# pipefail ab, und diese Funktion darf sich nicht darauf verlassen, in welcher
+# Shell-Konfiguration ihr Aufrufer laeuft. Die Datei statt einer Variablen,
+# weil das Listing eines Zielbaums leicht hunderttausende Zeilen hat.
+# Die Ausschluesse gelten mit, damit die genannte Zahl zur wirklich erwarteten
+# Menge passt; verglichen wird bei aktiven Ausschluessen trotzdem nicht (die
+# Filtersemantik von --list-only ist kein Beweis, siehe w2u_report).
+w2u_count_remote() {
+    local _List _Args _Rc=0 _Cnt=""
+    _List="$(mktemp "${TMPDIR:-/tmp}/w2u.remotelist.XXXXXXXX" 2>/dev/null)" || _List=""
+    if [ -z "$_List" ]; then
+        printf '%s\n' ""
+        return 0
+    fi
+    _Args=( -r --list-only "--timeout=$_RsyncTimeout" )
+    [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
+    "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" > "$_List" 2>/dev/null || _Rc=$?
+    if [ "$_Rc" -eq 0 ]; then
+        _Cnt="$(awk '/^-/ { _N++ } END { print _N + 0 }' "$_List")" || _Cnt=""
+    fi
+    rm -f "$_List"
+    printf '%s\n' "$_Cnt"
+    return 0
+}
+
+# Gegenstueck am Ziel. Leer heisst auch hier "nicht ermittelbar" - ein find,
+# das ueber ein unlesbares Verzeichnis stolpert, liefert rc 1 UND eine zu
+# kleine Zahl; die duerfte nie als Messwert durchgehen.
+#
+# $_LogDir wird ausgeschlossen: es liegt per Vorgabe UNTER dem Ziel
+# ($_DstRoot/.win2unix-logs, siehe main()), und mitgezaehlt waere die lokale
+# Zahl in JEDEM produktiven Lauf groesser als die entfernte - ein garantiertes
+# falsches FAIL. Bei leerem $_LogDir passt "-path ''" auf nichts, der Ausdruck
+# bleibt also auch ohne Logverzeichnis korrekt.
+w2u_count_local() {
+    local _List _Rc=0 _Cnt=""
+    if [ ! -d "$_DstRoot" ]; then
+        printf '%s\n' ""
+        return 0
+    fi
+    _List="$(mktemp "${TMPDIR:-/tmp}/w2u.locallist.XXXXXXXX" 2>/dev/null)" || _List=""
+    if [ -z "$_List" ]; then
+        printf '%s\n' ""
+        return 0
+    fi
+    find "$_DstRoot" -path "$_LogDir" -prune -o -type f -print > "$_List" 2>/dev/null || _Rc=$?
+    if [ "$_Rc" -eq 0 ]; then
+        _Cnt="$(awk 'END { print NR + 0 }' "$_List")" || _Cnt=""
+    fi
+    rm -f "$_List"
+    printf '%s\n' "$_Cnt"
+    return 0
+}
+
+# Abschlussbericht. Das PASS/FAIL-Kriterium ist explizit, weil daran haengt, ob
+# die Quelle verschrottet werden darf.
+#
+# CONTROLLER-RULING 1: die Ergebniszeilen werden gegen die CHUNKLISTE
+# abgeglichen, nicht nur untereinander ausgewertet. w2u_run_chunk gibt bewusst
+# IMMER 0 zurueck, damit ein kaputter Chunk keinen Terabyte-Transfer abbricht -
+# die Ergebnisdatei ist damit die einzige Stelle, an der ein Fehlschlag je
+# sichtbar wird. Wer nur die Zeilen auswertet, DIE DA SIND, kann einen Chunk
+# ohne Ergebniszeile nicht von einem unterscheiden, der nie gelaufen ist:
+# abgestuerzter Worker, voller Datentraeger, abgebrochener xargs-Lauf - und
+# eine halb geschriebene Ergebnisdatei liest sich als "nichts fehlgeschlagen".
+#
+# Verglichen werden NAMEN, nicht Zeilenzahlen. Eine Summe kann Verlust und
+# Duplikat nicht auseinanderhalten (dieselbe Lehre wie in w2u_autotune): zwei
+# Zeilen fuer chunk.aa und keine fuer chunk.ab ergeben exakt die Zeilenzahl
+# eines sauberen Laufs.
+#
+# CONTROLLER-RULING 2: $_TmpDir/chunks.rest wird hier NICHT gelesen - weder als
+# Quelle der Chunkzahl noch sonst. Die Datei entsteht nur im Auto-Messungs-Pfad
+# von w2u_run_all, im "--jobs N"-Pfad nie, und niemand entfernt eine alte aus
+# einem frueheren Lauf im selben Arbeitsverzeichnis; sie waere im schlimmsten
+# Fall die Chunkliste eines anderen Quellverzeichnisses. Der vollstaendige
+# Massstab ist ohnehin $_ChunkListFile: Probe-Runden und Restliste ueberdecken
+# diese Liste zu jedem Zeitpunkt exakt.
+#
+# Alle Zahlen werden ERST ermittelt und dann gedruckt, und jede Pruefung steht
+# in einem vollstaendigen if-Block: unter dem "set -euo pipefail" aus main()
+# risse ein Einzelkommando mit rc 1 (etwa ein "[ ... ] && ..." als Anweisung)
+# den Bericht ab, bevor sein Ergebnis auf dem Bildschirm steht - und ein Lauf
+# ohne gedrucktes Ergebnis ist genau der, den niemand bemerkt.
+w2u_report() {
+    local _Fail=0
+    local _Lines=0 _Bad=0 _Retried=0 _Malformed=0 _Stats=""
+    local _Chunks=0 _MissCnt=0 _DupCnt=0 _UnkCnt=0
+    local _Missing="" _Dupes="" _Unknown="" _Recon=""
+    local _ResultState="ok" _ListState="ok"
+    local _Dur=-1 _Now _Remote="" _Local="" _Rc=0 _Detail=0
+
+    # ---- Ergebnisdatei: existiert / lesbar / auswertbar? --------------------
+    # "existiert nicht" und "ist leer" duerfen nicht zusammenfallen (gleiche
+    # Trennung wie in w2u_run_list): leer ist eine Aussage, fehlend ist ein
+    # Defekt.
+    if [ -z "$_ResultFile" ]; then
+        _ResultState="ist nicht gesetzt"
+    elif [ ! -e "$_ResultFile" ]; then
+        _ResultState="fehlt"
+    elif [ ! -r "$_ResultFile" ]; then
+        _ResultState="ist nicht lesbar"
+    else
+        _Rc=0
+        _Stats="$(awk -F'\t' '
+            length($0) == 0 { next }
+            { _L++ }
+            (NF != 3 || $1 == "" || $2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/) { _M++; next }
+            $2 != "0" { _B++ }
+            $3 + 0 > 1 { _R++ }
+            END { printf "%d %d %d %d\n", _L + 0, _M + 0, _B + 0, _R + 0 }
+        ' "$_ResultFile")" || _Rc=$?
+        if [ "$_Rc" -ne 0 ]; then
+            _ResultState="ist nicht auswertbar"
+        else
+            case "$_Stats" in
+                [0-9]*' '[0-9]*' '[0-9]*' '[0-9]*)
+                    set -- $_Stats
+                    _Lines="$1"; _Malformed="$2"; _Bad="$3"; _Retried="$4"
+                    ;;
+                *)
+                    _ResultState="ist nicht auswertbar"
+                    ;;
+            esac
+        fi
+    fi
+    if [ "$_ResultState" != "ok" ]; then
+        _Fail=1
+    fi
+
+    # ---- Chunkliste: der Massstab fuer die Vollstaendigkeit ----------------
+    if [ -z "$_ChunkListFile" ]; then
+        _ListState="unbekannt"
+    elif [ ! -e "$_ChunkListFile" ]; then
+        _ListState="fehlt"
+    elif [ ! -r "$_ChunkListFile" ]; then
+        _ListState="ist nicht lesbar"
+    else
+        _Rc=0
+        _Chunks="$(awk 'length($0) > 0 { _N++ } END { print _N + 0 }' "$_ChunkListFile")" || _Rc=$?
+        case "$_Chunks" in
+            ''|*[!0-9]*) _Rc=1 ;;
+        esac
+        if [ "$_Rc" -ne 0 ]; then
+            _ListState="ist nicht auswertbar"
+            _Chunks=0
+        elif [ "$_Chunks" -eq 0 ]; then
+            # Gesetzt, aber leer: w2u_chunk bricht bei null Arbeitspaketen ab,
+            # eine leere registrierte Liste kann es also gar nicht geben. Sie
+            # als "null erwartete Chunks" durchzuwinken hiesse, einen Lauf ohne
+            # jede Uebertragung als vollstaendig zu melden.
+            _ListState="ist leer"
+        fi
+    fi
+
+    # ---- Abgleich Chunkliste <-> Ergebniszeilen (Ruling 1) -----------------
+    # Ein Durchlauf ueber beide Dateien. Unterschieden wird ueber FILENAME und
+    # nicht ueber das uebliche "NR == FNR": diese Abkuerzung bricht genau dann,
+    # wenn die Ergebnisdatei LEER ist - also im Fall, in dem am meisten fehlt.
+    if [ "$_ListState" = "ok" ] && [ "$_ResultState" = "ok" ]; then
+        _Rc=0
+        _Recon="$(awk -F'\t' -v _DoneFile="$_ResultFile" '
+            FILENAME == _DoneFile {
+                if (length($0) > 0 && $1 != "") { _Cnt[$1]++ }
+                next
+            }
+            {
+                _N = $0
+                sub(/^.*\//, "", _N)
+                if (_N != "") { _Want[_N] = 1 }
+            }
+            END {
+                for (_K in _Want) {
+                    if (!(_K in _Cnt)) { printf "M\t%s\n", _K }
+                }
+                for (_K in _Cnt) {
+                    if (!(_K in _Want)) { printf "U\t%s\n", _K }
+                    if (_Cnt[_K] > 1)   { printf "D\t%s (%dx)\n", _K, _Cnt[_K] }
+                }
+            }
+        ' "$_ResultFile" "$_ChunkListFile")" || _Rc=$?
+        if [ "$_Rc" -ne 0 ]; then
+            _ListState="ist nicht auswertbar"
+        else
+            _MissCnt="$(printf '%s\n' "$_Recon" | awk -F'\t' '$1 == "M" { _N++ } END { print _N + 0 }')"
+            _UnkCnt="$(printf '%s\n' "$_Recon" | awk -F'\t' '$1 == "U" { _N++ } END { print _N + 0 }')"
+            _DupCnt="$(printf '%s\n' "$_Recon" | awk -F'\t' '$1 == "D" { _N++ } END { print _N + 0 }')"
+            # Nur die ersten 20 je Klasse, und die Begrenzung per Zaehler in awk
+            # statt per "| head": head schliesst die Pipe und kann den Schreiber
+            # per SIGPIPE (rc 141) toeten - unter pipefail waere das ein
+            # Fehlschlag der Zuweisung und unter errexit das Ende des Berichts.
+            _Missing="$(printf '%s\n' "$_Recon" | awk -F'\t' '$1 == "M" && _N < 20 { printf "   %s\n", $2; _N++ }')"
+            _Unknown="$(printf '%s\n' "$_Recon" | awk -F'\t' '$1 == "U" && _N < 20 { printf "   %s\n", $2; _N++ }')"
+            _Dupes="$(printf '%s\n' "$_Recon" | awk -F'\t' '$1 == "D" && _N < 20 { printf "   %s\n", $2; _N++ }')"
+        fi
+    fi
+    if [ "$_ListState" != "ok" ] && [ "$_ListState" != "unbekannt" ]; then
+        _Fail=1
+    fi
+    if [ "$_ListState" = "unbekannt" ] && [ "$_Lines" -gt 0 ]; then
+        # Ergebniszeilen ohne Massstab: wieviele es haetten sein muessen, ist
+        # nicht feststellbar - und nicht feststellbar ist kein PASS.
+        _Fail=1
+    fi
+    if [ "$_Malformed" -gt 0 ] || [ "$_Bad" -gt 0 ]; then
+        _Fail=1
+    fi
+    if [ "$_MissCnt" -gt 0 ] || [ "$_DupCnt" -gt 0 ] || [ "$_UnkCnt" -gt 0 ]; then
+        _Fail=1
+    fi
+
+    # ---- Laufzeit ----------------------------------------------------------
+    # Ohne gesetztes _StartTs kaeme hier die Sekunde seit 1970 heraus - eine
+    # Zahl mit Messwert-Anmutung. Lieber "unbekannt".
+    _Now="$(date +%s)"
+    case "$_StartTs" in
+        ''|*[!0-9]*)
+            _Dur=-1
+            ;;
+        *)
+            if [ "$_StartTs" -gt 0 ]; then
+                _Dur=$((_Now - _StartTs))
+            else
+                _Dur=-1
+            fi
+            ;;
+    esac
+
+    printf '\n'
+    printf '========================================================\n'
+    printf ' win2unix %s - Abschlussbericht\n' "$W2U_VERSION"
+    printf '========================================================\n'
+    printf ' Quelle          : %s\n' "$_SrcUrl"
+    printf ' Ziel            : %s\n' "$_DstRoot"
+    if [ "$_Dur" -ge 0 ]; then
+        printf ' Dauer           : %d s\n' "$_Dur"
+    else
+        printf ' Dauer           : unbekannt (Startzeit nicht gesetzt)\n'
+    fi
+    printf ' Parallelitaet   : %s\n' "$_JobCnt"
+
+    case "$_ListState" in
+        ok)
+            printf ' Chunks          : %s laut Liste, %s Ergebniszeile(n), %s mit Wiederholung, %s fehlgeschlagen\n' \
+                   "$_Chunks" "$_Lines" "$_Retried" "$_Bad"
+            ;;
+        unbekannt)
+            if [ "$_Lines" -gt 0 ]; then
+                printf ' Chunks          : %s Ergebniszeile(n), aber KEINE CHUNKLISTE bekannt - wieviele es haetten sein muessen, ist nicht feststellbar\n' "$_Lines"
+            else
+                printf ' Chunks          : keine (Lauf ohne Uebertragung, z.B. --verify-only)\n'
+            fi
+            ;;
+        *)
+            printf ' Chunks          : CHUNKLISTE %s (%s) - die Vollstaendigkeit ist damit NICHT pruefbar\n' \
+                   "$_ListState" "$_ChunkListFile"
+            ;;
+    esac
+
+    if [ "$_ResultState" != "ok" ]; then
+        _Detail=1
+        printf '\n ERGEBNISDATEI %s (%s)\n' "$_ResultState" "$_ResultFile"
+        printf '   Sie ist die einzige Stelle, an der ein fehlgeschlagener Chunk sichtbar wird.\n'
+    fi
+
+    # Die Filter der Detailblöcke sind IDENTISCH mit denen der Zaehlung oben -
+    # eine Liste, die mehr Zeilen zeigt als ihre eigene Zahl nennt, laesst an
+    # der ganzen Buchfuehrung zweifeln. Kaputte Zeilen erscheinen deshalb nur
+    # im FORMAT-Block, nicht zusaetzlich unter den Exit-Codes.
+    if [ "$_Malformed" -gt 0 ]; then
+        _Detail=1
+        printf '\n %s Ergebniszeile(n) mit ungueltigem FORMAT (erwartet: Name<TAB>rc<TAB>Versuche):\n' "$_Malformed"
+        awk -F'\t' '
+            length($0) == 0 { next }
+            (NF != 3 || $1 == "" || $2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/) && _N < 20 { printf "   %s\n", $0; _N++ }
+        ' "$_ResultFile" || printf '   (Liste konnte nicht gelesen werden)\n'
+        printf '   Nicht auswertbar heisst nicht sauber.\n'
+    fi
+
+    if [ "$_Bad" -gt 0 ]; then
+        _Detail=1
+        printf '\n FEHLGESCHLAGENE CHUNKS (Exit 23/24 = Dateien fehlen still!):\n'
+        awk -F'\t' '
+            length($0) == 0 { next }
+            (NF != 3 || $1 == "" || $2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/) { next }
+            $2 != "0" { printf "   %s  Exit %s\n", $1, $2 }
+        ' "$_ResultFile" || printf '   (Liste konnte nicht gelesen werden)\n'
+    fi
+
+    if [ "$_MissCnt" -gt 0 ]; then
+        _Detail=1
+        printf '\n %s CHUNK(S) OHNE ERGEBNISZEILE - nicht (vollstaendig) uebertragen:\n' "$_MissCnt"
+        printf '%s\n' "$_Missing"
+        if [ "$_MissCnt" -gt 20 ]; then
+            printf '   ... und %s weitere\n' "$((_MissCnt - 20))"
+        fi
+    fi
+
+    if [ "$_DupCnt" -gt 0 ]; then
+        _Detail=1
+        printf '\n %s CHUNK(S) DOPPELT im Ergebnisprotokoll - die Zeilenzahl allein taeuscht Vollstaendigkeit vor:\n' "$_DupCnt"
+        printf '%s\n' "$_Dupes"
+    fi
+
+    if [ "$_UnkCnt" -gt 0 ]; then
+        _Detail=1
+        printf '\n %s ERGEBNISZEILE(N) ZU UNBEKANNTEN CHUNKS - Protokoll und Chunkliste gehoeren nicht zusammen:\n' "$_UnkCnt"
+        printf '%s\n' "$_Unknown"
+    fi
+
+    if [ "$_Detail" -eq 1 ]; then
+        printf '\n'
+    fi
+    if [ "$_DoVerify" = "1" ]; then
+        _Remote="$(w2u_count_remote)"
+        _Local="$(w2u_count_local)"
+        printf ' Dateizahl       : remote %s / lokal %s\n' "${_Remote:-?}" "${_Local:-?}"
+        if [ -n "$_ExcludeFrom" ]; then
+            printf '   (Hinweis: Ausschluesse aktiv, Zahlen nur orientierend)\n'
+        elif [ -z "$_Remote" ] || [ -z "$_Local" ]; then
+            printf '   Dateizahl nicht ermittelbar - die Vollstaendigkeit ist damit NICHT bestaetigt\n'
+            _Fail=1
+        elif [ "$_Remote" != "$_Local" ]; then
+            printf '   ABWEICHUNG in der Dateizahl!\n'
+            _Fail=1
+        fi
+    else
+        printf ' Dateizahl       : Vergleich uebersprungen (--no-verify)\n'
+    fi
+
+    printf '\n'
+    if [ "$_Fail" -eq 0 ]; then
+        printf ' ERGEBNIS: PASS - Transfer vollstaendig.\n'
+    else
+        printf ' ERGEBNIS: FAIL - NICHT verschrotten, Logs pruefen: %s\n' "$_LogDir"
+    fi
+    printf '========================================================\n\n'
+    return "$_Fail"
 }
 
 main() {
