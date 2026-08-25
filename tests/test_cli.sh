@@ -31,7 +31,17 @@ t_assert_contains "$_Out" "Aufruf:" "Usage wird ausgegeben"
 # nicht aus einer nebenbei abweichenden Zahl.
 # ---------------------------------------------------------------------------
 _Tmp="$(mktemp -d "${TMPDIR:-/tmp}/w2u.cli.XXXXXXXX")"
-trap 'd_stop; rm -rf "$_Tmp"' EXIT
+trap 'd_stop; chmod -R u+w "$_Tmp" 2>/dev/null; rm -rf "$_Tmp"' EXIT
+# Alles, was die Laeufe SELBST anlegen (Arbeits- und Logverzeichnisse), landet
+# unter $_Tmp und wird damit vom Trap mitgeraeumt. Nicht Ordnungsliebe: seit dem
+# Abschluss-Review bleiben Logverzeichnisse auch nach einem PASS liegen (sie sind
+# der Nachweis), und diese Datei faehrt viele vollstaendige Laeufe - ohne die
+# Umleitung blieben sie im echten TMPDIR des Entwicklers zurueck. Die
+# feingranularen TMPDIR-Umleitungen einzelner Faelle weiter unten bleiben
+# bestehen: die zaehlen, was in IHREM Verzeichnis liegt, und brauchen es
+# deshalb leer.
+export TMPDIR="$_Tmp/tmpdir"
+mkdir -p "$TMPDIR"
 
 _Fake="$_Tmp/fake-rsync"
 cat > "$_Fake" <<'FAKE'
@@ -340,10 +350,14 @@ _Out="$(bash "$_Root/pull.sh" --rsync "$_Fake" --log-dir "$_Tmp/dst-logs/Archiv/
 t_assert_rc 1 "$_Rc" "--log-dir unterhalb des Zielverzeichnisses wird abgelehnt (Ruling 3)"
 
 # --- main(): Ergebnisdatei, Logverzeichnis, Aufraeumen ------------------------
-mkdir -p "$_Tmp/dst-a"
+# TMPDIR umgebogen: dieser Lauf endet mit PASS, und seit dem Abschluss-Review
+# BLEIBEN die Logs auch nach einem PASS liegen (sie sind der Nachweis, und auf
+# ein PASS folgt das Verschrotten der Quelle). Ohne die Umleitung liesse jeder
+# Suite-Lauf ein Logverzeichnis im echten TMPDIR zurueck.
+mkdir -p "$_Tmp/dst-a" "$_Tmp/tmp-a"
 _StateA="$_Tmp/state-a"
 : > "$_StateA"
-_Out="$(bash "$_Probe" "$_Root/pull.sh" "$_StateA" --jobs 2 --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp/dst-a" 2>&1)"; _Rc=$?
+_Out="$(TMPDIR="$_Tmp/tmp-a" bash "$_Probe" "$_Root/pull.sh" "$_StateA" --jobs 2 --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp/dst-a" 2>&1)"; _Rc=$?
 t_assert_rc 0 "$_Rc" "voller Lauf mit Attrappen endet mit rc 0"
 _PTmp="$(_pval "$_StateA" TMPDIR)"
 _PRes="$(_pval "$_StateA" RESULTFILE)"
@@ -363,8 +377,16 @@ t_assert_contains "$_PTraps" "SIGINT" "INT wird abgefangen"
 t_assert_contains "$_PTraps" "SIGTERM" "TERM wird abgefangen"
 [ -d "$_PTmp" ] && _Left=ja || _Left=nein
 t_assert_eq "nein" "$_Left" "Arbeitsverzeichnis ist nach dem Lauf entfernt"
+# Umgekehrte Zusage seit dem Abschluss-Review: das Logverzeichnis BLEIBT auch
+# nach einem erfolgreichen Lauf liegen. Vorher wurde es geloescht - samt
+# verify.log, sweep.log und allen Chunk-Logs -, und der Bericht ging ohnehin nur
+# aufs Terminal. Damit vernichtete das Werkzeug den Nachweis genau in dem Lauf,
+# in dem er zaehlt: PASS ist die Freigabe, die Quellmaschine zu verschrotten.
 [ -d "$_PLog" ] && _Left=ja || _Left=nein
-t_assert_eq "nein" "$_Left" "selbst angelegtes Logverzeichnis ist nach einem erfolgreichen Lauf entfernt"
+t_assert_eq "ja" "$_Left" "selbst angelegtes Logverzeichnis BLEIBT nach einem erfolgreichen Lauf liegen (es ist der Nachweis)"
+[ -f "$_PLog/report.txt" ] && _Left=ja || _Left=nein
+t_assert_eq "ja" "$_Left" "der Abschlussbericht liegt als Datei im Logverzeichnis"
+t_assert_contains "$_Out" "Logs und Bericht bleiben liegen" "und der Lauf sagt, wo"
 t_assert_eq "0" "$(find "$_Tmp/dst-a" -type f | wc -l | tr -d ' ')" "der Lauf legt KEINE Dateien (Logs) im Ziel ab"
 
 # --- Ruling 2: Befunde im Verify duerfen NIE zu PASS fuehren -------------------
@@ -372,11 +394,16 @@ t_assert_eq "0" "$(find "$_Tmp/dst-a" -type f | wc -l | tr -d ' ')" "der Lauf le
 # Vergleichslauf Befunde meldet. Alles andere (Chunk-Buchfuehrung, Dateizahl)
 # ist in beiden Laeufen deckungsgleich - wer den Verify-Ausgang aus dem Bericht
 # entfernt, bekommt zweimal PASS.
-mkdir -p "$_Tmp/dst-b/Archiv"
+mkdir -p "$_Tmp/dst-b/Archiv" "$_Tmp/tmp-b"
 printf 'inhalt\n' > "$_Tmp/dst-b/Archiv/datei.txt"
-_Out="$(W2U_PROBE_REPORT=real bash "$_Probe" "$_Root/pull.sh" "$_Tmp/state-b" --jobs 2 --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp/dst-b" 2>&1)"; _Rc=$?
+_Out="$(TMPDIR="$_Tmp/tmp-b" W2U_PROBE_REPORT=real bash "$_Probe" "$_Root/pull.sh" "$_Tmp/state-b" --jobs 2 --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp/dst-b" 2>&1)"; _Rc=$?
 t_assert_rc 0 "$_Rc" "voller Lauf ohne Befunde meldet PASS"
 t_assert_contains "$_Out" "ERGEBNIS: PASS" "Bericht meldet PASS, wenn wirklich nichts zu beanstanden ist"
+# Der ECHTE Bericht (nicht die Attrappe) muss auch als Datei im Logverzeichnis
+# stehen, mit demselben Ergebnis wie auf dem Terminal. Ein Nachweis, der nur im
+# Scrollback existiert, ist nach dem Verschrotten der Quelle keiner.
+_PLogB="$(_pval "$_Tmp/state-b" LOGDIR)"
+t_assert_contains "$(cat "$_PLogB/report.txt" 2>&1)" "ERGEBNIS: PASS" "report.txt enthaelt denselben Bericht, den das Terminal zeigt"
 
 # TMPDIR umgebogen: dieser Lauf endet absichtlich mit FAIL, und nach einem FAIL
 # bleiben die Logs liegen (so soll es sein). Ohne die Umleitung liesse jeder

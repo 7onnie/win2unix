@@ -33,6 +33,14 @@ if ! d_available; then
     t_summary
 fi
 
+# EIN Wurzelverzeichnis fuer alles, was dieser Test und die Laeufe darin
+# anlegen - und TMPDIR zeigt hinein. Das ist nicht Ordnungsliebe: seit dem
+# Abschluss-Review BLEIBEN die Logverzeichnisse auch nach einem PASS liegen (sie
+# sind der Nachweis der Vollstaendigkeit), und dieser Test faehrt sechs
+# vollstaendige Laeufe. Ohne die Umleitung liesse jeder Suite-Lauf sechs
+# Logverzeichnisse im echten TMPDIR des Entwicklers zurueck.
+_TmpRoot="$(mktemp -d)"
+export TMPDIR="$_TmpRoot"
 _Src="$(mktemp -d)"
 _Dst="$(mktemp -d)"
 _Dst2="$(mktemp -d)"
@@ -41,7 +49,7 @@ _Dst4="$(mktemp -d)"
 _Dst5="$(mktemp -d)"
 # "chmod -R u+w" vor dem Loeschen: zwei Faelle unten setzen einen Vorfahren
 # absichtlich auf nur-lesen, und ein "rm -rf" kaeme dort nicht durch.
-trap 'd_stop; chmod -R u+w "$_Dst4" "$_Dst5" 2>/dev/null; rm -rf "$_Src" "$_Dst" "$_Dst2" "$_Dst3" "$_Dst4" "$_Dst5"' EXIT
+trap 'd_stop; chmod -R u+w "$_TmpRoot" 2>/dev/null; rm -rf "$_TmpRoot"' EXIT
 
 # Prueft, dass eine Zeichenkette NICHT vorkommt. Bewusst hier und nicht in
 # testlib.sh: dieser Test braucht sie, die anderen zehn nicht, und eine
@@ -117,6 +125,26 @@ t_assert_eq "" "$(diff -r "$_Src/Daten" "$_Dst/Daten" 2>&1)" "Quelle und Ziel si
 t_assert_eq "ja" "$_L" "leeres Verzeichnis existiert am Ziel"
 t_assert_eq "direkt" "$(cat "$_Dst/Daten/SonoGDT/Bildarchiv/direkt.txt")" "direkte Datei im expandierten Ordner"
 t_assert_eq "umlaut" "$(cat "$_Dst/Daten/BRIEFE/Größe & Maß.DOC")" "Umlaut-Datei lesbar"
+
+# ---- Der Nachweis muss den Lauf ueberleben ---------------------------------
+# Vorher loeschte das Werkzeug sein eigenes Logverzeichnis nach einem PASS -
+# verify.log, sweep.log, alle Chunk-Logs -, und der Bericht ging ohnehin nur
+# aufs Terminal. Genau der Lauf mit PASS ist aber der, dessen Aufzeichnung
+# jemand hinterher sehen will: PASS ist die Freigabe, die Quelle zu
+# verschrotten, und danach gibt es kein zweites Hinsehen.
+_LogPath="$(printf '%s\n' "$_Out" | sed -n 's/^\[[0-9:]*\] Logs: //p' | tail -1)"
+[ -n "$_LogPath" ] && _L=ja || _L=nein
+t_assert_eq "ja" "$_L" "Testaufbau: der Lauf hat sein Logverzeichnis genannt"
+[ -d "$_LogPath" ] && _L=ja || _L=nein
+t_assert_eq "ja" "$_L" "das Logverzeichnis existiert nach einem PASS noch"
+t_assert_contains "$(cat "$_LogPath/report.txt" 2>&1)" "ERGEBNIS: PASS" "der Abschlussbericht liegt als report.txt darin"
+[ -f "$_LogPath/verify.log" ] && _L=ja || _L=nein
+t_assert_eq "ja" "$_L" "verify.log liegt darin"
+[ -f "$_LogPath/sweep.log" ] && _L=ja || _L=nein
+t_assert_eq "ja" "$_L" "sweep.log liegt darin"
+[ -n "$(ls "$_LogPath"/chunk.* 2>/dev/null)" ] && _L=ja || _L=nein
+t_assert_eq "ja" "$_L" "und die Logs der einzelnen Chunks"
+t_assert_contains "$_Out" "Logs und Bericht bleiben liegen" "der Lauf sagt am Ende, wo der Nachweis liegt"
 
 # ---- Lauf 2: Wiederaufnahme, diesmal mit fester Parallelitaet ---------------
 # Ein zweiter Lauf ueber einen vollstaendigen Zielbaum uebertraegt nichts mehr

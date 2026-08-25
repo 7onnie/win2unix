@@ -2230,14 +2230,56 @@ w2u_verify_step() {
     fi
 }
 
+# Druckt den Abschlussbericht UND legt ihn als Datei ins Logverzeichnis.
+#
+# Warum als Datei (Fund im Abschluss-Review): der Bericht ging bisher nur aufs
+# Terminal. Er ist aber das einzige Dokument, das die Vollstaendigkeit
+# bezeugt - und auf ein PASS folgt das Verschrotten der Quelle. Wer danach
+# nachsehen will, hat nur noch den Scrollback, und den hat er nicht.
+#
+# "| tee" und nicht "> datei; cat datei": der Bericht muss WAEHREND seines
+# Entstehens auf dem Terminal erscheinen. Bricht w2u_report mitten drin ab,
+# steht das Bisherige da - bei "erst Datei, dann cat" saehe der Anwender
+# NICHTS, und ein Lauf ohne gedruckten Bericht ist genau der, den niemand
+# bemerkt (siehe den Kopf von w2u_report).
+#
+# Unter dem "pipefail" aus main() traegt der rc der Pipeline auch einen
+# Fehlschlag des tee. Das ist gewollt: ein Bericht, der nicht festgehalten
+# werden konnte, ist kein PASS. Gedruckt wurde er trotzdem - tee schreibt nach
+# stdout weiter, auch wenn die Datei scheitert.
+w2u_report_step() {
+    local _Rc=0
+    if [ -n "$_LogDir" ] && [ -d "$_LogDir" ] && [ -w "$_LogDir" ]; then
+        w2u_report | tee "${_LogDir%/}/report.txt" || _Rc=$?
+    else
+        # Kein Logverzeichnis (oder nicht beschreibbar): drucken geht vor
+        # festhalten. Der Preflight hat die Beschreibbarkeit schon geprueft,
+        # dieser Zweig ist der Riegel fuer alles, was danach noch passiert.
+        w2u_report || _Rc=$?
+    fi
+    return "$_Rc"
+}
+
 # Aufraeumen am Ende JEDES Weges aus main() heraus - auch aus w2u_die, auch
 # nach einem Signal.
 #
 # Das Arbeitsverzeichnis geht immer, es enthaelt nur Zwischenstaende. Das
-# Logverzeichnis nur dann, wenn WIR es angelegt haben UND der Lauf sauber war:
-# nach einem FAIL sind die Logs die einzige Spur, warum, und der Bericht nennt
-# genau diesen Pfad. Ein per --log-dir angegebenes Verzeichnis wird nie
-# geloescht - es koennte auf alles Moegliche zeigen.
+# Logverzeichnis wird geloescht, wenn WIR es angelegt haben UND es LEER ist -
+# und sonst nie. Ein per --log-dir angegebenes wird ohnehin nie angefasst, es
+# koennte auf alles Moegliche zeigen.
+#
+# Fund im Abschluss-Review: hier wurde das eigene Logverzeichnis auch nach
+# einem ERFOLGREICHEN Lauf geloescht, samt verify.log, sweep.log und allen
+# Chunk-Logs, und der Bericht ging ohnehin nur auf das Terminal. Damit
+# vernichtete das Werkzeug die Beweise genau in dem Lauf, in dem sie zaehlen:
+# PASS ist die Freigabe, die Quellmaschine zu verschrotten, und danach ist der
+# Nachweis der Vollstaendigkeit das Einzige, was von ihr uebrig bleibt. Der
+# Bericht liegt seit demselben Review als report.txt daneben (w2u_report_step).
+#
+# Ein LEERES eigenes Logverzeichnis geht weiterhin weg - auch nach einem
+# Fehlschlag: scheitert der Lauf vor der ersten Uebertragung (das Listing der
+# Quelle bricht ab), bliebe sonst bei jedem Versuch ein leeres Verzeichnis
+# zurueck, und die Meldung verspraeche Logs, die es nicht gibt.
 w2u_cleanup() {
     local _Rc=$? _LogEmpty=0
     if [ -n "$_TmpDir" ] && [ -d "$_TmpDir" ]; then
@@ -2247,14 +2289,10 @@ w2u_cleanup() {
         if [ -z "$(ls -A "$_LogDir" 2>/dev/null)" ]; then
             _LogEmpty=1
         fi
-        # Ein LEERES eigenes Logverzeichnis geht auch nach einem Fehlschlag:
-        # scheitert der Lauf vor der ersten Uebertragung (Listing der Quelle
-        # bricht ab), bliebe sonst bei jedem Versuch ein leeres Verzeichnis
-        # zurueck, und die Meldung verspraeche Logs, die es nicht gibt.
-        if [ "$_LogDirOwned" -eq 1 ] && { [ "$_Rc" -eq 0 ] || [ "$_LogEmpty" -eq 1 ]; }; then
+        if [ "$_LogDirOwned" -eq 1 ] && [ "$_LogEmpty" -eq 1 ]; then
             rm -rf "$_LogDir"
         else
-            printf '[%s] Logs bleiben liegen: %s\n' "$(date '+%H:%M:%S')" "$_LogDir" >&2
+            printf '[%s] Logs und Bericht bleiben liegen: %s\n' "$(date '+%H:%M:%S')" "$_LogDir" >&2
         fi
     fi
     return "$_Rc"
@@ -2317,7 +2355,7 @@ main() {
         w2u_log "nur Verifikation - es wird nichts uebertragen"
         w2u_verify_step
         _Rc=0
-        w2u_report || _Rc=$?
+        w2u_report_step || _Rc=$?
         exit "$_Rc"
     fi
 
@@ -2380,7 +2418,7 @@ main() {
     fi
 
     _Rc=0
-    w2u_report || _Rc=$?
+    w2u_report_step || _Rc=$?
     exit "$_Rc"
 }
 
