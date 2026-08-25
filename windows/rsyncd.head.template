@@ -1,0 +1,24 @@
+# Kopf der rsyncd.conf, die START-RSYNC-SERVER.cmd erzeugt. Der Platzhalter in
+# der letzten Zeile wird durch die lokalen /24-Subnetze der Maschine ersetzt.
+# Diese Datei ist KEINE Kopie fuer den Test: tests/test_rsyncd_conf.sh baut die
+# Config aus genau dieser Datei, sonst prueft er nicht das Ausgelieferte.
+# max connections und lock file gehoeren ZWINGEND zusammen (Spec 2.5) - ohne
+# lock file startet der Daemon, listet Module, und JEDER Transfer bricht mit
+# "@ERROR: failed to open lock file" ab. Der Default /var/run/rsyncd.lock
+# existiert im Cygwin-Root auf Windows nicht.
+# lock/pid/log stehen relativ: der Daemon laeuft im Bundle-Ordner (cd /d %~dp0),
+# damit landen sie neben rsync.exe und nicht in einem Systempfad.
+# KEIN "uid = 0" / "gid = 0" hier hinzufuegen, so verlockend es als Absicherung
+# fuer Cygwin aussieht. Gemessen mit rsync 3.5.0 als normaler Benutzer: der
+# Daemon startet, listet die Module - und JEDER Transfer stirbt an
+# "@ERROR: setgid failed" ("setgid 0 failed: Operation not permitted" im Log).
+# rsync versucht das setgid also unabhaengig davon, ob es root ist. Ein
+# elevierter Administrator ist unter Cygwin NICHT uid 0, diese zwei Zeilen
+# wuerden dort demselben Fehlerbild dienen wie ein fehlendes lock file.
+use chroot = false
+strict modes = false
+max connections = 32
+lock file = rsyncd.lock
+pid file = rsyncd.pid
+log file = rsyncd.log
+hosts allow = @HOSTSALLOW@

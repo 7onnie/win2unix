@@ -1,0 +1,12 @@
+# Ein Block je erkanntem Laufwerk; @DRIVE@/@PATH@/@LABEL@ setzt die .cmd ein.
+# exclude ist eine WHITESPACE-getrennte Liste OHNE Quoting - "System Volume
+# Information" wuerde in drei nutzlose Muster zerfallen; Wildcards matchen auch
+# Leerzeichen. Papierkorb in beiden Schreibweisen, weil Cygwin die Namen so
+# ausliefert, wie NTFS sie fuehrt. Die Ausschluesse stehen serverseitig, damit
+# sie unabhaengig davon greifen, was ein Client anfordert.
+[@DRIVE@]
+    path = @PATH@
+    comment = @LABEL@
+    read only = true
+    list = yes
+    exclude = pagefile.sys hiberfil.sys swapfile.sys DumpStack.log* System*Volume*Information $RECYCLE.BIN $Recycle.Bin
