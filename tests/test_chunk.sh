@@ -105,4 +105,24 @@ w2u_chunk "$_T/g.work" "$_T/cg" 8 "$_T/g.list"
 t_assert_eq "3" "$(grep -c . "$_T/g.list")" "Fall G: 3 Pakete mit Sonderzeichen -> 3 Chunks"
 _assert_identity "$_T/g.work" "$_T/g.list" "Fall G: Leerzeichen, TAB und Umlaut ueberleben den Chunk-Schnitt unveraendert"
 
+# Fall H: unlesbare Arbeitsdatei muss laut abbrechen statt eine unerwartete
+# Zaehlung still zu verarbeiten (Re-Review nach Task 5). Deckt den rc>1-Zweig
+# von "grep -c . || [ $? -eq 1 ] || w2u_die" ab - Praezedenz und Rechte-Messung
+# fuer das chmod-000-Muster in tests/test_decompose.sh:284-299 (dort
+# nachgemessen: unlesbare Datei -> rc 2 bei BSD-grep UND ugrep, kein Treffer
+# -> rc 1; beide stimmen fuer diesen Fall ueberein). Als root wirkungslos
+# (Rechte werden ignoriert), deshalb dort skippen.
+if [ "$(id -u)" -eq 0 ]; then
+    t_skip "laeuft als root - unlesbare Arbeitsdatei ist wirkungslos"
+else
+    _mk "$_T/h.work" 5
+    chmod 000 "$_T/h.work"
+    mkdir -p "$_T/ch"
+    _Rc=0
+    _Err="$(w2u_chunk "$_T/h.work" "$_T/ch" 8 "$_T/h.list" 2>&1)" || _Rc=$?
+    t_assert_eq "1" "$_Rc" "Fall H: unlesbare Arbeitsdatei bricht hart ab (rc 1 von w2u_die)"
+    t_assert_contains "$_Err" "nicht lesbar" "Fall H: Fehlermeldung nennt die Ursache"
+    chmod 644 "$_T/h.work"
+fi
+
 t_summary
