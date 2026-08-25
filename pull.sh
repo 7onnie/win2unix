@@ -264,6 +264,25 @@ w2u_decompose() {
     # "|| true" Fehler verschluckt, waere reines Risiko ohne Funktionsgewinn.
 }
 
+# Buendelt Arbeitspakete zu Chunks (Spec 5.5).
+# Eine feste Chunkgroesse waere falsch: 308 Pakete ergaeben nur 4 Chunks fuer
+# 8 Worker. Ziel ist deutlich mehr Chunks als Worker, damit xargs etwas zu
+# verteilen hat.
+w2u_chunk() {
+    local _WorkFile="$1" _ChunkDir="$2" _PMaxLocal="$3" _ListOut="$4"
+    local _Total _Divisor _Size
+    _Total="$(grep -c . "$_WorkFile" || true)"
+    [ "$_Total" -gt 0 ] || w2u_die "keine Arbeitspakete - ist der Quellpfad richtig?"
+    _Divisor=$((_ThresholdFactor * _PMaxLocal))
+    _Size=$(( (_Total + _Divisor - 1) / _Divisor ))
+    [ "$_Size" -lt 1 ] && _Size=1
+    [ "$_Size" -gt "$_ChunkMax" ] && _Size="$_ChunkMax"
+    rm -f "$_ChunkDir"/chunk.*
+    split -l "$_Size" "$_WorkFile" "$_ChunkDir/chunk."
+    ls "$_ChunkDir"/chunk.* > "$_ListOut"
+    w2u_log "$_Total Arbeitspakete, $_Size je Chunk, $(grep -c . "$_ListOut") Chunks"
+}
+
 main() {
     set -euo pipefail
     if [ "$#" -eq 0 ]; then
