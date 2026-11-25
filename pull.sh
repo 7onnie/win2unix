@@ -223,6 +223,33 @@ w2u_find_rsync() {
     return 0
 }
 
+# Enthaelt die Ausschlussdatei VERANKERTE Muster (fuehrender Schraegstrich)?
+# rc 0 = ja, rc 1 = nein, sonst = nicht auswertbar. Einzige Stelle dieser
+# Erkennung: Preflight (Ablehnung) und w2u_remote_list (Listing) benutzen sie
+# gemeinsam.
+# Kommentare (# oder ;), Leerzeilen und CRLF-Enden sind KEINE Muster -
+# eine Ausschlussdatei mit "# /Bild" darf keinen Lauf kosten. Die
+# beiden Kommentar-Zeilen unten koennen bei DIESER Pruefung nicht
+# zuschlagen (was mit "#" beginnt, beginnt nicht mit "/") - sie stehen
+# als Riegel fuer jeden, der die Erkennung spaeter lockert; eine
+# naivere Form ("steht irgendwo ein Schraegstrich?") laege sofort
+# falsch, und der zugehoerige Test faengt genau das ab.
+# Keine Intervall-Quantoren: BSD-awk kann sie nicht.
+w2u_exclude_has_anchored() {
+    awk '
+        {
+            sub(/\r$/, "")
+            _L = $0
+            sub(/^[ \t]+/, "", _L)
+            if (_L == "") { next }
+            if (_L ~ /^[#;]/) { next }
+            sub(/^[-+][ \t]*/, "", _L)
+            if (_L ~ /^\//) { _N++ }
+        }
+        END { exit (_N > 0 ? 0 : 1) }
+    ' "$1"
+}
+
 # Listet GENAU EINE Ebene unterhalb von <basis>/<rel>.
 #
 # Der rsync-Exit-Code darf hier nicht verworfen werden. Ein nicht lesbares
@@ -244,15 +271,41 @@ w2u_find_rsync() {
 # (Umleitung in eine Datei, Pipe), wie w2u_decompose (Task 4) sie
 # voraussichtlich nutzt. "|| _Rc=$?" ist die dokumentierte errexit-Ausnahme
 # und haelt den Aufruf am Leben, bis die rc-Pruefung unten laeuft.
+#
+# Ausschluesse (Issue #5): das Listing wendet dieselbe --exclude-from-Datei an
+# wie Worker, Sweep und Verify. Ein ausgeschlossener Ordner erscheint dann gar
+# nicht erst im Listing - er wird weder betreten noch gezaehlt, und ein
+# unlesbarer Altbestand kann den Lauf nicht mehr toeten. Ein NICHT
+# ausgeschlossener unlesbarer Ordner scheitert unveraendert laut (rc-Pruefung
+# unten). Es gibt keine zweite Kopie der Regel: rsync selbst filtert.
+#
+# GRENZE: beim Listing eines Unterordners ist DIESER die Wurzel des Filters. Ein
+# verankertes Muster ("/Bild") wuerde dort auf die falsche Ebene zielen und
+# "<unterordner>/Bild" zu Unrecht aus der Arbeitsliste nehmen - stiller
+# Verlust. Enthaelt die Datei verankerte Muster, wird deshalb nur das Listing
+# der Wurzel gefiltert; tiefer bleibt es ungefiltert (zu GROSSE Arbeitsliste
+# ist harmlos, die Worker filtern ohnehin, und ein unlesbarer Ordner scheitert
+# dort weiter laut - zu KLEINE waere Datenverlust).
 w2u_remote_list() {
-    local _Base="$1" _Rel="$2" _Url _Raw _Rc=0
+    local _Base="$1" _Rel="$2" _Url _Raw _Rc=0 _Anch=0
+    local -a _Args=( --list-only -d )
     _Base="${_Base%/}"
     if [ -n "$_Rel" ]; then
         _Url="$_Base/$_Rel/"
     else
         _Url="$_Base/"
     fi
-    _Raw="$("$_RsyncBin" --list-only -d "$_Url" 2>&1)" || _Rc=$?
+    if [ -n "${_ExcludeFrom-}" ]; then
+        _Anch=1                     # 1 = keine verankerten Muster (awk-Konvention)
+        if [ -n "$_Rel" ]; then
+            _Anch=0
+            w2u_exclude_has_anchored "$_ExcludeFrom" || _Anch=$?
+            [ "$_Anch" -le 1 ] || w2u_die "Ausschlussdatei $_ExcludeFrom nicht auswertbar (awk rc $_Anch)"
+        fi
+        # Wurzel (_Rel leer): immer filtern. Tiefer: nur ohne verankerte Muster.
+        [ "$_Anch" -eq 0 ] || _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
+    fi
+    _Raw="$("$_RsyncBin" "${_Args[@]}" "$_Url" 2>&1)" || _Rc=$?
     if [ "$_Rc" -ne 0 ]; then
         w2u_die "rsync-Listing fehlgeschlagen fuer $_Url (rc $_Rc): $_Raw"
     fi
@@ -2277,26 +2330,7 @@ w2u_preflight() {
     if [ -n "$_ExcludeFrom" ] && [ -n "$_SrcPrefix" ] \
        && [ "$_ParMode" = "parallel" ] && [ "$_VerifyOnly" -eq 0 ]; then
         _Rc=0
-        # Kommentare (# oder ;), Leerzeilen und CRLF-Enden sind KEINE Muster -
-        # eine Ausschlussdatei mit "# /Bild" darf keinen Lauf kosten. Die
-        # beiden Kommentar-Zeilen unten koennen bei DIESER Pruefung nicht
-        # zuschlagen (was mit "#" beginnt, beginnt nicht mit "/") - sie stehen
-        # als Riegel fuer jeden, der die Erkennung spaeter lockert; eine
-        # naivere Form ("steht irgendwo ein Schraegstrich?") laege sofort
-        # falsch, und der zugehoerige Test faengt genau das ab.
-        # Keine Intervall-Quantoren: BSD-awk kann sie nicht.
-        awk '
-            {
-                sub(/\r$/, "")
-                _L = $0
-                sub(/^[ \t]+/, "", _L)
-                if (_L == "") { next }
-                if (_L ~ /^[#;]/) { next }
-                sub(/^[-+][ \t]*/, "", _L)
-                if (_L ~ /^\//) { _N++ }
-            }
-            END { exit (_N > 0 ? 0 : 1) }
-        ' "$_ExcludeFrom" || _Rc=$?
+        w2u_exclude_has_anchored "$_ExcludeFrom" || _Rc=$?
         if [ "$_Rc" -eq 0 ] && [ "$_DryRun" -eq 1 ]; then
             # Eigene Regel, gleiche Begruendung wie bei den Flag-Kombinationen:
             # ein Trockenlauf uebertraegt nichts und faellt kein Urteil, also
