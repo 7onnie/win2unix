@@ -108,6 +108,19 @@ _SrcRoot=""           # rsync://host[:port]/modul  (ohne Schraegstrich am Ende)
 _SrcPrefix=""         # modul-relativer Pfad, leer wenn die Quelle die Wurzel ist
 _ParSrc=""            # Quelle der Worker = _SrcRoot
 _ParDst=""            # Ziel der Worker; leer, wenn nicht parallel uebertragen wird
+# Zwischenordner (Issue #7). Endet das Ziel NICHT auf dem modul-relativen
+# Praefix, wird <ziel>/NAME nur fuer die parallele Phase nach
+# _StageLeaf = _StageDir/<praefix> umbenannt; die Worker schreiben dann mit
+# _ParDst = _StageDir, und "_ParDst/<praefix>" ist wieder genau der Bestand.
+# Danach wird zurueckbenannt - Sweep, Verify und Bericht sehen nur <ziel>/NAME.
+# _StageDir liegt NEBEN <ziel>/NAME, also im selben Verzeichnis und damit auf
+# derselben Platte: das Umbenennen ist ein rename(2), kein Kopieren.
+_Stage=0              # 1 = Zwischenordner wird benutzt
+_StageDir=""          # <ziel>/.w2u-stage-NAME
+_StageLeaf=""         # _StageDir/<praefix> - hier liegt der Bestand waehrend der Phase
+_StageLock=""         # _StageDir.lock - Sperre gegen zwei Laeufe auf dasselbe Ziel
+_StageLockOwned=0     # 1 = dieser Lauf haelt die Sperre (nur dann wird sie freigegeben)
+_WorkRoot=""          # wo der Bestand GERADE liegt, wenn nicht unter _DstRoot
 _ParMode="parallel"   # Vorgabe bewusst "parallel": w2u_report wertet eine
                       # FEHLENDE Chunkliste nur im einstroemigen Lauf als
                       # zulaessig. Die strenge Vorgabe heisst also, dass ein
@@ -1936,7 +1949,7 @@ w2u_einstroemig() {
 # Abgelehnt wird beim PARSEN, nicht nach Stunden Arbeit: ein Lauf, der
 # strukturell nur FAIL melden kann, darf nicht erst den ganzen Bestand lesen.
 w2u_parse_args() {
-    local _Pos=0 _Base _Rest _SrcHost _SrcModule _Weg
+    local _Pos=0 _Base _Rest _SrcHost _SrcModule _Weg _SrcSlash=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --jobs)         w2u_take_arg "$1" "${2-}"; _JobCnt="$_ArgVal"; shift 2 ;;
@@ -2013,6 +2026,7 @@ w2u_parse_args() {
     done
     case "$_SrcUrl" in
         */)
+            _SrcSlash=1
             # Inhalt direkt ins Ziel. Auch hier koennen mehrere Schraegstriche
             # stehen ("…/Archiv//"), sonst bliebe einer im Pfad stehen und
             # jeder daraus gebaute URL haette einen doppelten.
@@ -2057,12 +2071,31 @@ w2u_parse_args() {
     # gibt es KEIN Ziel, in das die modul-relativen Eintraege passen - dann
     # laeuft der Transfer einstroemig ueber den Sweep. Das Anfuehrungszeichen
     # im Muster ist Pflicht: ein Praefix mit *, ? oder [ waere sonst ein Glob.
+    _Stage=0
+    _StageDir=""
+    _StageLeaf=""
+    _StageLock=""
     if [ -z "$_SrcPrefix" ]; then
         _ParDst="$_DstRoot"
         _ParMode="parallel"
     elif [ "${_DstRoot%"/$_SrcPrefix"}" != "$_DstRoot" ]; then
         _ParDst="${_DstRoot%"/$_SrcPrefix"}"
         [ -n "$_ParDst" ] || _ParDst="/"
+        _ParMode="parallel"
+    elif [ "$_SrcSlash" -eq 0 ]; then
+        # Issue #7: das Ziel ist IMMER <ziel>/NAME, egal wie tief die Quelle
+        # liegt. Die Kuerzung geht nicht auf, also laeuft die parallele Phase
+        # ueber einen Zwischenordner neben dem Ziel (Herleitung bei _Stage).
+        # Nur OHNE Schraegstrich am Ende: dann ist <ziel>/NAME ein Verzeichnis,
+        # das dieses Werkzeug anlegt und kurz umbenennen darf. MIT Schraegstrich
+        # ist das Ziel ein Verzeichnis des Anwenders, das fremde Dateien
+        # enthalten kann - das wird nie verschoben (Zweig darunter).
+        _Stage=1
+        _StageDir="$_DstDir/.w2u-stage-$_Base"
+        [ "$_DstDir" = "/" ] && _StageDir="/.w2u-stage-$_Base"
+        _StageLeaf="$_StageDir/$_SrcPrefix"
+        _StageLock="$_StageDir.lock"
+        _ParDst="$_StageDir"
         _ParMode="parallel"
     else
         # Der Ratschlag MUSS zur Tiefe des Praefixes passen (Fund in Task 12,
