@@ -1196,7 +1196,7 @@ w2u_count_local() {
         printf '%s\n' ""
         return 0
     fi
-    find "$_DstRoot" -path "${_LogDir%/}" -prune -o -type f -print > "$_List" 2>/dev/null || _Rc=$?
+    find -H "$_DstRoot" -path "${_LogDir%/}" -prune -o -type f -print > "$_List" 2>/dev/null || _Rc=$?
     if [ "$_Rc" -eq 0 ]; then
         _Cnt="$(awk 'END { print NR + 0 }' "$_List")" || _Cnt=""
     fi
@@ -1260,7 +1260,7 @@ w2u_name_diff() {
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" > "$_Rem" 2>/dev/null || _Rc=$?
     if [ "$_Rc" -eq 0 ]; then
-        find "$_DstRoot" -path "${_LogDir%/}" -prune -o -type f -print > "$_Loc" 2>/dev/null || _Rc=$?
+        find -H "$_DstRoot" -path "${_LogDir%/}" -prune -o -type f -print > "$_Loc" 2>/dev/null || _Rc=$?
     fi
     if [ "$_Rc" -eq 0 ]; then
         # Unterschieden wird ueber FILENAME, nicht ueber "NR == FNR" - dieselbe
@@ -2282,8 +2282,17 @@ w2u_dev_of() {
 # BSD und GNU gleich hat (flock gibt es auf macOS nicht).
 # Eine Sperre, deren Prozess nicht mehr lebt, wird UEBERNOMMEN: sonst blockierte
 # genau der Absturz (kill -9, Strom), nach dem fortgesetzt werden soll.
+#
+# Tot ist ein Lauf aber erst, wenn auch seine WORKER tot sind (Review-Fund):
+# kill -9 trifft nur den Hauptprozess, xargs und rsync laufen als Waisen weiter
+# und schreiben in den Zwischenordner. Wer dann den Bestand zurueckbenennt,
+# bekommt zwei halbe Bestaende. Erkannt werden die Waisen am TMP-Verzeichnis
+# des toten Laufs, das in der Sperre steht: jeder Worker traegt es im argv
+# (--files-from=<tmp>/chunks/..., die bash-Huelle um w2u_run_chunk ebenso).
+# Der Pfad stammt aus mktemp und ist damit eindeutig - ein fremder Lauf auf ein
+# anderes Ziel mit gleichem Ordnernamen loest das nicht aus.
 w2u_stage_lock() {
-    local _Pid=""
+    local _Pid="" _OldTmp="" _Orph=""
     [ "$_Stage" -eq 1 ] || return 0
     if ! mkdir "$_StageLock" 2>/dev/null; then
         [ -d "$_StageLock" ] || w2u_die "Sperre nicht anlegbar: $_StageLock"
@@ -2292,11 +2301,22 @@ w2u_stage_lock() {
             ''|*[!0-9]*) _Pid="" ;;
         esac
         if [ -n "$_Pid" ] && kill -0 "$_Pid" 2>/dev/null; then
-            w2u_die "Ein anderer Lauf (PID $_Pid) arbeitet schon auf $_DstRoot (Sperre $_StageLock). Dessen Ende abwarten - zwei Laeufe auf dasselbe Ziel schoeben sich den Bestand gegenseitig weg."
+            w2u_die "Ein anderer Lauf (PID $_Pid) arbeitet schon auf $_DstRoot (Sperre $_StageLock). Dessen Ende abwarten - zwei Laeufe auf dasselbe Ziel schoeben sich den Bestand gegenseitig weg. Laeuft sicher kein pull.sh mehr (PID wiederverwendet): 'rm -r $_StageLock' und neu starten."
         fi
-        w2u_warn "uebernehme verwaiste Sperre $_StageLock (Prozess ${_Pid:-unbekannt} laeuft nicht mehr)"
+        _OldTmp="$(cat "$_StageLock/tmp" 2>/dev/null)" || _OldTmp=""
+        if [ -n "$_OldTmp" ]; then
+            # Muster per Umgebung statt per Argument: sonst stuende es im argv
+            # von awk und awk faende sich selbst.
+            _Orph="$(ps -A -o pid= -o args= 2>/dev/null \
+                | W2U_PAT="$_OldTmp" awk 'index($0, ENVIRON["W2U_PAT"]) > 0 { printf "%s ", $1 }')" || _Orph=""
+            if [ -n "$_Orph" ]; then
+                w2u_die "Der abgebrochene Lauf (PID ${_Pid:-unbekannt}) hat noch Worker, die in den Zwischenordner schreiben: PID ${_Orph% }. Erst beenden ('kill ${_Orph% }'), dann denselben Aufruf wiederholen. Bis dahin wird nichts angefasst."
+            fi
+        fi
+        w2u_warn "uebernehme verwaiste Sperre $_StageLock (Prozess ${_Pid:-unbekannt} laeuft nicht mehr, keine Worker uebrig)"
     fi
     printf '%s\n' "$$" > "$_StageLock/pid" || w2u_die "Sperre nicht beschreibbar: $_StageLock/pid"
+    printf '%s\n' "$_TmpDir" > "$_StageLock/tmp" || w2u_die "Sperre nicht beschreibbar: $_StageLock/tmp"
     _StageLockOwned=1
 }
 
@@ -2345,9 +2365,15 @@ w2u_stage_recover() {
 # Abbruch mittendrin hinterliesse zwei halbe Bestaende.
 w2u_stage_in() {
     local _DevDst _DevDir
+    # Ein Symlink wuerde als LINK verschoben, rsync legte an seiner Stelle ein
+    # echtes Verzeichnis an: Daten auf der falschen Platte, Link zerstoert.
+    if [ -L "$_DstRoot" ]; then
+        w2u_warn "$_DstRoot ist ein Symlink - der wird nicht umbenannt"
+        return 1
+    fi
     [ ! -e "$_StageLeaf" ] || w2u_die "Zwischenordner existiert schon: $_StageLeaf (haette das Aufraeumen im Preflight erledigen muessen)"
     _DevDst="$(w2u_dev_of "$_DstRoot")"
-    _DevDir="$(w2u_dev_of "$_DstDir")"
+    _DevDir="$(w2u_dev_of "$_DstDir/.")"     # "/." folgt einem Symlink-<ziel>
     if [ -z "$_DevDst" ] || [ "$_DevDst" != "$_DevDir" ]; then
         w2u_warn "$_DstRoot liegt nicht nachweisbar auf derselben Platte wie $_DstDir (Geraet '${_DevDst:-?}' gegen '${_DevDir:-?}') - umbenennen ginge nur als Kopie"
         return 1
@@ -2654,8 +2680,11 @@ w2u_cleanup() {
         # Zwischenordner schreiben. Der naechste Lauf raeumt auf.
         printf '[%s] Der Bestand liegt im Zwischenordner %s - derselbe Aufruf holt ihn nach %s zurueck und setzt fort.\n' "$(date '+%H:%M:%S')" "$_StageLeaf" "$_DstRoot" >&2
     fi
-    if [ "$_StageLockOwned" -eq 1 ]; then
-        rm -f "$_StageLock/pid"
+    # Liegt der Bestand noch im Zwischenordner, bleibt die Sperre stehen: es
+    # koennen noch Worker schreiben (TERM nur an diesen Prozess). Der naechste
+    # Lauf sieht die tote PID, prueft per TMP-Pfad auf Waisen und uebernimmt.
+    if [ "$_StageLockOwned" -eq 1 ] && [ -z "$_WorkRoot" ]; then
+        rm -f "$_StageLock/pid" "$_StageLock/tmp"
         rmdir "$_StageLock" 2>/dev/null || true
     fi
     if [ -n "$_TmpDir" ] && [ -d "$_TmpDir" ]; then

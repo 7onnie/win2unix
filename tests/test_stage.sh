@@ -155,6 +155,70 @@ t_assert_rc 0 "$_Rc" "tote Sperre (kill -9): wird uebernommen, rc 0"
 t_assert_contains "$_Out" "ERGEBNIS: PASS" "tote Sperre: PASS"
 s_clean "$_Z" "tote Sperre"
 
+# ---- 5b: tote Sperre, aber Worker des toten Laufs leben noch (Review I1) ----
+# kill -9 trifft nur den Hauptprozess; xargs und rsync laufen als Waisen weiter
+# und schreiben in den Zwischenordner. Die Sperre darf dann NICHT uebernommen
+# werden - sonst schiebt der neue Lauf den Bestand weg, waehrend die Waisen
+# hineinschreiben, und am Ende liegen zwei halbe Bestaende da.
+# Nachgestellt: die Sperre nennt eine tote PID und das TMP-Verzeichnis des
+# toten Laufs; ein Prozess traegt dieses Verzeichnis im argv, wie es jeder
+# Worker tut (--files-from=<tmp>/chunks/...).
+_Z="$_TmpRoot/z8"
+_Leaf="$_Z/.w2u-stage-BRIEFE/Konv/Albis/AlbisWin/BRIEFE"
+mkdir -p "$_Leaf/1" "$_Z/.w2u-stage-BRIEFE.lock"
+cp -p "$_SrcB/1/1 AC.DOC" "$_Leaf/1/"
+sh -c 'exit 0' &
+_DeadPid=$!
+wait "$_DeadPid"
+_OrphTmp="$_TmpRoot/win2unix.TOTERLAUF"
+echo "$_DeadPid" > "$_Z/.w2u-stage-BRIEFE.lock/pid"
+echo "$_OrphTmp" > "$_Z/.w2u-stage-BRIEFE.lock/tmp"
+bash -c 'sleep 60; :' _ "--files-from=$_OrphTmp/chunks/c0001" &
+_OrphPid=$!
+_Out="$(bash "$_Root/pull.sh" --jobs 4 "$_Url" "$_Z" 2>&1)"; _Rc=$?
+t_assert_rc 1 "$_Rc" "Waisen am Werk: Abbruch statt Uebernahme"
+t_assert_contains "$_Out" "$_OrphPid" "Waisen am Werk: die Meldung nennt die PID des Waisen"
+[ -f "$_Leaf/1/1 AC.DOC" ] && _Has=ja || _Has=nein
+t_assert_eq "ja" "$_Has" "Waisen am Werk: Zwischenordner unangetastet"
+[ -e "$_Z/BRIEFE" ] && _Has=ja || _Has=nein
+t_assert_eq "nein" "$_Has" "Waisen am Werk: kein Ziel angelegt"
+kill "$_OrphPid" 2>/dev/null
+wait "$_OrphPid" 2>/dev/null
+_Out="$(bash "$_Root/pull.sh" --jobs 4 "$_Url" "$_Z" 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "nach Ende der Waisen: rc 0"
+t_assert_contains "$_Out" "ERGEBNIS: PASS" "nach Ende der Waisen: PASS"
+t_assert_eq "" "$(diff -r "$_SrcB" "$_Z/BRIEFE" 2>&1)" "nach Ende der Waisen: inhaltlich identisch"
+s_clean "$_Z" "nach Ende der Waisen"
+
+# ---- 5c: <ziel>/NAME ist ein Symlink (Review I2) ---------------------------
+# Umbenennen wuerde den LINK verschieben, rsync legte an seiner Stelle ein
+# echtes Verzeichnis an - Daten auf der falschen Platte, Link zerstoert.
+# Erwartet: kein Zwischenordner, einstroemig durch den Link, Link bleibt.
+_Z="$_TmpRoot/z9"
+mkdir -p "$_Z" "$_TmpRoot/woanders/BRIEFE_echt"
+ln -s "$_TmpRoot/woanders/BRIEFE_echt" "$_Z/BRIEFE"
+_Out="$(bash "$_Root/pull.sh" --jobs 4 "$_Url" "$_Z" 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "Symlink-Ziel: rc 0"
+t_assert_contains "$_Out" "ERGEBNIS: PASS" "Symlink-Ziel: PASS"
+t_assert_contains "$_Out" "EINSTROEMIG" "Symlink-Ziel: einstroemig, angesagt"
+[ -L "$_Z/BRIEFE" ] && _Has=ja || _Has=nein
+t_assert_eq "ja" "$_Has" "Symlink-Ziel: der Link bleibt ein Link"
+t_assert_eq "" "$(diff -r "$_SrcB" "$_TmpRoot/woanders/BRIEFE_echt" 2>&1)" "Symlink-Ziel: Daten liegen im Link-Ziel"
+[ -e "$_Z/.w2u-stage-BRIEFE" ] && _Has=ja || _Has=nein
+t_assert_eq "nein" "$_Has" "Symlink-Ziel: kein Zwischenordner"
+
+# ---- 5d: <ziel> selbst ist ein Symlink auf eine andere Platte (Review M1) ---
+# Haeufig auf Linux: /opt/data/files -> /mnt/gross. Das Geraet muss DURCH den
+# Link verglichen werden, sonst faellt jeder Lauf grundlos auf einstroemig.
+_Z="$_TmpRoot/z10"
+mkdir -p "$_TmpRoot/gross"
+ln -s "$_TmpRoot/gross" "$_Z"
+_Out="$(bash "$_Root/pull.sh" --jobs 4 "$_Url" "$_Z" 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "Ziel ist Symlink: rc 0"
+t_assert_contains "$_Out" "parallele Phase:" "Ziel ist Symlink: trotzdem parallel"
+s_absent "$_Out" "EINSTROEMIG" "Ziel ist Symlink: kein Rueckfall"
+t_assert_eq "" "$(diff -r "$_SrcB" "$_TmpRoot/gross/BRIEFE" 2>&1)" "Ziel ist Symlink: inhaltlich identisch"
+
 # ---- 6: Schraegstrich-Form bleibt einstroemig, ohne Zwischenordner ----------
 _Z="$_TmpRoot/z7"
 mkdir -p "$_Z"
