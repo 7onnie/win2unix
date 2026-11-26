@@ -101,7 +101,12 @@ ein Umbenennen auf derselben Platte und dauert keine Sekunde. Prüfung und Beric
 - **Nach Ctrl-C oder Absturz** liegt der Bestand eventuell im Zwischenordner. Die Meldung
   sagt das. **Denselben Befehl erneut ausführen**: Er holt den Bestand zurück und setzt fort.
 - **Zwei Läufe auf dasselbe Ziel** verhindert eine Sperre `<ziel>/.w2u-stage-BRIEFE.lock`.
-  Stammt sie von einem Prozess, der nicht mehr läuft, übernimmt der nächste Lauf sie.
+  Stammt sie von einem Prozess, der nicht mehr läuft, übernimmt der nächste Lauf sie. Nach
+  einem `kill -9` laufen allerdings oft noch dessen `xargs`/`rsync` weiter und schreiben in den
+  Zwischenordner. Dann bricht der Lauf ab, nennt deren PIDs und fasst nichts an. Warten, bis sie
+  fertig sind, oder sie mit `kill` beenden, und denselben Befehl wiederholen.
+- **Ist `<ziel>/BRIEFE` ein Symlink**, wird er nicht umbenannt. Der Transfer läuft
+  einströmig durch den Link, angesagt.
 - **Liegt Inhalt im Zwischenordner UND in `<ziel>/BRIEFE`**, bricht der Lauf ab und fasst
   nichts an. Das passiert nur nach Handarbeit zwischen zwei Läufen. Beide Bestände ansehen,
   von Hand zusammenführen, den Zwischenordner löschen, neu starten.

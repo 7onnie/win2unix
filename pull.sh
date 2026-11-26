@@ -695,6 +695,10 @@ w2u_run_list() {
     # w2u_run_chunk laesse jeden Chunk ohne Ergebniszeile scheitern.
     export _RsyncBin _ParSrc _ParDst _LogDir _ResultFile _MaxRetry _RetryPause _ExcludeFrom _RsyncTimeout
     export -f w2u_run_chunk w2u_die w2u_log
+    # "$0" der Worker-Shell = "w2u-worker:<tmp>": damit steht das TMP-Verzeichnis
+    # dieses Laufs im argv von XARGS SELBST (dessen Befehlsvorlage), nicht nur
+    # in dem seiner Kinder. Ueberlebt xargs einen kill -9 des Hauptprozesses,
+    # findet w2u_stage_lock es daran auch in der Luecke zwischen zwei Chunks.
     # Einmal je Phase nachsehen, ob dieses xargs "-S" kennt (siehe oben).
     # "true" statt eines echten Kommandos: der Probelauf darf nichts tun, nur
     # das Optionen-Parsen ausloesen. Ein fehlendes xargs (rc 127) landet
@@ -704,7 +708,7 @@ w2u_run_list() {
     if printf 'x\n' | xargs -S 4096 -I {} true >/dev/null 2>&1; then
         _XargsRepl=( -S 4096 )      # BSD: hebt die 255-Byte-Grenze der -I-Ersetzung
     fi                              # GNU: kennt -S nicht und hat die Grenze nicht
-    xargs -P "$_Jobs" ${_XargsRepl[@]+"${_XargsRepl[@]}"} -I {} "${BASH:-bash}" -c 'w2u_run_chunk "$1"' _ {} < "$_ListFile" || _Rc=$?
+    xargs -P "$_Jobs" ${_XargsRepl[@]+"${_XargsRepl[@]}"} -I {} "${BASH:-bash}" -c 'w2u_run_chunk "$1"' "w2u-worker:$_TmpDir" {} < "$_ListFile" || _Rc=$?
     if [ "$_Rc" -ne 0 ]; then
         w2u_warn "xargs endete mit rc $_Rc - w2u_run_chunk selbst liefert immer 0, also ist mindestens ein Worker vorzeitig gestorben. Bei Signal-Tod (z.B. OOM) und bei Exit 255 liest xargs die Liste danach NICHT weiter."
         # Der Abgleich gehoert hierher und nirgendwo sonst: dies ist die einzige
@@ -2307,7 +2311,7 @@ w2u_stage_lock() {
         if [ -n "$_OldTmp" ]; then
             # Muster per Umgebung statt per Argument: sonst stuende es im argv
             # von awk und awk faende sich selbst.
-            _Orph="$(ps -A -o pid= -o args= 2>/dev/null \
+            _Orph="$(ps -ww -A -o pid= -o args= 2>/dev/null \
                 | W2U_PAT="$_OldTmp" awk 'index($0, ENVIRON["W2U_PAT"]) > 0 { printf "%s ", $1 }')" || _Orph=""
             if [ -n "$_Orph" ]; then
                 w2u_die "Der abgebrochene Lauf (PID ${_Pid:-unbekannt}) hat noch Worker, die in den Zwischenordner schreiben: PID ${_Orph% }. Erst beenden ('kill ${_Orph% }'), dann denselben Aufruf wiederholen. Bis dahin wird nichts angefasst."
