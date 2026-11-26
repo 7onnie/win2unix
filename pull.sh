@@ -48,7 +48,7 @@
 #                main                           der Ablauf, und nur er
 # ---------------------------------------------------------------------------
 
-W2U_VERSION="0.1.0"
+W2U_VERSION="0.2.0"
 
 # ---------- Konfiguration (Zero-Touch: alles hier, keine Rueckfragen) ----------
 _JobCnt=0              # 0 = Auto-Messung (Spec 5.4)
@@ -172,8 +172,10 @@ w2u_usage() {
     cat >&2 <<'EOF'
 Aufruf: pull.sh [Optionen] rsync://<WIN-IP>/<modul>/<pfad> <zielverzeichnis>
 
-  Quelle OHNE abschliessenden Slash  -> legt <zielverzeichnis>/<ordnername> an
+  Quelle OHNE abschliessenden Slash  -> legt <zielverzeichnis>/<ordnername> an,
+                                        parallel, egal wie tief die Quelle liegt
   Quelle MIT abschliessendem Slash   -> schreibt den Inhalt direkt ins Ziel
+                                        (einstroemig)
 
 Optionen:
   --jobs N            feste Parallelitaet (1-64), ueberspringt die Auto-Messung

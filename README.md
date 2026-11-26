@@ -70,41 +70,43 @@ Homebrew-rsync wird bevorzugt, wenn es liegt; `--rsync PFAD` erzwingt ein bestim
 `cut`, `head`, `tail`, `tr`, `basename`, `mktemp`, optional `pkill`. Auf macOS und jedem
 Linux-System ist das vorhanden; die BSD-Varianten reichen (`awk` ohne Intervall-Quantoren, bash 3.2).
 
-### Die Form des Zielpfads entscheidet über die Parallelität
+### Wohin der Ordner kommt
 
-Die parallele Phase kann technisch nur die **Modulwurzel** ansprechen (`--files-from` gegen einen
-rsync-Daemon funktioniert ausschließlich so — nachgemessen). Sie hängt die modul-relativen Pfade
-darunter an. Daraus folgt genau eine Regel:
-
-> Der entstehende Zielpfad muss auf dem **gesamten** Pfad enden, der die Quelle unterhalb des
-> Moduls hat.
-
-Für den Normalfall — ein Ordner direkt unter dem Laufwerk — heißt das schlicht: **Quelle ohne
-Schrägstrich am Ende**, ihr letzter Pfadteil bildet den Zielordner.
+Das Ziel ist immer `<ziel>/<ordnername>`, egal wie tief der Ordner auf Windows liegt. Der
+Pfad davor taucht im Ziel nicht auf:
 
 ```bash
-pull.sh rsync://<IP>/e/Archiv /ziel      # -> /ziel/Archiv, volle Parallelität
-pull.sh rsync://<IP>/e/Archiv /ziel/     # dasselbe, Schrägstriche am ZIEL sind egal
-pull.sh rsync://<IP>/e/Archiv/ /ziel     # -> /ziel, EINSTROEMIG (siehe unten)
-pull.sh rsync://<IP>/e /ziel             # -> /ziel/e, ganzes Laufwerk, immer parallel
+bash /tmp/pull.sh rsync://<IP>/f/Konvertierung/Albis/AlbisWin/BRIEFE /opt/data/files
+# -> /opt/data/files/BRIEFE, parallel
 ```
 
-Liegt die Quelle **tiefer** unter dem Modul, muss das Ziel den Zwischenpfad mitbringen:
+Das angegebene Zielverzeichnis (`/opt/data/files`) muss existieren, sonst bricht der Lauf mit
+`Zielverzeichnis existiert nicht` ab. `<ordnername>` legt `pull.sh` selbst an.
 
-```bash
-mkdir -p /ziel/Daten                                # nötig: siehe unten
-pull.sh rsync://<IP>/e/Daten/Archiv /ziel/Daten     # -> /ziel/Daten/Archiv, parallel
-pull.sh rsync://<IP>/e/Daten/Archiv /ziel           # -> /ziel/Archiv, EINSTROEMIG
-```
+**Einzige Ausnahme: Quelle mit Schrägstrich am Ende.** `…/BRIEFE/` schreibt den *Inhalt*
+direkt ins Ziel. Das läuft mit einem einzelnen rsync-Prozess, angesagt mit dem Wort
+`EINSTROEMIG`: vollständig und verifiziert, aber langsamer. Für viele kleine Dateien die Form
+ohne Schrägstrich nehmen.
 
-Das `mkdir -p` ist keine Dekoration: **das angegebene Zielverzeichnis muss existieren**, sonst
-bricht der Lauf mit `Zielverzeichnis existiert nicht` ab. Nur die Ebenen *darunter* legt `pull.sh`
-selbst an.
+#### Der Zwischenordner `.w2u-stage-<ordnername>`
 
-Passt die Kürzung nicht auf, überträgt ein einzelner rsync-Prozess. Der Lauf ist trotzdem
-vollständig und wird verifiziert, dauert aber deutlich länger — und das Werkzeug **sagt es an**,
-mit dem Wort `EINSTROEMIG` und dem Zielpfad, an dem es scheitert (`… endet nicht auf
-'/Daten/Archiv'`). Ein stiller Rückfall wäre dieselbe Fehlerklasse wie ein stiller Datenverlust.
+Technischer Hintergrund: Die parallele Phase kann nur die **Modulwurzel** ansprechen
+(`--files-from` gegen einen rsync-Daemon funktioniert ausschließlich so, nachgemessen). rsync
+legt deshalb den ganzen Pfad ab Laufwerkswurzel an. `pull.sh` benennt `<ziel>/BRIEFE` dafür
+nur für die Dauer der parallelen Phase nach
+`<ziel>/.w2u-stage-BRIEFE/Konvertierung/Albis/AlbisWin/BRIEFE` um und danach zurück. Das ist
+ein Umbenennen auf derselben Platte und dauert keine Sekunde. Prüfung und Bericht laufen auf
+`<ziel>/BRIEFE`.
+
+- **Nach Ctrl-C oder Absturz** liegt der Bestand eventuell im Zwischenordner. Die Meldung
+  sagt das. **Denselben Befehl erneut ausführen**: Er holt den Bestand zurück und setzt fort.
+- **Zwei Läufe auf dasselbe Ziel** verhindert eine Sperre `<ziel>/.w2u-stage-BRIEFE.lock`.
+  Stammt sie von einem Prozess, der nicht mehr läuft, übernimmt der nächste Lauf sie.
+- **Liegt Inhalt im Zwischenordner UND in `<ziel>/BRIEFE`**, bricht der Lauf ab und fasst
+  nichts an. Das passiert nur nach Handarbeit zwischen zwei Läufen. Beide Bestände ansehen,
+  von Hand zusammenführen, den Zwischenordner löschen, neu starten.
+- **Ist `<ziel>/BRIEFE` ein eigener Einhängepunkt** (andere Platte als `<ziel>`), ginge das
+  Umbenennen nur als Kopie. Dann läuft der Transfer einströmig, angesagt.
 
 ### Ohne Skript
 
