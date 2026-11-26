@@ -142,8 +142,8 @@ if "!_HasPs!"=="nein" (
     exit /b 1
 )
 
-:: --- 4. IPv4-Adressen sammeln. Dieselbe Liste dient zweimal: fuer "hosts
-::        allow" und fuer die Copy-Paste-Zeilen am Ende. Alles wird mit LF
+:: --- 4. IPv4-Adressen sammeln. Die Liste dient nur noch der Anzeige und den
+::        Copy-Paste-Zeilen am Ende - "hosts allow" ist fest 0.0.0.0/0. Alles wird mit LF
 ::        geschrieben ([IO.File] statt "> datei"), damit kein CR in eine
 ::        Config oder in eine for/f-Variable geraet. .NET-Pfade sind ABSOLUT,
 ::        weil .NET relative Pfade gegen das Prozess-Arbeitsverzeichnis
@@ -152,37 +152,25 @@ echo  [+] Ermittle IPv4-Adressen...
 del /q "w2u-ips.tmp" >nul 2>&1
 powershell -NoProfile -Command "$ips = @(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=true' | ForEach-Object { $_.IPAddress } | Where-Object { $_ -like '*.*.*.*' -and $_ -ne '127.0.0.1' -and $_ -notlike '169.254.*' }); [IO.File]::WriteAllText('%~dp0w2u-ips.tmp', [string]::Join([string][char]10, $ips) + [string][char]10)"
 
-set "_Allow="
 set "_IpCnt=0"
 if exist "w2u-ips.tmp" (
     for /f "usebackq delims=" %%I in ("w2u-ips.tmp") do (
         set /a _IpCnt+=1
         echo  [+]   %%I
-        for /f "tokens=1-3 delims=." %%a in ("%%I") do (
-            if not defined _Seen_%%a_%%b_%%c (
-                set "_Seen_%%a_%%b_%%c=1"
-                set "_Allow=!_Allow! %%a.%%b.%%c.0/24"
-            )
-        )
     )
 )
-if defined _Allow set "_Allow=!_Allow:~1!"
 if "!_IpCnt!"=="0" (
-    rem Keine Adresse gefunden heisst nicht "kein Netz" - es kann auch die
-    rem WMI-Abfrage sein. Ein Server, der niemanden hereinlaesst, ist hier
-    rem nutzlos, also oeffnen statt raten. Die Maschine wird verschrottet.
-    set "_Allow=0.0.0.0/0"
-    echo  [!] Keine IPv4-Adresse erkannt - "hosts allow" wird auf 0.0.0.0/0
-    echo      gesetzt ^(jeder im Netz darf lesen^).
+    echo  [!] Keine IPv4-Adresse erkannt - die Befehle unten zeigen einen
+    echo      Platzhalter statt der IP dieses Rechners.
 )
-echo  [+] hosts allow = !_Allow!
-:: Die zwei degradierten Pfade ziehen bewusst in entgegengesetzte Richtungen:
-:: keine IPv4-Adresse -> 0.0.0.0/0, also maximal offen; eine Adresse in einem
-:: Netz WEITER als /24 -> auf dieses /24 festgenagelt, in dem die Gegenseite
-:: unter Umstaenden nicht liegt. Grund fuer die Asymmetrie: im ersten Fall ist
-:: nichts bekannt, im zweiten etwas Belastbares, und /24 ist die Annahme, die
-:: in kleinen Netzen fast immer stimmt. Beide Faelle stehen im Fenster; wer
-:: mit /16 arbeitet, korrigiert die Zeile in rsyncd.conf und startet neu.
+:: hosts allow ist IMMER offen (Issue #8). Frueher standen hier die lokalen
+:: /24-Netze - das hat im ersten Ernstfall den legitimen Client ausgesperrt.
+:: Das Modul ist read only, die Firewall-Regel ohnehin fuer alle offen, und
+:: die Maschine wird verschrottet. Wer es enger will, aendert die Zeile in
+:: rsyncd.conf: der Daemon liest die Config bei jeder Verbindung neu. Ein
+:: Neustart dieses Skripts wuerde sie dagegen neu erzeugen.
+set "_Allow=0.0.0.0/0"
+echo  [+] hosts allow = !_Allow! ^(jeder, der Port 873 erreicht, darf lesen^)
 
 :: --- 5. Laufwerke ermitteln. DriveType=3 sind die fest eingebauten Platten.
 ::        Volume-Labels werden auf ASCII-Grundzeichen reduziert: sie landen in
@@ -354,7 +342,8 @@ if "!_IpCnt!"=="0" (
 )
 echo.
 echo   Das listet die Laufwerke. Dann den gewuenschten Ordner holen, z.B.:
-echo     bash -c "$(curl -fsSL https://raw.githubusercontent.com/7onnie/win2unix/main/pull.sh)" -- rsync://IP/e/Archiv /ziel/
+echo     curl -fsSL -o /tmp/pull.sh https://raw.githubusercontent.com/7onnie/win2unix/main/pull.sh
+echo     bash /tmp/pull.sh rsync://IP/e/Archiv /ziel/
 echo.
 echo   Mehrere IPv4-Adressen oben heissen: mehrere Netzwerkkarten. Die nehmen,
 echo   die im selben Netz wie der Mac/Linux-Rechner liegt.

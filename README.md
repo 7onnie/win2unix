@@ -50,13 +50,14 @@ rsync rsync://<WINDOWS-IP>/e/        # was liegt auf E:?
 Dann holen:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/7onnie/win2unix/main/pull.sh)" -- \
-     rsync://<WINDOWS-IP>/e/Archiv /opt/data/files
+curl -fsSL -o /tmp/pull.sh https://raw.githubusercontent.com/7onnie/win2unix/main/pull.sh
+bash /tmp/pull.sh rsync://<WINDOWS-IP>/e/Archiv /opt/data/files
 ```
 
 **Nicht `curl … | bash` verwenden.** Dabei ist die Standardeingabe der Skript-Stream selbst, und
-die internen Dateilisten des Werkzeugs würden den restlichen Skriptcode lesen. Die Form mit
-`bash -c "$(…)" --` hat diese Falle nicht.
+die internen Dateilisten des Werkzeugs würden den restlichen Skriptcode lesen. Ebenfalls **nicht**
+die Form `bash -c "$(curl …)"`: `pull.sh` ist größer als die 128 KB, die Linux einem einzelnen
+Argument erlaubt, und scheitert dort mit „Argumentliste ist zu lang".
 
 Bricht der Transfer ab — Netzwerk, Strom, versehentlich geschlossenes Fenster, Ctrl-C —, einfach
 **denselben Befehl erneut ausführen**. Es wird nur geholt, was fehlt; bereits übertragene Dateien
@@ -225,14 +226,13 @@ Flaschenhals machen, also genau das kaputtmachen, wofür dieses Werkzeug existie
 Abgesichert ist es durch drei Dinge:
 
 - `read only` in jedem Modul — es lässt sich nichts auf die Quelle schreiben,
-- `hosts allow` auf die lokalen /24-Subnetze der Maschine,
 - der Server läuft nur, solange das Fenster offen ist.
 
-Eine Einschränkung an der zweiten Zeile, die man wissen muss: erkennt das Skript **keine**
-IPv4-Adresse, setzt es `hosts allow = 0.0.0.0/0` — dann darf jeder lesen. Das Fenster sagt es
-(`[!] Keine IPv4-Adresse erkannt`), und es steht auch in der erzeugten `rsyncd.conf`. Ebenso
-liegt die Grenze bei /24: wer im Netz mit /16 arbeitet, korrigiert die Zeile in `rsyncd.conf`
-und startet neu.
+`hosts allow` steht bewusst auf `0.0.0.0/0`: jeder, der Port 873 erreicht, darf lesen. Früher
+waren es die lokalen /24-Netze der Maschine — das hat im ersten Ernstfall den Client ausgesperrt,
+der die Daten holen sollte. Wer es enger will, ändert die Zeile in der erzeugten `rsyncd.conf`.
+Der Daemon liest die Datei bei jeder Verbindung neu, ein **Neustart ist nicht nötig — und
+schädlich**: das Skript erzeugt die Datei beim Start neu.
 
 Sind die Daten schutzbedürftig, gehört der Transfer in ein eigenes Netzsegment oder direkt an ein
 Crossover-Kabel zwischen die beiden Rechner. Das ist eine Betriebs-, keine Skript-Entscheidung.

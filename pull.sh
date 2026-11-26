@@ -3,11 +3,13 @@
 # win2unix / pull.sh - holt EINEN Ordner von einem Windows-rsync-Daemon.
 #
 # Aufruf:
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/7onnie/win2unix/main/pull.sh)" -- \
-#        rsync://<WIN-IP>/e/Archiv /opt/data/files/
+#   curl -fsSL -o /tmp/pull.sh https://raw.githubusercontent.com/7onnie/win2unix/main/pull.sh
+#   bash /tmp/pull.sh rsync://<WIN-IP>/e/Archiv /opt/data/files/
 #
 # NICHT "curl | bash" verwenden: dabei ist stdin der Skript-Stream, und die
-# Datei-Listen wuerden den restlichen Skriptcode lesen.
+# Datei-Listen wuerden den restlichen Skriptcode lesen. Auch NICHT
+# 'bash -c "$(curl ...)"': diese Datei ist groesser als die 128 KB, die Linux
+# einem einzelnen Argument erlaubt (MAX_ARG_STRLEN) - "Argumentliste zu lang".
 #
 # ---------------------------------------------------------------------------
 # WAS WO STEHT. Eine Datei ohne "source"-Abhaengigkeiten (sie wird per curl
@@ -595,8 +597,8 @@ w2u_run_chunk() {
 #
 # "xargs -a DATEI" gibt es auf BSD nicht. stdin wird deshalb EXPLIZIT aus der
 # Liste umgeleitet, und das ist der eigentliche Punkt: xargs darf nie das
-# GEERBTE stdin lesen, beim Bootstrap ueber "bash -c "$(curl ...)"" ist das der
-# Skript-Stream selbst.
+# GEERBTE stdin lesen, beim Start ueber "curl | bash" ist das der Skript-Stream
+# selbst.
 #
 # Hier entsteht die Prozessgrenze, auf die sich das Fail-Fast in w2u_run_chunk
 # stuetzt. Sie haelt, solange drei Dinge stimmen:
