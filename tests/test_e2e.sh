@@ -223,9 +223,14 @@ t_assert_contains "$_Out" "einstroemige Aufrufform" "der Trockenlauf nennt die e
 # geht. Das ist die Zusage im README, und sie ist genau die Stelle, an der ein
 # Anwender die Parallelitaet unbemerkt verliert - deshalb hier beide Richtungen.
 #
-# Die NEGATIVE Richtung genuegt als Trockenlauf: geprueft wird die Ansage.
+# Die andere Richtung (Ziel spiegelt den Praefix NICHT) ist seit Issue #7 nicht
+# mehr einstroemig, sondern laeuft ueber einen Zwischenordner - echt getestet
+# in tests/test_stage.sh. Hier nur: der Trockenlauf sagt keinen Rueckfall an
+# und legt nichts an.
 _Out="$(bash "$_Root/pull.sh" --dry-run "$D_Url/Daten/SonoGDT" "$_Dst2" 2>&1)"
-t_assert_contains "$_Out" "EINSTROEMIG" "tiefer Praefix ohne gespiegeltes Ziel: einstroemig, und angesagt"
+e_assert_absent "$_Out" "EINSTROEMIG" "tiefer Praefix ohne gespiegeltes Ziel: kein Rueckfall mehr (Issue #7)"
+[ -e "$_Dst2/.w2u-stage-SonoGDT" ] && _L=ja || _L=nein
+t_assert_eq "nein" "$_L" "tiefer Praefix, Trockenlauf: kein Zwischenordner angelegt"
 
 # Die POSITIVE Richtung darf KEIN Trockenlauf sein (Review-Fund): der Trockenlauf
 # steigt vor der Praefix-Umschreibung und vor w2u_chunk/w2u_run_all aus. Ein

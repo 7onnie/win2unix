@@ -534,6 +534,7 @@ t_assert_eq "rsync://10.0.0.1/e" "$_ParSrc" "Worker-Quelle ist die Modulwurzel, 
 t_assert_eq "Archiv" "$_SrcPrefix" "modul-relativer Praefix erkannt"
 t_assert_eq "$_Tmp/ziel" "$_ParDst" "_ParDst/<praefix> ergibt _DstRoot"
 t_assert_eq "parallel" "$_ParMode" "Hauptfall bleibt parallel"
+t_assert_eq "0" "$_Stage" "Hauptfall (einsegmentig): kein Zwischenordner"
 
 _reset_opts
 w2u_parse_args "rsync://10.0.0.1/e" "$_Tmp/ziel"
@@ -552,19 +553,20 @@ w2u_parse_args "rsync://10.0.0.1:8873/e/Daten/Archiv" "$_Tmp/ziel" 2> "$_Tmp/hin
 _Out="$(cat "$_Tmp/hinweis.txt")"
 t_assert_eq "rsync://10.0.0.1:8873/e" "$_ParSrc" "Port bleibt in der Modulwurzel erhalten"
 t_assert_eq "Daten/Archiv" "$_SrcPrefix" "mehrstufiger Praefix erkannt"
-t_assert_eq "einstroemig" "$_ParMode" "tieferer Unterpfad: Kuerzung geht nicht auf, also einstroemig"
-# Der Ratschlag in dieser Meldung muss zur Tiefe des Praefixes passen. Vor dem
-# Fix nannte er '<ziel>' - also genau den Aufruf, der gerade abgelehnt wurde,
-# und der Anwender landete beim zweiten Versuch wieder einstroemig (in Task 12
-# gegen einen echten Daemon nachgemessen). Geprueft wird deshalb der
-# Zwischenpfad im Vorschlag UND, dass dort kein "/." steht (die naheliegende
-# dirname-Loesung liefert fuer ein einsegmentiges Praefix genau das).
-t_assert_contains "$_Out" "<ziel>/Daten" "mehrstufiges Praefix: der Vorschlag nimmt den Zwischenpfad mit"
-_HatPunkt=nein
+# Issue #7: Ziel ist IMMER <ziel>/NAME, auch bei tiefem Praefix - parallel ueber
+# einen Zwischenordner neben dem Ziel, nicht mehr einstroemig.
+t_assert_eq "parallel" "$_ParMode" "tieferer Unterpfad, Ziel ohne Zwischenpfad: parallel ueber Zwischenordner"
+t_assert_eq "1" "$_Stage" "tieferer Unterpfad: Zwischenordner wird benutzt"
+t_assert_eq "$_Tmp/ziel/.w2u-stage-Archiv" "$_ParDst" "Worker schreiben in den Zwischenordner"
+t_assert_eq "$_Tmp/ziel/.w2u-stage-Archiv" "$_StageDir" "Zwischenordner liegt neben dem Ziel"
+t_assert_eq "$_Tmp/ziel/.w2u-stage-Archiv/Daten/Archiv" "$_StageLeaf" "Blatt des Zwischenordners traegt den ganzen Praefix"
+t_assert_eq "$_Tmp/ziel/.w2u-stage-Archiv.lock" "$_StageLock" "Sperre liegt neben dem Zwischenordner"
+t_assert_eq "$_Tmp/ziel/Archiv" "$_DstRoot" "Ziel bleibt <ziel>/NAME"
+_HatEin=nein
 case "$_Out" in
-    *"<ziel>/."*) _HatPunkt=ja ;;
+    *EINSTROEMIG*) _HatEin=ja ;;
 esac
-t_assert_eq "nein" "$_HatPunkt" "der Vorschlag enthaelt kein '<ziel>/.'"
+t_assert_eq "nein" "$_HatEin" "tieferer Unterpfad: keine EINSTROEMIG-Warnung mehr"
 
 _reset_opts
 # Auch hier in eine Datei statt in eine Substitution. Vorher stand hier ein
@@ -575,6 +577,7 @@ _reset_opts
 w2u_parse_args "rsync://10.0.0.1/e/Archiv/" "$_Tmp/ziel" 2> "$_Tmp/hinweis.txt"
 _Out="$(cat "$_Tmp/hinweis.txt")"
 t_assert_eq "einstroemig" "$_ParMode" "Quelle MIT Schraegstrich: Kuerzung geht nicht auf"
+t_assert_eq "0" "$_Stage" "Quelle MIT Schraegstrich: kein Zwischenordner (das Ziel gehoert dem Anwender)"
 t_assert_contains "$_Out" "EINSTROEMIG" "und der Anwender erfaehrt es SOFORT, nicht erst am Ende"
 t_assert_contains "$_Out" "OHNE abschliessenden Schraegstrich" "die Meldung sagt auch, wie man volle Parallelitaet bekommt"
 # Einsegmentiges Praefix: hier IST '<ziel>' der richtige Rat (nachgemessen),
@@ -585,17 +588,20 @@ _reset_opts
 w2u_parse_args "rsync://10.0.0.1/e/Archiv/" "$_Tmp/ziel/Archiv" 2>/dev/null
 t_assert_eq "parallel" "$_ParMode" "Schraegstrich-Form mit spiegelndem Ziel bleibt parallel"
 t_assert_eq "$_Tmp/ziel" "$_ParDst" "und _ParDst ist das gekuerzte Ziel"
+t_assert_eq "0" "$_Stage" "spiegelndes Ziel: kein Zwischenordner noetig"
 
 _reset_opts
 w2u_parse_args "rsync://10.0.0.1//e//Archiv" "$_Tmp/ziel"
 t_assert_eq "rsync://10.0.0.1/e" "$_ParSrc" "doppelte Schraegstriche in der URL werden zusammengezogen"
 t_assert_eq "Archiv" "$_SrcPrefix" "... und verfaelschen den Praefix nicht"
 _reset_opts
+# Einstroemig ist seit Issue #7 nur noch die Schraegstrich-Form mit nicht
+# spiegelndem Ziel - deshalb stehen die drei Aufrufe unten MIT Schraegstrich.
 
 # Einstroemig + fehlende Beweisschicht: dieselbe Klasse wie Ruling 5, nur mit
 # der AUFRUFFORM als zweitem Faktor. Ohne Chunk-Buchfuehrung traegt nur noch
 # der Dateizahl-Vergleich - faellt der auch weg, kann der Lauf nur FAIL melden.
-_Out="$(bash "$_Root/pull.sh" --no-verify "rsync://10.0.0.1/e/Daten/Archiv" /tmp 2>&1)"; _Rc=$?
+_Out="$(bash "$_Root/pull.sh" --no-verify "rsync://10.0.0.1/e/Daten/Archiv/" /tmp 2>&1)"; _Rc=$?
 t_assert_rc 1 "$_Rc" "einstroemig + --no-verify wird abgelehnt"
 t_assert_contains "$_Out" "einstroemig" "die Ablehnung nennt die Aufrufform"
 
@@ -605,7 +611,7 @@ t_assert_contains "$_Out" "einstroemig" "die Ablehnung nennt die Aufrufform"
 # dass es GAR KEINEN Lauf gab: kein Abschlussbericht in der Ausgabe.
 mkdir -p "$_Tmp/dst-ein-ex/Archiv"
 printf 'inhalt\n' > "$_Tmp/dst-ein-ex/Archiv/datei.txt"
-_Out="$(bash "$_Root/pull.sh" --exclude-from "$_Tmp/ex.txt" --rsync "$_Fake" "rsync://10.0.0.1/e/Daten/Archiv" "$_Tmp/dst-ein-ex" 2>&1)"; _Rc=$?
+_Out="$(bash "$_Root/pull.sh" --exclude-from "$_Tmp/ex.txt" --rsync "$_Fake" "rsync://10.0.0.1/e/Daten/Archiv/" "$_Tmp/dst-ein-ex" 2>&1)"; _Rc=$?
 t_assert_rc 1 "$_Rc" "einstroemig + --exclude-from wird abgelehnt"
 t_assert_contains "$_Out" "einstroemig" "die Ablehnung nennt die Aufrufform"
 case "$_Out" in
@@ -617,7 +623,7 @@ t_assert_eq "nein" "$_Has" "und zwar SOFORT - es wurde nicht erst geprueft und d
 # --verify-only ist von der Aufrufform unabhaengig - es uebertraegt ohnehin
 # nichts. Diese Kombination darf NICHT abgelehnt werden.
 _reset_opts
-w2u_parse_args --verify-only "rsync://10.0.0.1/e/Daten/Archiv" /tmp 2>/dev/null
+w2u_parse_args --verify-only "rsync://10.0.0.1/e/Daten/Archiv/" /tmp 2>/dev/null
 t_assert_eq "1" "$_VerifyOnly" "--verify-only bleibt auch in der einstroemigen Aufrufform erlaubt"
 _reset_opts
 

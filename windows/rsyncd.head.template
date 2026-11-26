@@ -1,5 +1,5 @@
 # Kopf der rsyncd.conf, die START-RSYNC-SERVER.cmd erzeugt. Der Platzhalter in
-# der letzten Zeile wird durch die lokalen /24-Subnetze der Maschine ersetzt.
+# der letzten Zeile wird durch 0.0.0.0/0 ersetzt (jeder darf lesen, Issue #8).
 # Diese Datei ist KEINE Kopie fuer den Test: tests/test_rsyncd_conf.sh baut die
 # Config aus genau dieser Datei, sonst prueft er nicht das Ausgelieferte.
 # max connections und lock file gehoeren ZWINGEND zusammen (Spec 2.5) - ohne

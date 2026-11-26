@@ -50,13 +50,14 @@ rsync rsync://<WINDOWS-IP>/e/        # was liegt auf E:?
 Dann holen:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/7onnie/win2unix/main/pull.sh)" -- \
-     rsync://<WINDOWS-IP>/e/Archiv /opt/data/files
+curl -fsSL -o /tmp/pull.sh https://raw.githubusercontent.com/7onnie/win2unix/main/pull.sh
+bash /tmp/pull.sh rsync://<WINDOWS-IP>/e/Archiv /opt/data/files
 ```
 
 **Nicht `curl … | bash` verwenden.** Dabei ist die Standardeingabe der Skript-Stream selbst, und
-die internen Dateilisten des Werkzeugs würden den restlichen Skriptcode lesen. Die Form mit
-`bash -c "$(…)" --` hat diese Falle nicht.
+die internen Dateilisten des Werkzeugs würden den restlichen Skriptcode lesen. Ebenfalls **nicht**
+die Form `bash -c "$(curl …)"`: `pull.sh` ist größer als die 128 KB, die Linux einem einzelnen
+Argument erlaubt, und scheitert dort mit „Argumentliste ist zu lang".
 
 Bricht der Transfer ab — Netzwerk, Strom, versehentlich geschlossenes Fenster, Ctrl-C —, einfach
 **denselben Befehl erneut ausführen**. Es wird nur geholt, was fehlt; bereits übertragene Dateien
@@ -69,41 +70,48 @@ Homebrew-rsync wird bevorzugt, wenn es liegt; `--rsync PFAD` erzwingt ein bestim
 `cut`, `head`, `tail`, `tr`, `basename`, `mktemp`, optional `pkill`. Auf macOS und jedem
 Linux-System ist das vorhanden; die BSD-Varianten reichen (`awk` ohne Intervall-Quantoren, bash 3.2).
 
-### Die Form des Zielpfads entscheidet über die Parallelität
+### Wohin der Ordner kommt
 
-Die parallele Phase kann technisch nur die **Modulwurzel** ansprechen (`--files-from` gegen einen
-rsync-Daemon funktioniert ausschließlich so — nachgemessen). Sie hängt die modul-relativen Pfade
-darunter an. Daraus folgt genau eine Regel:
-
-> Der entstehende Zielpfad muss auf dem **gesamten** Pfad enden, der die Quelle unterhalb des
-> Moduls hat.
-
-Für den Normalfall — ein Ordner direkt unter dem Laufwerk — heißt das schlicht: **Quelle ohne
-Schrägstrich am Ende**, ihr letzter Pfadteil bildet den Zielordner.
+Das Ziel ist immer `<ziel>/<ordnername>`, egal wie tief der Ordner auf Windows liegt. Der
+Pfad davor taucht im Ziel nicht auf:
 
 ```bash
-pull.sh rsync://<IP>/e/Archiv /ziel      # -> /ziel/Archiv, volle Parallelität
-pull.sh rsync://<IP>/e/Archiv /ziel/     # dasselbe, Schrägstriche am ZIEL sind egal
-pull.sh rsync://<IP>/e/Archiv/ /ziel     # -> /ziel, EINSTROEMIG (siehe unten)
-pull.sh rsync://<IP>/e /ziel             # -> /ziel/e, ganzes Laufwerk, immer parallel
+bash /tmp/pull.sh rsync://<IP>/f/Konvertierung/Albis/AlbisWin/BRIEFE /opt/data/files
+# -> /opt/data/files/BRIEFE, parallel
 ```
 
-Liegt die Quelle **tiefer** unter dem Modul, muss das Ziel den Zwischenpfad mitbringen:
+Das angegebene Zielverzeichnis (`/opt/data/files`) muss existieren, sonst bricht der Lauf mit
+`Zielverzeichnis existiert nicht` ab. `<ordnername>` legt `pull.sh` selbst an.
 
-```bash
-mkdir -p /ziel/Daten                                # nötig: siehe unten
-pull.sh rsync://<IP>/e/Daten/Archiv /ziel/Daten     # -> /ziel/Daten/Archiv, parallel
-pull.sh rsync://<IP>/e/Daten/Archiv /ziel           # -> /ziel/Archiv, EINSTROEMIG
-```
+**Einzige Ausnahme: Quelle mit Schrägstrich am Ende.** `…/BRIEFE/` schreibt den *Inhalt*
+direkt ins Ziel. Das läuft mit einem einzelnen rsync-Prozess, angesagt mit dem Wort
+`EINSTROEMIG`: vollständig und verifiziert, aber langsamer. Für viele kleine Dateien die Form
+ohne Schrägstrich nehmen.
 
-Das `mkdir -p` ist keine Dekoration: **das angegebene Zielverzeichnis muss existieren**, sonst
-bricht der Lauf mit `Zielverzeichnis existiert nicht` ab. Nur die Ebenen *darunter* legt `pull.sh`
-selbst an.
+#### Der Zwischenordner `.w2u-stage-<ordnername>`
 
-Passt die Kürzung nicht auf, überträgt ein einzelner rsync-Prozess. Der Lauf ist trotzdem
-vollständig und wird verifiziert, dauert aber deutlich länger — und das Werkzeug **sagt es an**,
-mit dem Wort `EINSTROEMIG` und dem Zielpfad, an dem es scheitert (`… endet nicht auf
-'/Daten/Archiv'`). Ein stiller Rückfall wäre dieselbe Fehlerklasse wie ein stiller Datenverlust.
+Technischer Hintergrund: Die parallele Phase kann nur die **Modulwurzel** ansprechen
+(`--files-from` gegen einen rsync-Daemon funktioniert ausschließlich so, nachgemessen). rsync
+legt deshalb den ganzen Pfad ab Laufwerkswurzel an. `pull.sh` benennt `<ziel>/BRIEFE` dafür
+nur für die Dauer der parallelen Phase nach
+`<ziel>/.w2u-stage-BRIEFE/Konvertierung/Albis/AlbisWin/BRIEFE` um und danach zurück. Das ist
+ein Umbenennen auf derselben Platte und dauert keine Sekunde. Prüfung und Bericht laufen auf
+`<ziel>/BRIEFE`.
+
+- **Nach Ctrl-C oder Absturz** liegt der Bestand eventuell im Zwischenordner. Die Meldung
+  sagt das. **Denselben Befehl erneut ausführen**: Er holt den Bestand zurück und setzt fort.
+- **Zwei Läufe auf dasselbe Ziel** verhindert eine Sperre `<ziel>/.w2u-stage-BRIEFE.lock`.
+  Stammt sie von einem Prozess, der nicht mehr läuft, übernimmt der nächste Lauf sie. Nach
+  einem `kill -9` laufen allerdings oft noch dessen `xargs`/`rsync` weiter und schreiben in den
+  Zwischenordner. Dann bricht der Lauf ab, nennt deren PIDs und fasst nichts an. Warten, bis sie
+  fertig sind, oder sie mit `kill` beenden, und denselben Befehl wiederholen.
+- **Ist `<ziel>/BRIEFE` ein Symlink**, wird er nicht umbenannt. Der Transfer läuft
+  einströmig durch den Link, angesagt.
+- **Liegt Inhalt im Zwischenordner UND in `<ziel>/BRIEFE`**, bricht der Lauf ab und fasst
+  nichts an. Das passiert nur nach Handarbeit zwischen zwei Läufen. Beide Bestände ansehen,
+  von Hand zusammenführen, den Zwischenordner löschen, neu starten.
+- **Ist `<ziel>/BRIEFE` ein eigener Einhängepunkt** (andere Platte als `<ziel>`), ginge das
+  Umbenennen nur als Kopie. Dann läuft der Transfer einströmig, angesagt.
 
 ### Ohne Skript
 
@@ -225,14 +233,13 @@ Flaschenhals machen, also genau das kaputtmachen, wofür dieses Werkzeug existie
 Abgesichert ist es durch drei Dinge:
 
 - `read only` in jedem Modul — es lässt sich nichts auf die Quelle schreiben,
-- `hosts allow` auf die lokalen /24-Subnetze der Maschine,
 - der Server läuft nur, solange das Fenster offen ist.
 
-Eine Einschränkung an der zweiten Zeile, die man wissen muss: erkennt das Skript **keine**
-IPv4-Adresse, setzt es `hosts allow = 0.0.0.0/0` — dann darf jeder lesen. Das Fenster sagt es
-(`[!] Keine IPv4-Adresse erkannt`), und es steht auch in der erzeugten `rsyncd.conf`. Ebenso
-liegt die Grenze bei /24: wer im Netz mit /16 arbeitet, korrigiert die Zeile in `rsyncd.conf`
-und startet neu.
+`hosts allow` steht bewusst auf `0.0.0.0/0`: jeder, der Port 873 erreicht, darf lesen. Früher
+waren es die lokalen /24-Netze der Maschine — das hat im ersten Ernstfall den Client ausgesperrt,
+der die Daten holen sollte. Wer es enger will, ändert die Zeile in der erzeugten `rsyncd.conf`.
+Der Daemon liest die Datei bei jeder Verbindung neu, ein **Neustart ist nicht nötig — und
+schädlich**: das Skript erzeugt die Datei beim Start neu.
 
 Sind die Daten schutzbedürftig, gehört der Transfer in ein eigenes Netzsegment oder direkt an ein
 Crossover-Kabel zwischen die beiden Rechner. Das ist eine Betriebs-, keine Skript-Entscheidung.
