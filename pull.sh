@@ -741,7 +741,9 @@ w2u_run_list() {
 # fehlgeschlagenes du den Lauf abreissen.
 w2u_dst_kb() {
     local _Kb
-    _Kb="$(du -sk "$_DstRoot" 2>/dev/null | awk 'NR == 1 { print $1 }')" || _Kb=""
+    # Waehrend der parallelen Phase liegt der Bestand im Zwischenordner
+    # (_WorkRoot, Issue #7) - unter _DstRoot gibt es dann nichts zu messen.
+    _Kb="$(du -sk "${_WorkRoot:-$_DstRoot}" 2>/dev/null | awk 'NR == 1 { print $1 }')" || _Kb=""
     case "$_Kb" in
         ''|*[!0-9]*) _Kb="" ;;
     esac
@@ -2244,6 +2246,140 @@ w2u_abs_path() {
 
 # Preflight (Spec 5.2). Alles, was den Lauf strukturell unmoeglich macht, wird
 # HIER laut - nicht nach der ersten Stunde Uebertragung.
+# ---- Zwischenordner (Issue #7) ---------------------------------------------
+# Herleitung bei _Stage im Kopf. Fuenf Funktionen, in der Reihenfolge des
+# Ablaufs: Sperre und Aufraeumen im Preflight, Hinein und Heraus um die
+# parallele Phase, Wegraeumen leerer Reste.
+#
+# Leitlinie fuer alle fuenf: NIE zusammenfuehren, NIE loeschen, was Inhalt hat.
+# Im Zweifel abbrechen und beide Pfade nennen - ein Abbruch kostet einen
+# Handgriff, ein falsch zusammengefuehrter Bestand kostet Daten, und das faellt
+# erst auf, wenn die Quelle schon verschrottet ist.
+
+# Geraetenummer eines Pfads, oder LEER, wenn sie sich nicht ermitteln laesst.
+# GNU: "stat -c %d", BSD: "stat -f %d" - in DIESER Reihenfolge, weil GNU-stat
+# "-f" als "Dateisystem-Status" versteht und dann etwas ganz anderes liefert.
+w2u_dev_of() {
+    local _Dev=""
+    _Dev="$(stat -c %d "$1" 2>/dev/null)" || _Dev=""
+    case "$_Dev" in
+        ''|*[!0-9]*)
+            _Dev="$(stat -f %d "$1" 2>/dev/null)" || _Dev=""
+            ;;
+    esac
+    case "$_Dev" in
+        ''|*[!0-9]*) _Dev="" ;;
+    esac
+    printf '%s\n' "$_Dev"
+    return 0
+}
+
+# Sperre gegen zwei Laeufe auf dasselbe Ziel: zwei Laeufe wuerden sich den
+# Bestand gegenseitig in den Zwischenordner und wieder heraus schieben.
+# "mkdir" ist die einzige atomare Pruefe-und-setze-Operation, die bash 3.2 auf
+# BSD und GNU gleich hat (flock gibt es auf macOS nicht).
+# Eine Sperre, deren Prozess nicht mehr lebt, wird UEBERNOMMEN: sonst blockierte
+# genau der Absturz (kill -9, Strom), nach dem fortgesetzt werden soll.
+w2u_stage_lock() {
+    local _Pid=""
+    [ "$_Stage" -eq 1 ] || return 0
+    if ! mkdir "$_StageLock" 2>/dev/null; then
+        [ -d "$_StageLock" ] || w2u_die "Sperre nicht anlegbar: $_StageLock"
+        _Pid="$(cat "$_StageLock/pid" 2>/dev/null)" || _Pid=""
+        case "$_Pid" in
+            ''|*[!0-9]*) _Pid="" ;;
+        esac
+        if [ -n "$_Pid" ] && kill -0 "$_Pid" 2>/dev/null; then
+            w2u_die "Ein anderer Lauf (PID $_Pid) arbeitet schon auf $_DstRoot (Sperre $_StageLock). Dessen Ende abwarten - zwei Laeufe auf dasselbe Ziel schoeben sich den Bestand gegenseitig weg."
+        fi
+        w2u_warn "uebernehme verwaiste Sperre $_StageLock (Prozess ${_Pid:-unbekannt} laeuft nicht mehr)"
+    fi
+    printf '%s\n' "$$" > "$_StageLock/pid" || w2u_die "Sperre nicht beschreibbar: $_StageLock/pid"
+    _StageLockOwned=1
+}
+
+# Entfernt die leere Kette vom Elternordner des Blatts bis einschliesslich
+# _StageDir. rmdir loescht nur Leeres - was Inhalt hat, bleibt mit Warnung.
+w2u_stage_prune() {
+    local _Dir
+    _Dir="${_StageLeaf%/*}"
+    while :; do
+        rmdir "$_Dir" 2>/dev/null || break
+        [ "$_Dir" = "$_StageDir" ] && break
+        _Dir="${_Dir%/*}"
+    done
+    if [ -e "$_StageDir" ]; then
+        w2u_warn "Zwischenordner ist nicht leer und bleibt liegen: $_StageDir"
+    fi
+    return 0
+}
+
+# Ein abgebrochener Lauf (Ctrl-C, kill -9, Strom) hinterlaesst den Bestand im
+# Zwischenordner. Zurueckgeholt wird nur, wenn das Ziel fehlt oder ein LEERES
+# Verzeichnis ist (z.B. von "mkdir -p"). Haben beide Inhalt: Abbruch, nichts
+# wird angefasst.
+w2u_stage_recover() {
+    [ "$_Stage" -eq 1 ] || return 0
+    [ -e "$_StageLeaf" ] || return 0
+    if [ "$_VerifyOnly" -eq 1 ] || [ "$_DryRun" -eq 1 ]; then
+        w2u_warn "Im Zwischenordner liegt ein Bestand aus einem abgebrochenen Lauf: $_StageLeaf. Dieser Lauf veraendert nichts; ein normaler Lauf mit demselben Aufruf holt ihn nach $_DstRoot zurueck."
+        return 0
+    fi
+    if [ -d "$_DstRoot" ] && [ ! -L "$_DstRoot" ] && [ -z "$(ls -A "$_DstRoot" 2>/dev/null)" ]; then
+        rmdir "$_DstRoot" || w2u_die "leeres Ziel $_DstRoot liess sich nicht entfernen - der Bestand bleibt im Zwischenordner $_StageLeaf"
+    fi
+    if [ -e "$_DstRoot" ] || [ -L "$_DstRoot" ]; then
+        w2u_die "Zwischenordner $_StageLeaf UND Ziel $_DstRoot haben beide Inhalt. Es wird NICHTS zusammengefuehrt oder geloescht. Beide ansehen, von Hand zu einem Bestand machen (der Zwischenordner stammt aus einem abgebrochenen Lauf), den Zwischenordner $_StageDir entfernen und denselben Aufruf wiederholen."
+    fi
+    mv "$_StageLeaf" "$_DstRoot" || w2u_die "Zwischenordner $_StageLeaf liess sich nicht nach $_DstRoot zurueckbenennen - nichts weiter veraendert"
+    w2u_log "Zwischenordner aus einem abgebrochenen Lauf zurueckgeholt: $_StageLeaf -> $_DstRoot"
+    w2u_stage_prune
+}
+
+# Vor der parallelen Phase: <ziel>/NAME in den Zwischenordner umbenennen.
+# rc 1 heisst: es geht nicht, nichts wurde veraendert - der Aufrufer schaltet
+# laut auf einstroemig um. Nur bei GLEICHEM Geraet: "mv" ueber Geraetegrenzen
+# KOPIERT still (und loescht danach), aus einer Sekunde wuerden Stunden, und ein
+# Abbruch mittendrin hinterliesse zwei halbe Bestaende.
+w2u_stage_in() {
+    local _DevDst _DevDir
+    [ ! -e "$_StageLeaf" ] || w2u_die "Zwischenordner existiert schon: $_StageLeaf (haette das Aufraeumen im Preflight erledigen muessen)"
+    _DevDst="$(w2u_dev_of "$_DstRoot")"
+    _DevDir="$(w2u_dev_of "$_DstDir")"
+    if [ -z "$_DevDst" ] || [ "$_DevDst" != "$_DevDir" ]; then
+        w2u_warn "$_DstRoot liegt nicht nachweisbar auf derselben Platte wie $_DstDir (Geraet '${_DevDst:-?}' gegen '${_DevDir:-?}') - umbenennen ginge nur als Kopie"
+        return 1
+    fi
+    if ! mkdir -p "${_StageLeaf%/*}"; then
+        w2u_warn "Zwischenordner nicht anlegbar: ${_StageLeaf%/*}"
+        w2u_stage_prune
+        return 1
+    fi
+    if ! mv "$_DstRoot" "$_StageLeaf"; then
+        w2u_warn "$_DstRoot liess sich nicht nach $_StageLeaf umbenennen"
+        w2u_stage_prune
+        return 1
+    fi
+    _WorkRoot="$_StageLeaf"
+    w2u_log "Zwischenordner fuer die parallele Phase: $_DstRoot -> $_StageLeaf"
+    return 0
+}
+
+# Nach der parallelen Phase: zurueck nach <ziel>/NAME. Existiert das Ziel
+# inzwischen wieder (jemand anderes hat es angelegt), wird NICHT
+# zusammengefuehrt - Abbruch, der Bestand bleibt im Zwischenordner, und der
+# naechste Lauf meldet beide.
+w2u_stage_out() {
+    [ -n "$_WorkRoot" ] || return 0
+    if [ -e "$_DstRoot" ] || [ -L "$_DstRoot" ]; then
+        w2u_die "$_DstRoot ist waehrend der parallelen Phase neu entstanden - der Bestand bleibt in $_StageLeaf, nichts wird zusammengefuehrt"
+    fi
+    mv "$_StageLeaf" "$_DstRoot" || w2u_die "Zwischenordner $_StageLeaf liess sich nicht nach $_DstRoot zurueckbenennen - derselbe Aufruf versucht es erneut"
+    _WorkRoot=""
+    w2u_log "Zwischenordner zurueck: $_StageLeaf -> $_DstRoot"
+    w2u_stage_prune
+}
+
 w2u_preflight() {
     local _Version _VersionAll _Nl _LogAbs _DstAbs _Rc=0
     # _RsyncTimeout war der einzige Zahlen-Regler ohne die case-Pruefung, die
@@ -2394,6 +2530,13 @@ w2u_preflight() {
     [ -w "$_LogDir" ] || w2u_die "Logverzeichnis nicht beschreibbar: $_LogDir"
     w2u_log "Logs: $_LogDir"
 
+    # Sperre und Aufraeumen VOR dem Anlegen: das "mkdir -p" darunter legte
+    # sonst ein leeres Ziel neben einen liegengebliebenen Zwischenordner.
+    if [ "$_VerifyOnly" -eq 0 ] && [ "$_DryRun" -eq 0 ]; then
+        w2u_stage_lock
+    fi
+    w2u_stage_recover
+
     # Angelegt wird nur, wenn wirklich uebertragen wird: ein Trockenlauf, der
     # Verzeichnisse anlegt, ist kein Trockenlauf.
     if [ "$_VerifyOnly" -eq 0 ] && [ "$_DryRun" -eq 0 ]; then
@@ -2504,6 +2647,15 @@ w2u_report_step() {
 # zurueck, und die Meldung verspraeche Logs, die es nicht gibt.
 w2u_cleanup() {
     local _Rc=$? _LogEmpty=0
+    if [ -n "$_WorkRoot" ]; then
+        # Kein Zurueckbenennen hier: es koennen noch rsync-Kinder in den
+        # Zwischenordner schreiben. Der naechste Lauf raeumt auf.
+        printf '[%s] Der Bestand liegt im Zwischenordner %s - derselbe Aufruf holt ihn nach %s zurueck und setzt fort.\n' "$(date '+%H:%M:%S')" "$_StageLeaf" "$_DstRoot" >&2
+    fi
+    if [ "$_StageLockOwned" -eq 1 ]; then
+        rm -f "$_StageLock/pid"
+        rmdir "$_StageLock" 2>/dev/null || true
+    fi
     if [ -n "$_TmpDir" ] && [ -d "$_TmpDir" ]; then
         rm -rf "$_TmpDir"
     fi
@@ -2610,6 +2762,16 @@ main() {
                 || w2u_die "Arbeitsliste konnte nicht kopiert werden"
         fi
 
+        # Erst JETZT umbenennen, nach Zerlegung und Trockenlauf: so kurz wie
+        # moeglich liegt der Bestand im Zwischenordner (Issue #7).
+        if [ "$_Stage" -eq 1 ] && ! w2u_stage_in; then
+            w2u_einstroemig \
+                "der Zwischenordner fuer die parallele Phase liess sich nicht einrichten (Warnung oben)" \
+                "Das Ziel auf dieselbe Platte legen wie das Zielverzeichnis, oder das Ziel auf dem ganzen modul-relativen Pfad enden lassen: 'pull.sh $_SrcRoot/$_SrcPrefix <ziel>/${_SrcPrefix%/*}'."
+        fi
+    fi
+
+    if [ "$_ParMode" = "parallel" ]; then
         mkdir -p "$_TmpDir/chunks"
         w2u_chunk "$_TmpDir/work.par" "$_TmpDir/chunks" "$_PMax" "$_TmpDir/chunks.list"
         w2u_log "parallele Phase: $_ParSrc/ -> $_ParDst/ (Praefix '${_SrcPrefix:-<keiner>}')"
@@ -2622,6 +2784,7 @@ main() {
         _ParKbBefore="$(w2u_dst_kb)"
         w2u_run_all "$_TmpDir/chunks.list"
         _ParKbAfter="$(w2u_dst_kb)"
+        w2u_stage_out
     else
         # Einstroemig: kein Zerlegen, keine Chunks, keine Buchfuehrung - der
         # Sweep unten macht die ganze Arbeit. Beim Parsen ist das bereits
