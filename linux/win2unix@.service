@@ -1,0 +1,26 @@
+# win2unix: ein Transfer als Dienst (Issue #9). Angelegt von install.sh.
+# Instanz = Auftragsname, Auftrag in /etc/win2unix/jobs/%i.conf.
+# Steuern mit "w2u" (TUI) oder "w2u start|stop|restart NAME".
+[Unit]
+Description=win2unix Transfer %i
+After=network-online.target
+Wants=network-online.target
+# Nie aufgeben: ein Transfer ueber Wochen ueberlebt so Netzausfaelle und einen
+# abgeschalteten Windows-Server. Endgueltig stoppt nur Exit 3 (siehe unten).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/opt/win2unix/w2u run %i
+Restart=on-failure
+RestartSec=2min
+# Exit 3 = Einrichtungsfehler oder dreimal FAIL-Urteil: Neuversuch sinnlos.
+RestartPreventExitStatus=3
+# bash -> xargs -> viele rsync: alle gehoeren zur Gruppe und werden beim Stop
+# gemeinsam beendet; pull.sh setzt beim naechsten Start fort.
+KillMode=control-group
+TimeoutStopSec=60
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target
