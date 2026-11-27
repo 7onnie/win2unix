@@ -217,6 +217,23 @@ exit {rc}
         self.run_job()
         self.assertEqual(self.runs()["fail_streak"], "0")
 
+    def test_stop_signal_ends_cleanly(self):
+        # systemctl stop schickt SIGTERM: w2u run reicht es weiter und endet
+        # mit 0 - ein bewusster Stopp ist kein Fehler (sonst "failed").
+        script = self.tmp / "slow-pull.sh"
+        write_exec(script, "#!/bin/sh\ntrap 'exit 130' TERM\nsleep 30 & wait\n")
+        os.environ["W2U_PULL"] = str(script)
+        import threading
+        def term():
+            time.sleep(1.0)
+            os.kill(os.getpid(), signal.SIGTERM)
+        import signal, time
+        t = threading.Thread(target=term)
+        t.start()
+        rc = self.run_job()
+        t.join()
+        self.assertEqual(rc, 0)
+
     def test_bad_name_rejected_in_run(self):
         self.assertEqual(self.w2u.cmd_run("../etc/passwd"), 3)
 
@@ -253,6 +270,9 @@ class TestState(Base):
         self.assertEqual(self.label(), "erledigt")
         self.st(phase="preflight", result="", updated=now)
         self.assertEqual(self.label(), "gestoppt")
+        self.show("j1", ActiveState="failed", SubState="failed", NRestarts=0,
+                  UnitFileState="disabled", ExecMainStatus=1)
+        self.assertEqual(self.label(), "abgebrochen")      # nicht "Einrichtungsfehler"
         self.show("j1", ActiveState="failed", SubState="failed", NRestarts=0,
                   UnitFileState="enabled", ExecMainStatus=3)
         self.assertEqual(self.label(), "Einrichtungsfehler")

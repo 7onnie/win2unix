@@ -305,14 +305,26 @@ def cmd_run(name) -> int:
     # SIGTERM von systemd an das Kind weiterreichen (KillMode=control-group
     # erreicht es ohnehin; so endet auch dieser Prozess sauber).
     proc = subprocess.Popen(cmd)
+    stopped = []
 
     def _forward(sig, _frm):
+        stopped.append(sig)
         try:
             proc.send_signal(sig)
         except ProcessLookupError:
             pass
-    signal.signal(signal.SIGTERM, _forward)
-    rc = proc.wait()
+    old = signal.signal(signal.SIGTERM, _forward)
+    try:
+        rc = proc.wait()
+    finally:
+        signal.signal(signal.SIGTERM, old)
+    if stopped:
+        # Bewusster Stopp (systemctl stop/disable --now): kein Fehler, kein
+        # Urteil. Exit 0, sonst stuende der Dienst als "failed" da.
+        _set_runs(name, last_rc=rc, last_end=int(time.time()))
+        _group_writable(jd)
+        print("w2u run: gestoppt, pull.sh setzt beim naechsten Start fort", flush=True)
+        return 0
 
     result = read_kv(status).get("result", "")
     streak = int(_runs(name).get("fail_streak") or 0)
@@ -364,8 +376,10 @@ def job_state(name) -> dict:
         label = "keine Rückmeldung" if (age is not None and age > STALE_SECS) else "läuft"
     elif active == "activating" or sub == "auto-restart":
         label = "wartet auf Neustart"
-    elif active == "failed" or unit.get("ExecMainStatus") == "3":
+    elif unit.get("ExecMainStatus") == "3" and active in ("failed", "inactive"):
         label = "aufgegeben" if runs.get("given_up") == "1" else "Einrichtungsfehler"
+    elif active == "failed":
+        label = "abgebrochen"
     elif st.get("result") == "PASS":
         label = "erledigt"
     elif not st and not runs:

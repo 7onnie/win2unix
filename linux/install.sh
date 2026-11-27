@@ -73,12 +73,16 @@ mv -f "$_Opt/pull.sh.new" "$_Opt/pull.sh"
 install -m 0755 "$_Here/w2u" "$_Opt/w2u.new"
 mv -f "$_Opt/w2u.new" "$_Opt/w2u"
 ln -sfn "/opt/win2unix/w2u" "$_Bin/w2u"
+# Ausdruecklich 0755: unter sudo gilt oft eine strenge umask (gemessen: 0770),
+# dann kaemen nur root und eine Gruppe an Programm und Auftraege.
+chmod 0755 "$_Opt"
 
 say "Dienst-Vorlage $_Unit"
 install -m 0644 "$_Here/win2unix@.service" "$_Unit"
 
 say "Auftraege $_Etc/jobs (gehoert $_OpUser)"
 mkdir -p "$_Etc/jobs"
+chmod 0755 "$_Etc"
 if [ -z "$_Prefix" ]; then
     chown "$_OpUser:$_OpGroup" "$_Etc/jobs"
 fi
