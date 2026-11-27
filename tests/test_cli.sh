@@ -663,16 +663,17 @@ else
     chmod 500 "$_Tmp/ro2/Daten/Archiv"
     _Out="$(TMPDIR="$_Tmp/tmp-ro2" bash "$_Root/pull.sh" --rsync "$_Fake" "rsync://10.0.0.1/e/Daten/Archiv" "$_Tmp/ro2/Daten" 2>&1 || true)"
     chmod 700 "$_Tmp/ro2/Daten/Archiv"
-    t_assert_contains "$_Out" "EINSTROEMIG" "b) nicht beschreibbares ZIEL schaltet auf einstroemig um"
-    t_assert_contains "$_Out" "nicht beschreibbar" "b) und nennt den Grund"
-    # Der Rat muss zum Grund passen: hier stimmt der Zielpfad bereits, es fehlen
-    # die Rechte - "waehle ein Ziel, das auf den Praefix endet" waere Unsinn.
-    t_assert_contains "$_Out" "es fehlen die Rechte" "b) und einen Rat, der zum Grund passt"
+    # Seit dem Ernstfall-Fix (w2u_fix_perms) repariert pull.sh EIGENE Ordner
+    # ohne Eigentuemer-Rechte, statt auf einen Strom zurueckzufallen - genau
+    # so lag ThumbCache (d---r-x---) im Ernstfall da. Der Rueckfall bleibt fuer
+    # FREMDE Ordner, die chmod nicht aendern darf; als Nicht-root hier nicht
+    # nachstellbar.
     case "$_Out" in
-        *"OHNE abschliessenden Schraegstrich"*) _Has=ja ;;
-        *)                                      _Has=nein ;;
+        *EINSTROEMIG*) _Has=ja ;;
+        *)             _Has=nein ;;
     esac
-    t_assert_eq "nein" "$_Has" "b) und NICHT den Rat aus dem anderen Fall"
+    t_assert_eq "nein" "$_Has" "b) eigenes, schreibgeschuetztes ZIEL wird repariert - kein Rueckfall"
+    t_assert_contains "$_Out" "parallele Phase" "b) die parallele Phase laeuft"
 fi
 chmod 700 "$_Tmp/ro"
 

@@ -308,7 +308,10 @@ else
     chmod 555 "$_Dst4/nurlesen/Daten/SonoGDT"
     _Out="$(bash "$_Root/pull.sh" --jobs 4 "$D_Url/Daten/SonoGDT" "$_Dst4/nurlesen/Daten" 2>&1)"
     chmod 755 "$_Dst4/nurlesen/Daten/SonoGDT"
-    t_assert_contains "$_Out" "EINSTROEMIG" "nicht beschreibbares ZIEL: der Rueckfall kommt weiterhin - und wird angesagt"
+    # Seit w2u_fix_perms wird ein EIGENES schreibgeschuetztes Ziel repariert
+    # (Ernstfall ThumbCache). Der Rueckfall gilt nur noch fuer fremde Ordner.
+    e_assert_absent "$_Out" "EINSTROEMIG" "eigenes schreibgeschuetztes ZIEL wird repariert, kein Rueckfall"
+    t_assert_contains "$_Out" "ERGEBNIS: PASS" "eigenes schreibgeschuetztes ZIEL: PASS"
 fi
 
 t_summary

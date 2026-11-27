@@ -121,6 +121,11 @@ _StageLeaf=""         # _StageDir/<praefix> - hier liegt der Bestand waehrend de
 _StageLock=""         # _StageDir.lock - Sperre gegen zwei Laeufe auf dasselbe Ziel
 _StageLockOwned=0     # 1 = dieser Lauf haelt die Sperre (nur dann wird sie freigegeben)
 _WorkRoot=""          # wo der Bestand GERADE liegt, wenn nicht unter _DstRoot
+# Zusatz-Argumente aus dem ersten Ernstfall (w2u_rsync_extra). Skalare statt
+# Array, weil die Worker sie per export ueber xargs erben.
+_XChmod=""            # --chmod=Du+rwx,Fu+rw an Worker und Sweep
+_XProto=""            # --protocol=30 an JEDEN Aufruf gegen den Daemon (GNU >= 31)
+_RsyncExtra=( )       # beides zusammen, fuer Tests und Logzeile
 _ParMode="parallel"   # Vorgabe bewusst "parallel": w2u_report wertet eine
                       # FEHLENDE Chunkliste nur im einstroemigen Lauf als
                       # zulaessig. Die strenge Vorgabe heisst also, dass ein
@@ -240,6 +245,55 @@ w2u_find_rsync() {
     return 0
 }
 
+# Zwei Zusatz-Argumente, beide aus dem ersten Ernstfall (2026-11-27):
+#
+# --chmod=Du+rwx,Fu+rw: Cygwin bildet Windows-ACLs auf Modi wie d---r-x---
+#   ab. rsync ohne -p uebernimmt die Quellrechte fuer NEUE Eintraege - danach
+#   durfte der Eigentuemer im eigenen Ordner nichts mehr anlegen (mkdir ...
+#   Permission denied, Chunks mit rc 23), und find zaehlte nicht hinein
+#   ("lokal ?", FAIL). Nur u+: Gruppe und Rest bleiben, wie die Quelle sie hat.
+# --protocol=30: rsync 3.4.1 (Cygwin, Windows-Seite) schickte eine Datei mit
+#   negativen Nanosekunden; rsync 3.5.0 als Empfaenger bricht daran mit
+#   "wire value modtime_nsec out of range" (rc 2) ab - JEDER Lauf, der diese
+#   Datei anfasst, auch Verify und Zaehlung. Protokoll 30 uebertraegt keine
+#   Nanosekunden. Verglichen wird ohnehin sekundengenau. Nur fuer GNU rsync ab
+#   Protokoll 31: openrsync spricht 29 und kennt die Option nicht sicher.
+w2u_rsync_extra() {
+    local _Ver _Proto=""
+    _Ver="$("$_RsyncBin" --version 2>&1)" || _Ver=""
+    _XChmod="--chmod=Du+rwx,Fu+rw"
+    _XProto=""
+    case "$_Ver" in
+        *openrsync*) ;;
+        *)
+            _Proto="$(printf '%s\n' "$_Ver" | sed -n 's/.*protocol version \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+            case "$_Proto" in
+                ''|*[!0-9]*) ;;
+                *)
+                    if [ "$_Proto" -ge 31 ]; then
+                        _XProto="--protocol=30"
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+    _RsyncExtra=( "$_XChmod" )
+    [ -n "$_XProto" ] && _RsyncExtra=( "${_RsyncExtra[@]}" "$_XProto" )
+    return 0
+}
+
+# Ordner im Ziel, denen der Eigentuemer Rechte fehlen (aus einem Lauf vor dem
+# --chmod-Fix), wieder betretbar machen. Ohne das scheitern rsync-mkdir und
+# die Zaehlung weiter an genau diesen Ordnern. Nur Ordner ohne volle
+# Eigentuemer-Rechte werden angefasst, Dateien nur ohne u+rw.
+w2u_fix_perms() {
+    local _Dir="$1"
+    [ -d "$_Dir" ] || return 0
+    find -H "$_Dir" -type d ! -perm -u=rwx -exec chmod u+rwx {} + 2>/dev/null || true
+    find -H "$_Dir" -type f ! -perm -u=rw -exec chmod u+rw {} + 2>/dev/null || true
+    return 0
+}
+
 # Listet GENAU EINE Ebene unterhalb von <basis>/<rel>.
 #
 # Der rsync-Exit-Code darf hier nicht verworfen werden. Ein nicht lesbares
@@ -269,7 +323,7 @@ w2u_remote_list() {
     else
         _Url="$_Base/"
     fi
-    _Raw="$("$_RsyncBin" --list-only -d "$_Url" 2>&1)" || _Rc=$?
+    _Raw="$("$_RsyncBin" ${_XProto:+"$_XProto"} --list-only -d "$_Url" 2>&1)" || _Rc=$?
     if [ "$_Rc" -ne 0 ]; then
         w2u_die "rsync-Listing fehlgeschlagen fuer $_Url (rc $_Rc): $_Raw"
     fi
@@ -576,6 +630,8 @@ w2u_run_chunk() {
     # steht und deren Ausgabe niemand auswertet, ist ein Versprechen an den
     # naechsten Leser, das nicht gehalten wird.
     _Args=( -rlt -W --partial --numeric-ids "--timeout=$_RsyncTimeout" )
+    [ -n "$_XChmod" ] && _Args=( "${_Args[@]}" "$_XChmod" )
+    [ -n "$_XProto" ] && _Args=( "${_Args[@]}" "$_XProto" )
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     _Args=( "${_Args[@]}" "--files-from=$_ChunkFile" )
 
@@ -693,7 +749,7 @@ w2u_run_list() {
     # MODULWURZEL aus (siehe w2u_run_chunk). Fehlten sie in dieser Liste, waeren
     # sie im Kind leer - dort gilt kein "set -u" - und der Guard in
     # w2u_run_chunk laesse jeden Chunk ohne Ergebniszeile scheitern.
-    export _RsyncBin _ParSrc _ParDst _LogDir _ResultFile _MaxRetry _RetryPause _ExcludeFrom _RsyncTimeout
+    export _RsyncBin _ParSrc _ParDst _LogDir _ResultFile _MaxRetry _RetryPause _ExcludeFrom _RsyncTimeout _XChmod _XProto
     export -f w2u_run_chunk w2u_die w2u_log
     # "$0" der Worker-Shell = "w2u-worker:<tmp>": damit steht das TMP-Verzeichnis
     # dieses Laufs im argv von XARGS SELBST (dessen Befehlsvorlage), nicht nur
@@ -1036,6 +1092,8 @@ w2u_run_all() {
 w2u_sweep() {
     local _Args
     _Args=( -rlt -W --partial --numeric-ids "--timeout=$_RsyncTimeout" )
+    [ -n "$_XChmod" ] && _Args=( "${_Args[@]}" "$_XChmod" )
+    [ -n "$_XProto" ] && _Args=( "${_Args[@]}" "$_XProto" )
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" "$_DstRoot/"
 }
@@ -1097,6 +1155,7 @@ w2u_verify() {
         return 1
     fi
     _Args=( -rlt -W -n -i "--timeout=$_RsyncTimeout" )
+    [ -n "$_XProto" ] && _Args=( "${_Args[@]}" "$_XProto" )
     [ "$_DoChecksum" = "1" ] && _Args=( "${_Args[@]}" -c )
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" "$_DstRoot/" > "$_List" 2>&1 || _Rc=$?
@@ -1148,6 +1207,7 @@ w2u_count_remote() {
         return 0
     fi
     _Args=( -r --list-only "--timeout=$_RsyncTimeout" )
+    [ -n "$_XProto" ] && _Args=( "${_Args[@]}" "$_XProto" )
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" > "$_List" 2>/dev/null || _Rc=$?
     # Zwei Zahlen, nicht eine: Dateien ("-") UND ueberhaupt erkannte
@@ -1254,6 +1314,7 @@ w2u_name_diff() {
         return 1
     fi
     _Args=( -r --list-only "--timeout=$_RsyncTimeout" )
+    [ -n "$_XProto" ] && _Args=( "${_Args[@]}" "$_XProto" )
     # Der Ausschluss-Arm ist heute NICHT erreichbar: der einzige Aufrufer steht
     # im else-Zweig hinter "[ -n "$_ExcludeFrom" ]", auf diesem Pfad sind die
     # Ausschluesse also immer leer. Er bleibt trotzdem stehen, weil er zur
@@ -2413,7 +2474,7 @@ w2u_stage_out() {
 }
 
 w2u_preflight() {
-    local _Version _VersionAll _Nl _LogAbs _DstAbs _Rc=0
+    local _Version _VersionAll _Nl _LogAbs _DstAbs _Rc=0 _Probe=""
     # _RsyncTimeout war der einzige Zahlen-Regler ohne die case-Pruefung, die
     # die anderen sechs haben. Er landet als "--timeout=$_RsyncTimeout" im argv
     # von w2u_run_chunk, w2u_sweep, w2u_verify UND w2u_count_remote - deshalb
@@ -2439,6 +2500,8 @@ w2u_preflight() {
     _VersionAll="$("$_RsyncBin" --version 2>&1)" || _VersionAll=""
     _Version="${_VersionAll%%"$_Nl"*}"
     w2u_log "rsync: $_RsyncBin ($_Version)"
+    w2u_rsync_extra
+    w2u_log "Zusatz-Argumente: ${_RsyncExtra[*]}"
     case "$_Version" in
         *openrsync*) w2u_log "openrsync erkannt - kein --info=progress2, kein --iconv (beides unkritisch)" ;;
     esac
@@ -2452,8 +2515,8 @@ w2u_preflight() {
     fi
     [ -z "$_ExcludeFrom" ] || [ -r "$_ExcludeFrom" ] || w2u_die "Ausschlussdatei nicht lesbar: $_ExcludeFrom"
 
-    "$_RsyncBin" --list-only -d "$_SrcUrl/" >/dev/null 2>&1 \
-        || w2u_die "Quelle nicht erreichbar: $_SrcUrl (laeuft START-RSYNC-SERVER.cmd? Port 873 offen?)"
+    _Probe="$("$_RsyncBin" ${_XProto:+"$_XProto"} --list-only -d "$_SrcUrl/" 2>&1 >/dev/null)" \
+        || w2u_die "Quelle nicht erreichbar: $_SrcUrl (laeuft START-RSYNC-SERVER.cmd? Port 873 offen?) - rsync sagte: $(printf '%s' "$_Probe" | tail -n 3 | tr '\n' ' ')"
 
     # Verankerte Ausschlussmuster werden ABGELEHNT, nicht
     # umgeschrieben.
@@ -2571,6 +2634,13 @@ w2u_preflight() {
 
     # Angelegt wird nur, wenn wirklich uebertragen wird: ein Trockenlauf, der
     # Verzeichnisse anlegt, ist kein Trockenlauf.
+    # Rechte aus einem Lauf vor dem --chmod-Fix reparieren (siehe
+    # w2u_fix_perms) - vor jedem Transfer und vor jeder Zaehlung, auch im
+    # --verify-only-Lauf: sonst bleibt "lokal ?" das Urteil.
+    if [ "$_DryRun" -eq 0 ]; then
+        w2u_fix_perms "$_DstRoot"
+    fi
+
     if [ "$_VerifyOnly" -eq 0 ] && [ "$_DryRun" -eq 0 ]; then
         mkdir -p "$_DstRoot"
         # Geprueft wird, wo die Worker WIRKLICH schreiben - und das ist
