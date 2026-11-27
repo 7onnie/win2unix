@@ -48,7 +48,7 @@
 #                main                           der Ablauf, und nur er
 # ---------------------------------------------------------------------------
 
-W2U_VERSION="0.2.0"
+W2U_VERSION="0.3.0"
 
 # ---------- Konfiguration (Zero-Touch: alles hier, keine Rueckfragen) ----------
 _JobCnt=0              # 0 = Auto-Messung (Spec 5.4)
@@ -215,6 +215,10 @@ Optionen:
   --no-verify         Verifikation ueberspringen (nicht empfohlen)
   --checksum          Verifikation zusaetzlich mit Pruefsummen (langsam)
   --dry-run           nur zeigen, was passieren wuerde
+  --chown U:G         Besitzer beim Schreiben, nach PASS chown -R (nur root, GNU rsync)
+  --neu-zuerst TAGE   Dateien der letzten TAGE Tage zuerst (0 = aus)
+  --status-file PFAD  Phase/Fortschritt/Urteil als key=value
+  Exit: 0 PASS, 1 FAIL oder Abbruch (erneut versuchen), 3 Einrichtungsfehler
   --version
 EOF
 }
