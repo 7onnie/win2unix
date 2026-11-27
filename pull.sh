@@ -120,6 +120,7 @@ _StageDir=""          # <ziel>/.w2u-stage-NAME
 _StageLeaf=""         # _StageDir/<praefix> - hier liegt der Bestand waehrend der Phase
 _StageLock=""         # _StageDir.lock - Sperre gegen zwei Laeufe auf dasselbe Ziel
 _StageLockOwned=0     # 1 = dieser Lauf haelt die Sperre (nur dann wird sie freigegeben)
+_StageLink=""         # relativer Linkinhalt <ziel>/NAME -> .w2u-stage-NAME/<praefix>
 _WorkRoot=""          # wo der Bestand GERADE liegt, wenn nicht unter _DstRoot
 # Zusatz-Argumente aus dem ersten Ernstfall (w2u_rsync_extra). Skalare statt
 # Array, weil die Worker sie per export ueber xargs erben.
@@ -2235,6 +2236,7 @@ w2u_parse_args() {
     _StageDir=""
     _StageLeaf=""
     _StageLock=""
+    _StageLink=""
     if [ -z "$_SrcPrefix" ]; then
         _ParDst="$_DstRoot"
         _ParMode="parallel"
@@ -2255,6 +2257,7 @@ w2u_parse_args() {
         [ "$_DstDir" = "/" ] && _StageDir="/.w2u-stage-$_Base"
         _StageLeaf="$_StageDir/$_SrcPrefix"
         _StageLock="$_StageDir.lock"
+        _StageLink=".w2u-stage-$_Base/$_SrcPrefix"
         _ParDst="$_StageDir"
         _ParMode="parallel"
     else
@@ -2559,6 +2562,12 @@ w2u_stage_recover() {
         w2u_warn "Im Zwischenordner liegt ein Bestand aus einem abgebrochenen Lauf: $_StageLeaf. Dieser Lauf veraendert nichts; ein normaler Lauf mit demselben Aufruf holt ihn nach $_DstRoot zurueck."
         return 0
     fi
+    # Der eigene Link aus der parallelen Phase (w2u_stage_in) zaehlt als "fehlt":
+    # er zeigt genau auf das Blatt, das gleich zurueckbenannt wird. Jeder andere
+    # Symlink bleibt unangetastet und faellt unten in "beide haben Inhalt".
+    if w2u_is_own_link; then
+        rm -f "$_DstRoot" || w2u_die "eigenen Link $_DstRoot nicht entfernbar - der Bestand bleibt im Zwischenordner $_StageLeaf"
+    fi
     if [ -d "$_DstRoot" ] && [ ! -L "$_DstRoot" ] && [ -z "$(ls -A "$_DstRoot" 2>/dev/null)" ]; then
         rmdir "$_DstRoot" || w2u_die "leeres Ziel $_DstRoot liess sich nicht entfernen - der Bestand bleibt im Zwischenordner $_StageLeaf"
     fi
@@ -2602,7 +2611,24 @@ w2u_stage_in() {
     fi
     _WorkRoot="$_StageLeaf"
     w2u_log "Zwischenordner fuer die parallele Phase: $_DstRoot -> $_StageLeaf"
+    # Die Phase dauert im Ernstfall Tage: so lange zeigt <ziel>/NAME per Link
+    # auf das Blatt, die Dateien sind am gewohnten Ort nutzbar. Relativ, damit
+    # er auch stimmt, wenn das Ziel anders eingehaengt wird. Kein Worker und
+    # kein Sweep schreibt je durch ihn (Worker -> _ParDst, Sweep erst nach
+    # w2u_stage_out). Scheitert er, ist das nur ein Komfortverlust.
+    if ln -s "$_StageLink" "$_DstRoot" 2>/dev/null; then
+        w2u_log "waehrend der Phase: $_DstRoot -> $_StageLink (Symlink)"
+    else
+        w2u_warn "Symlink $_DstRoot -> $_StageLink nicht anlegbar - die Dateien liegen bis zum Ende der Phase nur im Zwischenordner"
+    fi
     return 0
+}
+
+# Ist <ziel>/NAME genau der Link, den w2u_stage_in anlegt?
+w2u_is_own_link() {
+    [ -n "$_StageLink" ] || return 1
+    [ -L "$_DstRoot" ] || return 1
+    [ "$(readlink "$_DstRoot" 2>/dev/null)" = "$_StageLink" ]
 }
 
 # Nach der parallelen Phase: zurueck nach <ziel>/NAME. Existiert das Ziel
@@ -2611,6 +2637,9 @@ w2u_stage_in() {
 # naechste Lauf meldet beide.
 w2u_stage_out() {
     [ -n "$_WorkRoot" ] || return 0
+    if w2u_is_own_link; then
+        rm -f "$_DstRoot" || w2u_die "eigenen Link $_DstRoot nicht entfernbar - der Bestand bleibt in $_StageLeaf"
+    fi
     if [ -e "$_DstRoot" ] || [ -L "$_DstRoot" ]; then
         w2u_die "$_DstRoot ist waehrend der parallelen Phase neu entstanden - der Bestand bleibt in $_StageLeaf, nichts wird zusammengefuehrt"
     fi
