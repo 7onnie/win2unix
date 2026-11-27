@@ -136,13 +136,33 @@ t_assert_eq "nein" "$_Has" "beide mit Inhalt: die eigene Sperre ist wieder frei"
 # ---- 5: Sperre -------------------------------------------------------------
 _Z="$_TmpRoot/z5"
 mkdir -p "$_Z/.w2u-stage-BRIEFE.lock"
-echo "$$" > "$_Z/.w2u-stage-BRIEFE.lock/pid"
+# Ein lebender Prozess, der wie ein pull.sh aussieht (argv enthaelt pull.sh).
+bash -c 'sleep 120; :' pull.sh &
+_LivePull=$!
+echo "$_LivePull" > "$_Z/.w2u-stage-BRIEFE.lock/pid"
 _Out="$(bash "$_Root/pull.sh" --jobs 4 "$_Url" "$_Z" 2>&1)"; _Rc=$?
 t_assert_rc 1 "$_Rc" "lebende Sperre: Abbruch"
-t_assert_contains "$_Out" "$$" "lebende Sperre: die Meldung nennt den haltenden Prozess"
-t_assert_eq "$$" "$(cat "$_Z/.w2u-stage-BRIEFE.lock/pid" 2>/dev/null)" "lebende Sperre: fremde Sperre bleibt unangetastet"
+t_assert_contains "$_Out" "$_LivePull" "lebende Sperre: die Meldung nennt den haltenden Prozess"
+t_assert_eq "$_LivePull" "$(cat "$_Z/.w2u-stage-BRIEFE.lock/pid" 2>/dev/null)" "lebende Sperre: fremde Sperre bleibt unangetastet"
 [ -e "$_Z/BRIEFE" ] && _Has=ja || _Has=nein
 t_assert_eq "nein" "$_Has" "lebende Sperre: nichts uebertragen"
+
+kill "$_LivePull" 2>/dev/null
+wait "$_LivePull" 2>/dev/null
+
+# PID-Wiederverwendung nach Reboot (Review-Fund): die PID in der Sperre gehoert
+# jetzt einem fremden, lebenden Prozess (kein pull.sh) -> Sperre ist verwaist.
+_Z="$_TmpRoot/z5b"
+mkdir -p "$_Z/.w2u-stage-BRIEFE.lock"
+sleep 120 &
+_Fremd=$!
+echo "$_Fremd" > "$_Z/.w2u-stage-BRIEFE.lock/pid"
+_Out="$(bash "$_Root/pull.sh" --jobs 4 "$_Url" "$_Z" 2>&1)"; _Rc=$?
+kill "$_Fremd" 2>/dev/null
+wait "$_Fremd" 2>/dev/null
+t_assert_rc 0 "$_Rc" "PID gehoert einem fremden Prozess (kein pull.sh): Sperre verwaist, Lauf geht"
+t_assert_contains "$_Out" "ERGEBNIS: PASS" "PID-Wiederverwendung: PASS"
+s_clean "$_Z" "PID-Wiederverwendung"
 
 _Z="$_TmpRoot/z6"
 sh -c 'exit 0' &

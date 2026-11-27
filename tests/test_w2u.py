@@ -234,6 +234,19 @@ exit {rc}
         t.join()
         self.assertEqual(rc, 0)
 
+    def test_exit3_disables_unit(self):
+        # Einrichtungsfehler/aufgegeben: nach einem Reboot NICHT erneut laufen.
+        self.fake_pull(3)
+        self.assertEqual(self.run_job(), 3)
+        self.assertIn("systemctl disable win2unix@j1.service", self.calls.read_text())
+
+    def test_broken_conf_is_3(self):
+        conf = self.etc / "jobs" / "j1.conf"
+        conf.write_text(conf.read_text().replace("JOBS=3", "JOBS=abc"))
+        self.assertEqual(self.run_job(), 3)
+        conf.write_text("OWNER=x:y\n")                       # SRC/DST fehlen
+        self.assertEqual(self.run_job(), 3)
+
     def test_bad_name_rejected_in_run(self):
         self.assertEqual(self.w2u.cmd_run("../etc/passwd"), 3)
 
@@ -302,6 +315,24 @@ class TestRender(Base):
         self.assertIn("412/980 183.0 GB 42 MB/s", rows[0])
         self.assertIn("erledigt ✓", rows[1])
         self.assertEqual(len(rows[0]), len(rows[1]))
+
+
+class TestTuiSafe(Base):
+    def test_safe_addstr_clips_and_survives(self):
+        class FakeScr:
+            def __init__(self):
+                self.out = []
+            def getmaxyx(self):
+                return (5, 20)
+            def addstr(self, y, x, s, *a):
+                if y >= 5 or x + len(s) > 20:
+                    raise RuntimeError("zu breit")   # wie curses.error
+                self.out.append((y, s))
+        scr = FakeScr()
+        self.w2u.safe_addstr(scr, 1, 0, "x" * 50, 0, err=RuntimeError)
+        self.w2u.safe_addstr(scr, 9, 0, "unterhalb", 0, err=RuntimeError)
+        self.w2u.safe_addstr(scr, -1, 0, "oberhalb", 0, err=RuntimeError)
+        self.assertEqual(scr.out, [(1, "x" * 19)])
 
 
 if __name__ == "__main__":

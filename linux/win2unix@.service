@@ -3,7 +3,7 @@
 # Steuern mit "w2u" (TUI) oder "w2u start|stop|restart NAME".
 [Unit]
 Description=win2unix Transfer %i
-After=network-online.target
+After=network-online.target local-fs.target remote-fs.target
 Wants=network-online.target
 # Nie aufgeben: ein Transfer ueber Wochen ueberlebt so Netzausfaelle und einen
 # abgeschalteten Windows-Server. Endgueltig stoppt nur Exit 3 (siehe unten).

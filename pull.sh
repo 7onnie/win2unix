@@ -295,7 +295,7 @@ w2u_status() {
 }
 
 # Herzschlag: alle 30 s den Fortschritt nachtragen (erledigte Chunks), alle
-# 2 min die belegten KB am Ziel (du ist auf grossen Baeumen teuer). Laeuft als
+# 5 min die belegten KB am Ziel (du ist auf Millionen Dateien teuer). Laeuft als
 # Hintergrundprozess bis w2u_cleanup ihn beendet. So sieht die TUI auch in
 # langen Phasen (ein Sweep ueber Stunden), dass der Lauf lebt.
 w2u_heartbeat_start() {
@@ -314,7 +314,7 @@ w2u_heartbeat_start() {
             fi
             # Vorlauf "neue Dateien zuerst": eigene Ergebnisdatei, eigener Zaehler.
             _NewDone="$(grep -c . "$_TmpDir/results.newfirst" 2>/dev/null)" || _NewDone=""
-            if [ $((_Tick % 4)) -eq 0 ]; then
+            if [ $((_Tick % 10)) -eq 0 ]; then
                 w2u_status "chunks_done=${_Done:-0}" "new_done=${_NewDone:-0}" "kb_dst=$(w2u_dst_kb)"
             else
                 w2u_status "chunks_done=${_Done:-0}" "new_done=${_NewDone:-0}"
@@ -2468,6 +2468,15 @@ w2u_newfirst() {
     return 0
 }
 
+# Abschluss-chown nach PASS. -h: Symlinks im Baum SELBST umstellen, nie ihr
+# Ziel (Review-Fund: GNU "chown -R -H" folgt jedem Link im Baum - ein
+# haengender Link aus dem rsync-Daemon liess den chown scheitern, ein Link
+# nach /etc haette root dort den Besitzer aendern lassen). _DstRoot ist nach
+# w2u_stage_out ein echter Ordner, ein -H fuer die Wurzel braucht es nicht.
+w2u_final_chown() {
+    chown -R -h "$_ChownIds" "$_DstRoot"
+}
+
 # Haengt die Zusatz-Argumente an _Args an, die JEDE uebertragende rsync-Instanz
 # bekommt (Worker und Sweep; NICHT der Verify-Lauf mit -n, der nichts aendert).
 # Eine Stelle statt zwei, damit Worker und Sweep nie auseinanderlaufen.
@@ -2603,7 +2612,12 @@ w2u_stage_lock() {
         case "$_Pid" in
             ''|*[!0-9]*) _Pid="" ;;
         esac
-        if [ -n "$_Pid" ] && kill -0 "$_Pid" 2>/dev/null; then
+        if [ -n "$_Pid" ] && [ "$_Pid" != "$$" ] && kill -0 "$_Pid" 2>/dev/null \
+            && ps -ww -o args= -p "$_Pid" 2>/dev/null | grep -q 'pull'; then
+            # Lebt die PID UND ist sie ein pull.sh, laeuft wirklich ein anderer
+            # Lauf. Nach einem Reboot gehoert eine alte PID oft einem ganz
+            # anderen Prozess (Boot-PIDs sind klein und wiederholen sich) -
+            # dann ist die Sperre verwaist (Review-Fund).
             w2u_die "Ein anderer Lauf (PID $_Pid) arbeitet schon auf $_DstRoot (Sperre $_StageLock). Dessen Ende abwarten - zwei Laeufe auf dasselbe Ziel schoeben sich den Bestand gegenseitig weg. Laeuft sicher kein pull.sh mehr (PID wiederverwendet): 'rm -r $_StageLock' und neu starten."
         fi
         _OldTmp="$(cat "$_StageLock/tmp" 2>/dev/null)" || _OldTmp=""
@@ -2985,6 +2999,13 @@ w2u_verify_step() {
 # stdout weiter, auch wenn die Datei scheitert.
 w2u_report_step() {
     local _Rc=0 _Rep=""
+    # Herzschlag beenden, BEVOR das Urteil geschrieben wird: er liest und
+    # ersetzt die Statusdatei ebenfalls und koennte result= ueberschreiben.
+    if [ -n "$_HbPid" ]; then
+        kill "$_HbPid" 2>/dev/null || true
+        wait "$_HbPid" 2>/dev/null || true
+        _HbPid=""
+    fi
     if [ -n "$_LogDir" ] && [ -d "$_LogDir" ] && [ -w "$_LogDir" ]; then
         _Rep="${_LogDir%/}/report.txt"
         w2u_report | tee "$_Rep" || _Rc=$?
@@ -3073,6 +3094,9 @@ w2u_cleanup() {
 # Signal kommt - bash fuehrt den Trap erst danach aus, dann ist das Kind
 # bereits fertig.
 w2u_on_signal() {
+    # Ein zweites Signal (systemd schickt TERM an die ganze cgroup, w2u run
+    # reicht es zusaetzlich weiter) darf das Aufraeumen nicht abbrechen.
+    trap '' INT TERM
     w2u_warn "abgebrochen - derselbe Aufruf setzt fort, bereits uebertragene Dateien bleiben liegen"
     w2u_status "message=abgebrochen (Signal)"
     if command -v pkill >/dev/null 2>&1; then
@@ -3113,6 +3137,9 @@ main() {
     trap 'w2u_cleanup' EXIT
     trap 'w2u_on_signal' INT TERM
 
+    # Schon vor dem Preflight: auf Millionen Dateien dauern Reparatur der
+    # Rechte, Sperre und Aufraeumen Minuten - die TUI soll sehen, dass er lebt.
+    w2u_heartbeat_start
     w2u_preflight
 
     _ResultFile="$_TmpDir/results"
@@ -3122,7 +3149,6 @@ main() {
     # fiele jeder Verify-Only-Lauf falsch auf FAIL. Das ">" leert sie zugleich:
     # Reste aus einem frueheren Lauf waeren fremde Namen im Abgleich.
     : > "$_ResultFile"
-    w2u_heartbeat_start
 
     if [ "$_VerifyOnly" -eq 1 ]; then
         w2u_log "nur Verifikation - es wird nichts uebertragen"
@@ -3223,7 +3249,7 @@ main() {
     if [ "$_Rc" -eq 0 ] && [ -n "$_ChownIds" ]; then
         w2u_status "phase=chown"
         w2u_log "Besitzer setzen: chown -R $_Chown ($_ChownIds) $_DstRoot"
-        if chown -R -H "$_ChownIds" "$_DstRoot"; then
+        if w2u_final_chown; then
             w2u_log "Besitzer gesetzt: alles unter $_DstRoot gehoert $_Chown"
             w2u_status "phase=done"
         else

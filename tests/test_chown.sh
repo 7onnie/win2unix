@@ -40,4 +40,31 @@ t_assert_eq "-rlt --chmod=Du+rwx,Fu+rw --protocol=30" "${_Args[*]}" "ohne --chow
 w2u_resolve_owner "$_Me"
 t_assert_eq "$(id -u):$(id -g)" "$_ChownIds" "U:G wird numerisch aufgeloest"
 
+# Abschluss-chown darf Symlinks im Baum NICHT folgen (Review-Fund, kritisch):
+# GNU "chown -R -H" dereferenziert jeden Link im Baum - ein haengender Link
+# (rsyncd "munged" Links: /rsyncd-munged/...) liess den chown scheitern, ein
+# Link nach /etc haette root dort den Besitzer aendern lassen. Mit GNU chown
+# geprueft, wenn vorhanden (gchown aus coreutils auf macOS).
+_Gnu=""
+if chown --version 2>/dev/null | grep -q GNU; then
+    _Gnu="$(command -v chown)"
+elif command -v gchown >/dev/null 2>&1; then
+    _Gnu="$(command -v gchown)"
+fi
+if [ -n "$_Gnu" ]; then
+    mkdir -p "$_TmpRoot/shim" "$_TmpRoot/baum/sub"
+    ln -s "$_Gnu" "$_TmpRoot/shim/chown"
+    echo x > "$_TmpRoot/baum/sub/f"
+    ln -s /rsyncd-munged/gibtsnicht "$_TmpRoot/baum/sub/haengend"
+    _SavePath="$PATH"
+    PATH="$_TmpRoot/shim:$PATH"
+    _ChownIds="$(id -u):$(id -g)"
+    _DstRoot="$_TmpRoot/baum"
+    w2u_final_chown; _Rc=$?
+    PATH="$_SavePath"
+    t_assert_rc 0 "$_Rc" "Abschluss-chown mit haengendem Symlink im Baum (GNU chown): rc 0"
+else
+    t_skip "kein GNU chown - Symlink-Fall des Abschluss-chown nicht pruefbar"
+fi
+
 t_summary

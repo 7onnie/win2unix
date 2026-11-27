@@ -278,8 +278,13 @@ def cmd_run(name) -> int:
         return 3
     try:
         conf = read_job(name)
+        if not conf.get("SRC") or not conf.get("DST"):
+            raise ValueError(f"Auftrag {name}: SRC oder DST fehlt")
+        int(conf.get("JOBS") or 0)
+        int(conf.get("NEWDAYS") or 0)
     except ValueError as e:
-        print(str(e), file=sys.stderr)
+        # Kaputter Auftrag ist ein Einrichtungsfehler: Neuversuch sinnlos.
+        print(f"Auftrag {name} ungueltig: {e}", file=sys.stderr)
         return 3
     jd = job_dir(name)
     logs = jd / "logs"
@@ -346,6 +351,10 @@ def cmd_run(name) -> int:
         # FAIL-Urteile bleibt, wie er ist - endlos neu versuchen.
         _set_runs(name, fail_streak=streak, last_rc=rc, last_end=int(time.time()))
         out = 1
+    if out == 3:
+        # Einrichtungsfehler oder aufgegeben: nach einem Reboot NICHT erneut
+        # starten (Review-Fund). "w2u start" aktiviert ihn wieder.
+        subprocess.run([systemctl_path(), "disable", UNIT.format(name)], capture_output=True)
     _prune_logs(logs)
     _group_writable(jd)
     return out
@@ -446,6 +455,22 @@ def render_rows(states: list, rates: dict) -> list:
     return rows
 
 
+def safe_addstr(scr, y, x, text, attr=0, err=None):
+    """addstr, das nie ueber den Rand schreibt und nie wirft: kleine oder
+    verkleinerte Terminals beendeten die TUI sonst mit curses.error."""
+    if err is None:
+        import curses
+        err = curses.error
+    h, w = scr.getmaxyx()
+    if y < 0 or y >= h or x >= w - 1:
+        return
+    text = text[: max(0, w - 1 - x)]
+    try:
+        scr.addstr(y, x, text, attr)
+    except err:
+        pass
+
+
 def _color_for(label: str) -> int:
     return {"läuft": 2, "erledigt": 2, "wartet auf Neustart": 3, "keine Rückmeldung": 3,
             "aufgegeben": 1, "Einrichtungsfehler": 1}.get(label, 0)
@@ -463,7 +488,7 @@ def _form(stdscr, curses):
         for i, (label, default) in enumerate(fields):
             stdscr.move(3 + i, 2)
             stdscr.clrtoeol()
-            stdscr.addstr(3 + i, 2, f"{label} [{default}]: ")
+            safe_addstr(stdscr, 3 + i, 2, f"{label} [{default}]: ")
             stdscr.refresh()
             raw = stdscr.getstr(3 + i, 4 + len(label) + len(default) + 4, 200)
             v = raw.decode("utf-8", "replace").strip() if raw else ""
@@ -487,13 +512,15 @@ def _probe_source(src: str) -> str:
 
 def _pager(stdscr, curses, title, text):
     lines = text.splitlines() or ["(leer)"]
-    top = max(0, len(lines) - (curses.LINES - 3))
+    h, w = stdscr.getmaxyx()
+    top = max(0, len(lines) - (h - 3))
     while True:
+        h, w = stdscr.getmaxyx()
         stdscr.erase()
-        stdscr.addstr(0, 0, title[: curses.COLS - 1], curses.A_BOLD)
-        for i, line in enumerate(lines[top: top + curses.LINES - 3]):
-            stdscr.addstr(1 + i, 0, line[: curses.COLS - 1])
-        stdscr.addstr(curses.LINES - 1, 0, "[↑↓ PgUp PgDn] blättern  [q] zurück"[: curses.COLS - 1])
+        safe_addstr(stdscr, 0, 0, title[: w - 1], curses.A_BOLD)
+        for i, line in enumerate(lines[top: top + h - 3]):
+            safe_addstr(stdscr, 1 + i, 0, line[: w - 1])
+        safe_addstr(stdscr, h - 1, 0, "[↑↓ PgUp PgDn] blättern  [q] zurück"[: w - 1])
         k = stdscr.getch()
         if k in (ord("q"), 27):
             return
@@ -502,9 +529,9 @@ def _pager(stdscr, curses, title, text):
         elif k == curses.KEY_DOWN:
             top = min(max(0, len(lines) - 1), top + 1)
         elif k == curses.KEY_PPAGE:
-            top = max(0, top - (curses.LINES - 3))
+            top = max(0, top - (h - 3))
         elif k == curses.KEY_NPAGE:
-            top = min(max(0, len(lines) - 1), top + (curses.LINES - 3))
+            top = min(max(0, len(lines) - 1), top + (h - 3))
 
 
 def tui():
@@ -545,34 +572,35 @@ def tui():
                     last_kb[s["name"]] = (now, kb)
             sel = min(sel, max(0, len(states) - 1))
             stdscr.erase()
-            w = curses.COLS - 1
+            h, w = stdscr.getmaxyx()
+            w = w - 1
             head = f" win2unix – {len(states)} Transfer(s)"
             clock = time.strftime("%a %d.%m. %H:%M ")
-            stdscr.addstr(0, 0, (head + " " * w)[: w - len(clock)] + clock, curses.A_BOLD)
-            stdscr.addstr(1, 0, ("  " + "  ".join(t.ljust(wd) for t, wd in COLS))[:w], curses.A_UNDERLINE)
+            safe_addstr(stdscr, 0, 0, (head + " " * w)[: w - len(clock)] + clock, curses.A_BOLD)
+            safe_addstr(stdscr, 1, 0, ("  " + "  ".join(t.ljust(wd) for t, wd in COLS))[:w], curses.A_UNDERLINE)
             rows = render_rows(states, rates)
             for i, (row, s) in enumerate(zip(rows, states)):
-                if 2 + i >= curses.LINES - 6:
+                if 2 + i >= h - 6:
                     break
                 attr = curses.color_pair(_color_for(s["label"]))
                 if i == sel:
                     attr |= curses.A_REVERSE
-                stdscr.addstr(2 + i, 0, (("> " if i == sel else "  ") + row)[:w], attr)
+                safe_addstr(stdscr, 2 + i, 0, (("> " if i == sel else "  ") + row)[:w], attr)
             if states:
                 s = states[sel]
-                y = curses.LINES - 5
-                stdscr.addstr(y, 0, f" Ziel: {s['target']}   Besitzer: {s['owner']}   FAIL in Folge: {s['fail_streak']}"[:w])
-                stdscr.addstr(y + 1, 0, f" Quelle: {s['src']}"[:w])
-                stdscr.addstr(y + 2, 0, f" Meldung: {s['message'] or '–'}"[:w],
+                y = h - 5
+                safe_addstr(stdscr, y, 0, f" Ziel: {s['target']}   Besitzer: {s['owner']}   FAIL in Folge: {s['fail_streak']}"[:w])
+                safe_addstr(stdscr, y + 1, 0, f" Quelle: {s['src']}"[:w])
+                safe_addstr(stdscr, y + 2, 0, f" Meldung: {s['message'] or '–'}"[:w],
                               curses.color_pair(1) if s["label"] in ("aufgegeben", "Einrichtungsfehler") else 0)
             else:
-                stdscr.addstr(3, 2, "Noch kein Auftrag - [n] legt einen an.")
-            stdscr.addstr(curses.LINES - 2, 0, (" " + msg)[:w], curses.A_BOLD)
-            stdscr.addstr(curses.LINES - 1, 0,
+                safe_addstr(stdscr, 3, 2, "Noch kein Auftrag - [n] legt einen an.")
+            safe_addstr(stdscr, h - 2, 0, (" " + msg)[:w], curses.A_BOLD)
+            safe_addstr(stdscr, h - 1, 0,
                           " [n]eu  [s]tart  [x] stop  [r]estart  [l]og  [b]ericht  [d] entfernen  [q]uit"[:w])
             stdscr.refresh()
             k = stdscr.getch()
-            if k == -1:
+            if k == -1 or k == curses.KEY_RESIZE:
                 continue
             msg = ""
             cur = states[sel]["name"] if states else None
@@ -585,7 +613,7 @@ def tui():
                     sel = min(len(states) - 1, sel + 1)
                 elif k == ord("n"):
                     stdscr.erase()
-                    stdscr.addstr(1, 2, "Neuer Auftrag (Enter übernimmt [Vorgabe])", curses.A_BOLD)
+                    safe_addstr(stdscr, 1, 2, "Neuer Auftrag (Enter übernimmt [Vorgabe])", curses.A_BOLD)
                     f = _form(stdscr, curses)
                     problem = _probe_source(f["src"])
                     if problem:
@@ -610,7 +638,7 @@ def tui():
                     text = Path(rep).read_text(errors="replace") if rep and Path(rep).is_file() else "(noch kein Bericht)"
                     _pager(stdscr, curses, f"Bericht {cur}", text)
                 elif cur and k == ord("d"):
-                    stdscr.addstr(curses.LINES - 2, 0, f" {cur} entfernen (Zieldaten bleiben)? [j/N] "[:w])
+                    safe_addstr(stdscr, h - 2, 0, f" {cur} entfernen (Zieldaten bleiben)? [j/N] "[:w])
                     stdscr.timeout(-1)
                     yes = stdscr.getch() in (ord("j"), ord("y"))
                     stdscr.timeout(2000)
