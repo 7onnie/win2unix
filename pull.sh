@@ -136,6 +136,7 @@ _HbPid=""             # Hintergrund-Herzschlag, der Fortschritt nachtraegt
 _Chown=""             # wie angegeben, z.B. tomedo:tomedo
 _ChownIds=""          # numerisch aufgeloest, uid:gid (pull.sh nutzt --numeric-ids)
 _XChown=""            # --chown=uid:gid an Worker und Sweep
+_NewDays=0            # --neu-zuerst TAGE; 0 = aus
 _ParMode="parallel"   # Vorgabe bewusst "parallel": w2u_report wertet eine
                       # FEHLENDE Chunkliste nur im einstroemigen Lauf als
                       # zulaessig. Die strenge Vorgabe heisst also, dass ein
@@ -2121,6 +2122,7 @@ w2u_parse_args() {
             --dry-run)      _DryRun=1; shift ;;
             --status-file)  w2u_take_arg "$1" "${2-}"; _StatusFile="$_ArgVal"; shift 2 ;;
             --chown)        w2u_take_arg "$1" "${2-}"; _Chown="$_ArgVal"; shift 2 ;;
+            --neu-zuerst)   w2u_take_arg "$1" "${2-}"; _NewDays="$_ArgVal"; shift 2 ;;
             --version)      printf 'win2unix pull.sh %s\n' "$W2U_VERSION"; exit 0 ;;
             -h|--help)      w2u_usage; exit 0 ;;
             -*)             w2u_die "unbekannte Option: $1" ;;
@@ -2333,6 +2335,10 @@ w2u_parse_args() {
         w2u_warn "--no-verify: der Vergleich mit der Quelle entfaellt. Ein PASS heisst dann nur noch 'jeder Chunk hat rc 0 gemeldet' - nicht 'Quelle und Ziel sind gleich'."
     fi
 
+    case "$_NewDays" in
+        ''|*[!0-9]*) w2u_die "--neu-zuerst erwartet eine Zahl von Tagen (0 = aus), bekam: '$_NewDays'" ;;
+    esac
+
     # ---- --chown: alles hier, beim Parsen, damit ein Fehler Exit 3 ist ----
     if [ -n "$_Chown" ]; then
         w2u_resolve_owner "$_Chown"
@@ -2377,6 +2383,77 @@ w2u_resolve_owner() {
         ''|*[!0-9]*) w2u_die "--chown: Gruppe '$_Group' gibt es auf diesem Rechner nicht" ;;
     esac
     _ChownIds="$_Uid:$_Gid"
+    return 0
+}
+
+# ---- Neue Dateien zuerst (--neu-zuerst TAGE) ---------------------------------
+# Meist werden die juengsten Dateien wirklich gebraucht, der Rest ist Archiv.
+# Vor der normalen parallelen Phase wird die Quelle EINMAL rekursiv gelistet,
+# und alle regulaeren Dateien ab dem Stichtag laufen als eigene Chunkliste
+# durch dieselben Worker. Das ist eine VORAB-LIEFERUNG ohne Beweiskraft: eigene
+# Ergebnisdatei, keine Wirkung auf den Bericht. Vollstaendig wird es erst durch
+# die normale Phase, den Sweep und den Verify, die Vorhandenes ueberspringen.
+
+# Stichtag JJJJ/MM/TT, heute minus <tage>. GNU date (-d @s) oder BSD (-r s).
+w2u_cutoff_date() {
+    local _Secs
+    _Secs=$(( $(date +%s) - $1 * 86400 ))
+    date -d "@$_Secs" +%Y/%m/%d 2>/dev/null || date -r "$_Secs" +%Y/%m/%d
+}
+
+# stdin: Zeilen aus "rsync -r --list-only". stdout: Namen regulaerer Dateien
+# mit Datum >= <stichtag>. Format je Zeile: Rechte, Groesse (mit Tausender-
+# trennern), Datum JJJJ/MM/TT, Uhrzeit, Name - der Name ist der REST der Zeile
+# und darf Leerzeichen enthalten. Der Datumsvergleich ist ein Stringvergleich:
+# JJJJ/MM/TT sortiert lexikalisch wie zeitlich.
+w2u_parse_newfiles() {
+    awk -v _Cut="$1" '
+        substr($1, 1, 1) != "-" { next }
+        $3 < _Cut { next }
+        {
+            _L = $0
+            sub(/^[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ /, "", _L)
+            if (_L != "") print _L
+        }
+    '
+}
+
+w2u_newfirst() {
+    local _Cut _Rc=0 _Cnt _SaveRes="$_ResultFile" _Jobs=4 _Args
+    _Cut="$(w2u_cutoff_date "$_NewDays")"
+    w2u_status "phase=neu-zuerst"
+    w2u_log "neue Dateien zuerst: alles ab $_Cut (letzte $_NewDays Tage) - liste die Quelle"
+    _Args=( -r --list-only "--timeout=$_RsyncTimeout" )
+    [ -n "$_XProto" ] && _Args=( "${_Args[@]}" "$_XProto" )
+    [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
+    "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" > "$_TmpDir/newfirst.listing" 2> "$_LogDir/newfirst-listing.log" || _Rc=$?
+    if [ "$_Rc" -ne 0 ] && [ "$_Rc" -ne 23 ] && [ "$_Rc" -ne 24 ]; then
+        w2u_warn "neue Dateien zuerst: Listing der Quelle scheiterte (rc $_Rc) - Vorlauf entfaellt, die normale Phase holt alles"
+        return 0
+    fi
+    w2u_parse_newfiles "$_Cut" < "$_TmpDir/newfirst.listing" > "$_TmpDir/newfirst.work"
+    _Cnt="$(grep -c . "$_TmpDir/newfirst.work" || true)"
+    w2u_status "new_total=${_Cnt:-0}"
+    if [ "${_Cnt:-0}" -eq 0 ]; then
+        w2u_log "neue Dateien zuerst: keine Datei ab $_Cut"
+        return 0
+    fi
+    if [ -n "$_SrcPrefix" ]; then
+        awk -v _P="$_SrcPrefix/" 'length($0) > 0 { print _P $0 }' "$_TmpDir/newfirst.work" > "$_TmpDir/newfirst.par"
+    else
+        cp "$_TmpDir/newfirst.work" "$_TmpDir/newfirst.par"
+    fi
+    mkdir -p "$_TmpDir/newchunks"
+    w2u_chunk "$_TmpDir/newfirst.par" "$_TmpDir/newchunks" "$_PMax" "$_TmpDir/newchunks.list"
+    if [ "$_JobCnt" -gt 0 ]; then
+        _Jobs="$_JobCnt"
+    fi
+    w2u_log "neue Dateien zuerst: $_Cnt Datei(en), Parallelitaet $_Jobs"
+    _ResultFile="$_TmpDir/results.newfirst"
+    : > "$_ResultFile"
+    w2u_run_list "$_TmpDir/newchunks.list" "$_Jobs"
+    _ResultFile="$_SaveRes"
+    w2u_log "neue Dateien zuerst: Vorlauf fertig (ohne Beweiskraft - die normale Phase prueft alles)"
     return 0
 }
 
@@ -3085,6 +3162,9 @@ main() {
     fi
 
     if [ "$_ParMode" = "parallel" ]; then
+        if [ "$_NewDays" -gt 0 ]; then
+            w2u_newfirst
+        fi
         mkdir -p "$_TmpDir/chunks"
         w2u_chunk "$_TmpDir/work.par" "$_TmpDir/chunks" "$_PMax" "$_TmpDir/chunks.list"
         w2u_status "phase=parallel" "chunks_total=$(grep -c . "$_TmpDir/chunks.list" || true)" "chunks_done=0"
