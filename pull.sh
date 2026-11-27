@@ -48,7 +48,7 @@
 #                main                           der Ablauf, und nur er
 # ---------------------------------------------------------------------------
 
-W2U_VERSION="0.2.0"
+W2U_VERSION="0.3.0"
 
 # ---------- Konfiguration (Zero-Touch: alles hier, keine Rueckfragen) ----------
 _JobCnt=0              # 0 = Auto-Messung (Spec 5.4)
@@ -120,7 +120,23 @@ _StageDir=""          # <ziel>/.w2u-stage-NAME
 _StageLeaf=""         # _StageDir/<praefix> - hier liegt der Bestand waehrend der Phase
 _StageLock=""         # _StageDir.lock - Sperre gegen zwei Laeufe auf dasselbe Ziel
 _StageLockOwned=0     # 1 = dieser Lauf haelt die Sperre (nur dann wird sie freigegeben)
+_StageLink=""         # relativer Linkinhalt <ziel>/NAME -> .w2u-stage-NAME/<praefix>
 _WorkRoot=""          # wo der Bestand GERADE liegt, wenn nicht unter _DstRoot
+# Zusatz-Argumente aus dem ersten Ernstfall (w2u_rsync_extra). Skalare statt
+# Array, weil die Worker sie per export ueber xargs erben.
+_XChmod=""            # --chmod=Du+rwx,Fu+rw an Worker und Sweep
+_XProto=""            # --protocol=30 an JEDEN Aufruf gegen den Daemon (GNU >= 31)
+_RsyncExtra=( )       # beides zusammen, fuer Tests und Logzeile
+# Statusdatei (Issue #9): key=value, atomar ersetzt; die TUI liest sie.
+_StatusFile=""        # leer = keine Statusdatei
+_StatusReady=0        # 1, sobald sie angelegt ist (w2u_die schreibt erst dann)
+_Parsing=0            # 1 waehrend w2u_parse_args -> w2u_die endet mit Exit 3
+_HbPid=""             # Hintergrund-Herzschlag, der Fortschritt nachtraegt
+# --chown U:G (Issue #12): Besitzer schon beim Schreiben, nach PASS chown -R.
+_Chown=""             # wie angegeben, z.B. tomedo:tomedo
+_ChownIds=""          # numerisch aufgeloest, uid:gid (pull.sh nutzt --numeric-ids)
+_XChown=""            # --chown=uid:gid an Worker und Sweep
+_NewDays=0            # --neu-zuerst TAGE; 0 = aus
 _ParMode="parallel"   # Vorgabe bewusst "parallel": w2u_report wertet eine
                       # FEHLENDE Chunkliste nur im einstroemigen Lauf als
                       # zulaessig. Die strenge Vorgabe heisst also, dass ein
@@ -166,7 +182,19 @@ _ArgVal=""            # Rueckgabekanal von w2u_take_arg - eine Variable statt
 
 w2u_log()  { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
 w2u_warn() { printf '[%s] WARNUNG: %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
-w2u_die()  { printf '[%s] ABBRUCH: %s\n' "$(date '+%H:%M:%S')" "$*" >&2; exit 1; }
+# Exit 3 = Einrichtungsfehler (Abbruch waehrend w2u_parse_args): ein Neuversuch
+# aendert daran nichts, der Dienst (w2u run / systemd) startet dann NICHT neu.
+# Alles andere ist Exit 1 - voruebergehend, ein Neuversuch setzt fort.
+w2u_die()  {
+    printf '[%s] ABBRUCH: %s\n' "$(date '+%H:%M:%S')" "$*" >&2
+    if [ -n "${_StatusFile:-}" ] && [ "${_StatusReady:-0}" -eq 1 ]; then
+        w2u_status "message=ABBRUCH: $*"
+    fi
+    if [ "${_Parsing:-0}" -eq 1 ]; then
+        exit 3
+    fi
+    exit 1
+}
 
 w2u_usage() {
     cat >&2 <<'EOF'
@@ -187,6 +215,10 @@ Optionen:
   --no-verify         Verifikation ueberspringen (nicht empfohlen)
   --checksum          Verifikation zusaetzlich mit Pruefsummen (langsam)
   --dry-run           nur zeigen, was passieren wuerde
+  --chown U:G         Besitzer beim Schreiben, nach PASS chown -R (nur root, GNU rsync)
+  --neu-zuerst TAGE   Dateien der letzten TAGE Tage zuerst (0 = aus)
+  --status-file PFAD  Phase/Fortschritt/Urteil als key=value
+  Exit: 0 PASS, 1 FAIL oder Abbruch (erneut versuchen), 3 Einrichtungsfehler
   --version
 EOF
 }
@@ -223,6 +255,76 @@ w2u_parse_listing() {
 
 # Sucht ein brauchbares rsync. Auf den Ziel-Macs ist das Apple-openrsync
 # (Protokoll 29) - das reicht als CLIENT vollstaendig aus (Spec 2.2).
+# Schreibt key=value-Paare in die Statusdatei. Vorhandene Schluessel werden
+# ersetzt, "updated" immer neu gesetzt. Atomar: erst eine Zwischendatei im
+# selben Verzeichnis, dann mv - die TUI liest nie eine halbe Datei.
+# Zeilenumbrueche in Werten werden zu Leerzeichen (eine Zeile = ein Schluessel).
+# Testhaken: W2U_STATUS_TRACE bekommt jeden Phasenwechsel angehaengt.
+w2u_status() {
+    [ -n "$_StatusFile" ] || return 0
+    local _Tmp="${_StatusFile}.tmp.$$.${BASHPID:-0}" _Pair _Keys="|" _Line _Key
+    for _Pair in "$@"; do
+        _Keys="${_Keys}${_Pair%%=*}|"
+    done
+    {
+        if [ -f "$_StatusFile" ]; then
+            while IFS= read -r _Line; do
+                _Key="${_Line%%=*}"
+                case "$_Keys" in
+                    *"|$_Key|"*) ;;
+                    *)
+                        [ "$_Key" = "updated" ] || printf '%s\n' "$_Line"
+                        ;;
+                esac
+            done < "$_StatusFile"
+        fi
+        for _Pair in "$@"; do
+            printf '%s\n' "$(printf '%s' "$_Pair" | tr '\n\r' '  ')"
+        done
+        printf 'updated=%s\n' "$(date +%s)"
+    } > "$_Tmp" 2>/dev/null && mv -f "$_Tmp" "$_StatusFile" 2>/dev/null
+    rm -f "$_Tmp" 2>/dev/null
+    if [ -n "${W2U_STATUS_TRACE:-}" ]; then
+        for _Pair in "$@"; do
+            case "$_Pair" in
+                phase=*) printf '%s\n' "${_Pair#phase=}" >> "$W2U_STATUS_TRACE" ;;
+            esac
+        done
+    fi
+    return 0
+}
+
+# Herzschlag: alle 30 s den Fortschritt nachtragen (erledigte Chunks), alle
+# 5 min die belegten KB am Ziel (du ist auf Millionen Dateien teuer). Laeuft als
+# Hintergrundprozess bis w2u_cleanup ihn beendet. So sieht die TUI auch in
+# langen Phasen (ein Sweep ueber Stunden), dass der Lauf lebt.
+w2u_heartbeat_start() {
+    [ -n "$_StatusFile" ] || return 0
+    (
+        set +e
+        _Tick=0
+        while sleep 30; do
+            # $$ ist im Subshell der Hauptprozess. Ist er tot (kill -9), darf
+            # der Herzschlag nicht weiter "lebt" melden.
+            kill -0 $$ 2>/dev/null || exit 0
+            _Tick=$((_Tick + 1))
+            _Done=""
+            if [ -n "$_ResultFile" ] && [ -f "$_ResultFile" ]; then
+                _Done="$(grep -c . "$_ResultFile" 2>/dev/null)"
+            fi
+            # Vorlauf "neue Dateien zuerst": eigene Ergebnisdatei, eigener Zaehler.
+            _NewDone="$(grep -c . "$_TmpDir/results.newfirst" 2>/dev/null)" || _NewDone=""
+            if [ $((_Tick % 10)) -eq 0 ]; then
+                w2u_status "chunks_done=${_Done:-0}" "new_done=${_NewDone:-0}" "kb_dst=$(w2u_dst_kb)"
+            else
+                w2u_status "chunks_done=${_Done:-0}" "new_done=${_NewDone:-0}"
+            fi
+        done
+    ) &
+    _HbPid=$!
+    return 0
+}
+
 w2u_find_rsync() {
     if [ -n "$_RsyncBin" ]; then
         [ -x "$_RsyncBin" ] || w2u_die "kein ausfuehrbares rsync unter $_RsyncBin"
@@ -237,6 +339,55 @@ w2u_find_rsync() {
     done
     _RsyncBin="$(command -v rsync 2>/dev/null || true)"
     [ -n "$_RsyncBin" ] || w2u_die "kein rsync gefunden"
+    return 0
+}
+
+# Zwei Zusatz-Argumente, beide aus dem ersten Ernstfall (2026-11-27):
+#
+# --chmod=Du+rwx,Fu+rw: Cygwin bildet Windows-ACLs auf Modi wie d---r-x---
+#   ab. rsync ohne -p uebernimmt die Quellrechte fuer NEUE Eintraege - danach
+#   durfte der Eigentuemer im eigenen Ordner nichts mehr anlegen (mkdir ...
+#   Permission denied, Chunks mit rc 23), und find zaehlte nicht hinein
+#   ("lokal ?", FAIL). Nur u+: Gruppe und Rest bleiben, wie die Quelle sie hat.
+# --protocol=30: rsync 3.4.1 (Cygwin, Windows-Seite) schickte eine Datei mit
+#   negativen Nanosekunden; rsync 3.5.0 als Empfaenger bricht daran mit
+#   "wire value modtime_nsec out of range" (rc 2) ab - JEDER Lauf, der diese
+#   Datei anfasst, auch Verify und Zaehlung. Protokoll 30 uebertraegt keine
+#   Nanosekunden. Verglichen wird ohnehin sekundengenau. Nur fuer GNU rsync ab
+#   Protokoll 31: openrsync spricht 29 und kennt die Option nicht sicher.
+w2u_rsync_extra() {
+    local _Ver _Proto=""
+    _Ver="$("$_RsyncBin" --version 2>&1)" || _Ver=""
+    _XChmod="--chmod=Du+rwx,Fu+rw"
+    _XProto=""
+    case "$_Ver" in
+        *openrsync*) ;;
+        *)
+            _Proto="$(printf '%s\n' "$_Ver" | sed -n 's/.*protocol version \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+            case "$_Proto" in
+                ''|*[!0-9]*) ;;
+                *)
+                    if [ "$_Proto" -ge 31 ]; then
+                        _XProto="--protocol=30"
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+    _RsyncExtra=( "$_XChmod" )
+    [ -n "$_XProto" ] && _RsyncExtra=( "${_RsyncExtra[@]}" "$_XProto" )
+    return 0
+}
+
+# Ordner im Ziel, denen der Eigentuemer Rechte fehlen (aus einem Lauf vor dem
+# --chmod-Fix), wieder betretbar machen. Ohne das scheitern rsync-mkdir und
+# die Zaehlung weiter an genau diesen Ordnern. Nur Ordner ohne volle
+# Eigentuemer-Rechte werden angefasst, Dateien nur ohne u+rw.
+w2u_fix_perms() {
+    local _Dir="$1"
+    [ -d "$_Dir" ] || return 0
+    find -H "$_Dir" -type d ! -perm -u=rwx -exec chmod u+rwx {} + 2>/dev/null || true
+    find -H "$_Dir" -type f ! -perm -u=rw -exec chmod u+rw {} + 2>/dev/null || true
     return 0
 }
 
@@ -269,7 +420,7 @@ w2u_remote_list() {
     else
         _Url="$_Base/"
     fi
-    _Raw="$("$_RsyncBin" --list-only -d "$_Url" 2>&1)" || _Rc=$?
+    _Raw="$("$_RsyncBin" ${_XProto:+"$_XProto"} --list-only -d "$_Url" 2>&1)" || _Rc=$?
     if [ "$_Rc" -ne 0 ]; then
         w2u_die "rsync-Listing fehlgeschlagen fuer $_Url (rc $_Rc): $_Raw"
     fi
@@ -576,6 +727,7 @@ w2u_run_chunk() {
     # steht und deren Ausgabe niemand auswertet, ist ein Versprechen an den
     # naechsten Leser, das nicht gehalten wird.
     _Args=( -rlt -W --partial --numeric-ids "--timeout=$_RsyncTimeout" )
+    w2u_xfer_args
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     _Args=( "${_Args[@]}" "--files-from=$_ChunkFile" )
 
@@ -693,8 +845,8 @@ w2u_run_list() {
     # MODULWURZEL aus (siehe w2u_run_chunk). Fehlten sie in dieser Liste, waeren
     # sie im Kind leer - dort gilt kein "set -u" - und der Guard in
     # w2u_run_chunk laesse jeden Chunk ohne Ergebniszeile scheitern.
-    export _RsyncBin _ParSrc _ParDst _LogDir _ResultFile _MaxRetry _RetryPause _ExcludeFrom _RsyncTimeout
-    export -f w2u_run_chunk w2u_die w2u_log
+    export _RsyncBin _ParSrc _ParDst _LogDir _ResultFile _MaxRetry _RetryPause _ExcludeFrom _RsyncTimeout _XChmod _XProto _XChown
+    export -f w2u_run_chunk w2u_die w2u_log w2u_xfer_args
     # "$0" der Worker-Shell = "w2u-worker:<tmp>": damit steht das TMP-Verzeichnis
     # dieses Laufs im argv von XARGS SELBST (dessen Befehlsvorlage), nicht nur
     # in dem seiner Kinder. Ueberlebt xargs einen kill -9 des Hauptprozesses,
@@ -749,7 +901,11 @@ w2u_dst_kb() {
     local _Kb
     # Waehrend der parallelen Phase liegt der Bestand im Zwischenordner
     # (_WorkRoot, Issue #7) - unter _DstRoot gibt es dann nichts zu messen.
-    _Kb="$(du -sk "${_WorkRoot:-$_DstRoot}" 2>/dev/null | awk 'NR == 1 { print $1 }')" || _Kb=""
+    # -H: einem Symlink AUF DER KOMMANDOZEILE folgen - waehrend der Phase ist
+    # <ziel>/NAME ein Link auf den Zwischenordner (der Herzschlag kennt
+    # _WorkRoot nicht, er laeuft seit vor w2u_stage_in). Links im Baum bleiben
+    # Links; GNU und BSD du kennen -H.
+    _Kb="$(du -skH "${_WorkRoot:-$_DstRoot}" 2>/dev/null | awk 'NR == 1 { print $1 }')" || _Kb=""
     case "$_Kb" in
         ''|*[!0-9]*) _Kb="" ;;
     esac
@@ -987,6 +1143,7 @@ w2u_run_all() {
     if [ "$_JobCnt" -gt 0 ]; then
         _Jobs="$_JobCnt"
         w2u_log "feste Parallelitaet: $_Jobs (Auto-Messung uebersprungen)"
+        w2u_status "parallel=$_Jobs"
         w2u_run_list "$_ListFile" "$_Jobs"
     else
         # Kein Fallback auf einen Ersatzwert: unter dem errexit aus main() reisst
@@ -997,6 +1154,7 @@ w2u_run_all() {
         # je etwas Ungueltiges durch, faengt es der Guard in w2u_run_list.
         _Jobs="$(w2u_autotune "$_ListFile")"
         w2u_log "gewaehlte Parallelitaet: $_Jobs"
+        w2u_status "parallel=$_Jobs"
         w2u_run_list "$_TmpDir/chunks.rest" "$_Jobs"
     fi
     _JobCnt="$_Jobs"
@@ -1036,6 +1194,7 @@ w2u_run_all() {
 w2u_sweep() {
     local _Args
     _Args=( -rlt -W --partial --numeric-ids "--timeout=$_RsyncTimeout" )
+    w2u_xfer_args
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" "$_DstRoot/"
 }
@@ -1097,6 +1256,7 @@ w2u_verify() {
         return 1
     fi
     _Args=( -rlt -W -n -i "--timeout=$_RsyncTimeout" )
+    [ -n "$_XProto" ] && _Args=( "${_Args[@]}" "$_XProto" )
     [ "$_DoChecksum" = "1" ] && _Args=( "${_Args[@]}" -c )
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" "$_DstRoot/" > "$_List" 2>&1 || _Rc=$?
@@ -1148,6 +1308,7 @@ w2u_count_remote() {
         return 0
     fi
     _Args=( -r --list-only "--timeout=$_RsyncTimeout" )
+    [ -n "$_XProto" ] && _Args=( "${_Args[@]}" "$_XProto" )
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" > "$_List" 2>/dev/null || _Rc=$?
     # Zwei Zahlen, nicht eine: Dateien ("-") UND ueberhaupt erkannte
@@ -1254,6 +1415,7 @@ w2u_name_diff() {
         return 1
     fi
     _Args=( -r --list-only "--timeout=$_RsyncTimeout" )
+    [ -n "$_XProto" ] && _Args=( "${_Args[@]}" "$_XProto" )
     # Der Ausschluss-Arm ist heute NICHT erreichbar: der einzige Aufrufer steht
     # im else-Zweig hinter "[ -n "$_ExcludeFrom" ]", auf diesem Pfad sind die
     # Ausschluesse also immer leer. Er bleibt trotzdem stehen, weil er zur
@@ -1968,6 +2130,9 @@ w2u_parse_args() {
             --no-verify)    _DoVerify=0; shift ;;
             --checksum)     _DoChecksum=1; shift ;;
             --dry-run)      _DryRun=1; shift ;;
+            --status-file)  w2u_take_arg "$1" "${2-}"; _StatusFile="$_ArgVal"; shift 2 ;;
+            --chown)        w2u_take_arg "$1" "${2-}"; _Chown="$_ArgVal"; shift 2 ;;
+            --neu-zuerst)   w2u_take_arg "$1" "${2-}"; _NewDays="$_ArgVal"; shift 2 ;;
             --version)      printf 'win2unix pull.sh %s\n' "$W2U_VERSION"; exit 0 ;;
             -h|--help)      w2u_usage; exit 0 ;;
             -*)             w2u_die "unbekannte Option: $1" ;;
@@ -2083,6 +2248,7 @@ w2u_parse_args() {
     _StageDir=""
     _StageLeaf=""
     _StageLock=""
+    _StageLink=""
     if [ -z "$_SrcPrefix" ]; then
         _ParDst="$_DstRoot"
         _ParMode="parallel"
@@ -2103,6 +2269,7 @@ w2u_parse_args() {
         [ "$_DstDir" = "/" ] && _StageDir="/.w2u-stage-$_Base"
         _StageLeaf="$_StageDir/$_SrcPrefix"
         _StageLock="$_StageDir.lock"
+        _StageLink=".w2u-stage-$_Base/$_SrcPrefix"
         _ParDst="$_StageDir"
         _ParMode="parallel"
     else
@@ -2177,6 +2344,147 @@ w2u_parse_args() {
     if [ "$_VerifyOnly" -eq 0 ] && [ "$_DryRun" -eq 0 ] && [ "$_DoVerify" -eq 0 ]; then
         w2u_warn "--no-verify: der Vergleich mit der Quelle entfaellt. Ein PASS heisst dann nur noch 'jeder Chunk hat rc 0 gemeldet' - nicht 'Quelle und Ziel sind gleich'."
     fi
+
+    case "$_NewDays" in
+        ''|*[!0-9]*) w2u_die "--neu-zuerst erwartet eine Zahl von Tagen (0 = aus), bekam: '$_NewDays'" ;;
+    esac
+
+    # ---- --chown: alles hier, beim Parsen, damit ein Fehler Exit 3 ist ----
+    if [ -n "$_Chown" ]; then
+        w2u_resolve_owner "$_Chown"
+        if [ "$(id -u)" -ne 0 ]; then
+            w2u_die "--chown $_Chown braucht root: nur root darf Dateien einem anderen Benutzer geben. Als Dienst (w2u) laeuft pull.sh als root; von Hand: sudo bash pull.sh --chown ..."
+        fi
+        w2u_find_rsync
+        if ! "$_RsyncBin" --help 2>&1 | grep -q -- '--chown'; then
+            w2u_die "--chown: $_RsyncBin kennt die Option --chown nicht (openrsync?). GNU rsync ab 3.1 benutzen (--rsync PFAD)."
+        fi
+        _XChown="--chown=$_ChownIds"
+    fi
+}
+
+# Loest U:G in uid:gid auf und setzt _ChownIds. pull.sh uebertraegt mit
+# --numeric-ids - ein Name an rsync koennte dort anders gedeutet werden als
+# gemeint. Unbekannte Namen sind ein Einrichtungsfehler (w2u_die beim Parsen).
+w2u_resolve_owner() {
+    local _Spec="$1" _User _Group _Uid _Gid=""
+    case "$_Spec" in
+        *:*) ;;
+        *) w2u_die "--chown erwartet BENUTZER:GRUPPE, bekam: $_Spec" ;;
+    esac
+    _User="${_Spec%%:*}"
+    _Group="${_Spec#*:}"
+    [ -n "$_User" ] && [ -n "$_Group" ] || w2u_die "--chown erwartet BENUTZER:GRUPPE, bekam: $_Spec"
+    _Uid="$(id -u "$_User" 2>/dev/null)" || _Uid=""
+    case "$_Uid" in
+        ''|*[!0-9]*) w2u_die "--chown: Benutzer '$_User' gibt es auf diesem Rechner nicht" ;;
+    esac
+    case "$_Group" in
+        *[!0-9]*)
+            if command -v getent >/dev/null 2>&1; then
+                _Gid="$(getent group "$_Group" 2>/dev/null | cut -d: -f3)"
+            elif command -v dscl >/dev/null 2>&1; then
+                _Gid="$(dscl . -read "/Groups/$_Group" PrimaryGroupID 2>/dev/null | awk '{ print $2 }')"
+            fi
+            ;;
+        *) _Gid="$_Group" ;;
+    esac
+    case "$_Gid" in
+        ''|*[!0-9]*) w2u_die "--chown: Gruppe '$_Group' gibt es auf diesem Rechner nicht" ;;
+    esac
+    _ChownIds="$_Uid:$_Gid"
+    return 0
+}
+
+# ---- Neue Dateien zuerst (--neu-zuerst TAGE) ---------------------------------
+# Meist werden die juengsten Dateien wirklich gebraucht, der Rest ist Archiv.
+# Vor der normalen parallelen Phase wird die Quelle EINMAL rekursiv gelistet,
+# und alle regulaeren Dateien ab dem Stichtag laufen als eigene Chunkliste
+# durch dieselben Worker. Das ist eine VORAB-LIEFERUNG ohne Beweiskraft: eigene
+# Ergebnisdatei, keine Wirkung auf den Bericht. Vollstaendig wird es erst durch
+# die normale Phase, den Sweep und den Verify, die Vorhandenes ueberspringen.
+
+# Stichtag JJJJ/MM/TT, heute minus <tage>. GNU date (-d @s) oder BSD (-r s).
+w2u_cutoff_date() {
+    local _Secs
+    _Secs=$(( $(date +%s) - $1 * 86400 ))
+    date -d "@$_Secs" +%Y/%m/%d 2>/dev/null || date -r "$_Secs" +%Y/%m/%d
+}
+
+# stdin: Zeilen aus "rsync -r --list-only". stdout: Namen regulaerer Dateien
+# mit Datum >= <stichtag>. Format je Zeile: Rechte, Groesse (mit Tausender-
+# trennern), Datum JJJJ/MM/TT, Uhrzeit, Name - der Name ist der REST der Zeile
+# und darf Leerzeichen enthalten. Der Datumsvergleich ist ein Stringvergleich:
+# JJJJ/MM/TT sortiert lexikalisch wie zeitlich.
+w2u_parse_newfiles() {
+    awk -v _Cut="$1" '
+        substr($1, 1, 1) != "-" { next }
+        $3 < _Cut { next }
+        {
+            _L = $0
+            sub(/^[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ /, "", _L)
+            if (_L != "") print _L
+        }
+    '
+}
+
+w2u_newfirst() {
+    local _Cut _Rc=0 _Cnt _SaveRes="$_ResultFile" _Jobs=4 _Args
+    _Cut="$(w2u_cutoff_date "$_NewDays")"
+    w2u_status "phase=neu-zuerst"
+    w2u_log "neue Dateien zuerst: alles ab $_Cut (letzte $_NewDays Tage) - liste die Quelle"
+    _Args=( -r --list-only "--timeout=$_RsyncTimeout" )
+    [ -n "$_XProto" ] && _Args=( "${_Args[@]}" "$_XProto" )
+    [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
+    "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" > "$_TmpDir/newfirst.listing" 2> "$_LogDir/newfirst-listing.log" || _Rc=$?
+    if [ "$_Rc" -ne 0 ] && [ "$_Rc" -ne 23 ] && [ "$_Rc" -ne 24 ]; then
+        w2u_warn "neue Dateien zuerst: Listing der Quelle scheiterte (rc $_Rc) - Vorlauf entfaellt, die normale Phase holt alles"
+        return 0
+    fi
+    w2u_parse_newfiles "$_Cut" < "$_TmpDir/newfirst.listing" > "$_TmpDir/newfirst.work"
+    _Cnt="$(grep -c . "$_TmpDir/newfirst.work" || true)"
+    w2u_status "new_total=${_Cnt:-0}"
+    if [ "${_Cnt:-0}" -eq 0 ]; then
+        w2u_log "neue Dateien zuerst: keine Datei ab $_Cut"
+        return 0
+    fi
+    if [ -n "$_SrcPrefix" ]; then
+        awk -v _P="$_SrcPrefix/" 'length($0) > 0 { print _P $0 }' "$_TmpDir/newfirst.work" > "$_TmpDir/newfirst.par"
+    else
+        cp "$_TmpDir/newfirst.work" "$_TmpDir/newfirst.par"
+    fi
+    mkdir -p "$_TmpDir/newchunks"
+    w2u_chunk "$_TmpDir/newfirst.par" "$_TmpDir/newchunks" "$_PMax" "$_TmpDir/newchunks.list"
+    w2u_status "new_chunks=$(grep -c . "$_TmpDir/newchunks.list" || true)" "new_done=0"
+    if [ "$_JobCnt" -gt 0 ]; then
+        _Jobs="$_JobCnt"
+    fi
+    w2u_log "neue Dateien zuerst: $_Cnt Datei(en), Parallelitaet $_Jobs"
+    _ResultFile="$_TmpDir/results.newfirst"
+    : > "$_ResultFile"
+    w2u_run_list "$_TmpDir/newchunks.list" "$_Jobs"
+    _ResultFile="$_SaveRes"
+    w2u_log "neue Dateien zuerst: Vorlauf fertig (ohne Beweiskraft - die normale Phase prueft alles)"
+    return 0
+}
+
+# Abschluss-chown nach PASS. -h: Symlinks im Baum SELBST umstellen, nie ihr
+# Ziel (Review-Fund: GNU "chown -R -H" folgt jedem Link im Baum - ein
+# haengender Link aus dem rsync-Daemon liess den chown scheitern, ein Link
+# nach /etc haette root dort den Besitzer aendern lassen). _DstRoot ist nach
+# w2u_stage_out ein echter Ordner, ein -H fuer die Wurzel braucht es nicht.
+w2u_final_chown() {
+    chown -R -h "$_ChownIds" "$_DstRoot"
+}
+
+# Haengt die Zusatz-Argumente an _Args an, die JEDE uebertragende rsync-Instanz
+# bekommt (Worker und Sweep; NICHT der Verify-Lauf mit -n, der nichts aendert).
+# Eine Stelle statt zwei, damit Worker und Sweep nie auseinanderlaufen.
+w2u_xfer_args() {
+    [ -n "$_XChmod" ] && _Args=( "${_Args[@]}" "$_XChmod" )
+    [ -n "$_XProto" ] && _Args=( "${_Args[@]}" "$_XProto" )
+    [ -n "$_XChown" ] && _Args=( "${_Args[@]}" "$_XChown" )
+    return 0
 }
 
 # Loest einen Pfad zu einem absoluten Pfad OHNE "." und ".." auf, und ohne ihn
@@ -2304,7 +2612,12 @@ w2u_stage_lock() {
         case "$_Pid" in
             ''|*[!0-9]*) _Pid="" ;;
         esac
-        if [ -n "$_Pid" ] && kill -0 "$_Pid" 2>/dev/null; then
+        if [ -n "$_Pid" ] && [ "$_Pid" != "$$" ] && kill -0 "$_Pid" 2>/dev/null \
+            && ps -ww -o args= -p "$_Pid" 2>/dev/null | grep -q 'pull'; then
+            # Lebt die PID UND ist sie ein pull.sh, laeuft wirklich ein anderer
+            # Lauf. Nach einem Reboot gehoert eine alte PID oft einem ganz
+            # anderen Prozess (Boot-PIDs sind klein und wiederholen sich) -
+            # dann ist die Sperre verwaist (Review-Fund).
             w2u_die "Ein anderer Lauf (PID $_Pid) arbeitet schon auf $_DstRoot (Sperre $_StageLock). Dessen Ende abwarten - zwei Laeufe auf dasselbe Ziel schoeben sich den Bestand gegenseitig weg. Laeuft sicher kein pull.sh mehr (PID wiederverwendet): 'rm -r $_StageLock' und neu starten."
         fi
         _OldTmp="$(cat "$_StageLock/tmp" 2>/dev/null)" || _OldTmp=""
@@ -2351,6 +2664,12 @@ w2u_stage_recover() {
         w2u_warn "Im Zwischenordner liegt ein Bestand aus einem abgebrochenen Lauf: $_StageLeaf. Dieser Lauf veraendert nichts; ein normaler Lauf mit demselben Aufruf holt ihn nach $_DstRoot zurueck."
         return 0
     fi
+    # Der eigene Link aus der parallelen Phase (w2u_stage_in) zaehlt als "fehlt":
+    # er zeigt genau auf das Blatt, das gleich zurueckbenannt wird. Jeder andere
+    # Symlink bleibt unangetastet und faellt unten in "beide haben Inhalt".
+    if w2u_is_own_link; then
+        rm -f "$_DstRoot" || w2u_die "eigenen Link $_DstRoot nicht entfernbar - der Bestand bleibt im Zwischenordner $_StageLeaf"
+    fi
     if [ -d "$_DstRoot" ] && [ ! -L "$_DstRoot" ] && [ -z "$(ls -A "$_DstRoot" 2>/dev/null)" ]; then
         rmdir "$_DstRoot" || w2u_die "leeres Ziel $_DstRoot liess sich nicht entfernen - der Bestand bleibt im Zwischenordner $_StageLeaf"
     fi
@@ -2394,7 +2713,24 @@ w2u_stage_in() {
     fi
     _WorkRoot="$_StageLeaf"
     w2u_log "Zwischenordner fuer die parallele Phase: $_DstRoot -> $_StageLeaf"
+    # Die Phase dauert im Ernstfall Tage: so lange zeigt <ziel>/NAME per Link
+    # auf das Blatt, die Dateien sind am gewohnten Ort nutzbar. Relativ, damit
+    # er auch stimmt, wenn das Ziel anders eingehaengt wird. Kein Worker und
+    # kein Sweep schreibt je durch ihn (Worker -> _ParDst, Sweep erst nach
+    # w2u_stage_out). Scheitert er, ist das nur ein Komfortverlust.
+    if ln -s "$_StageLink" "$_DstRoot" 2>/dev/null; then
+        w2u_log "waehrend der Phase: $_DstRoot -> $_StageLink (Symlink)"
+    else
+        w2u_warn "Symlink $_DstRoot -> $_StageLink nicht anlegbar - die Dateien liegen bis zum Ende der Phase nur im Zwischenordner"
+    fi
     return 0
+}
+
+# Ist <ziel>/NAME genau der Link, den w2u_stage_in anlegt?
+w2u_is_own_link() {
+    [ -n "$_StageLink" ] || return 1
+    [ -L "$_DstRoot" ] || return 1
+    [ "$(readlink "$_DstRoot" 2>/dev/null)" = "$_StageLink" ]
 }
 
 # Nach der parallelen Phase: zurueck nach <ziel>/NAME. Existiert das Ziel
@@ -2403,6 +2739,9 @@ w2u_stage_in() {
 # naechste Lauf meldet beide.
 w2u_stage_out() {
     [ -n "$_WorkRoot" ] || return 0
+    if w2u_is_own_link; then
+        rm -f "$_DstRoot" || w2u_die "eigenen Link $_DstRoot nicht entfernbar - der Bestand bleibt in $_StageLeaf"
+    fi
     if [ -e "$_DstRoot" ] || [ -L "$_DstRoot" ]; then
         w2u_die "$_DstRoot ist waehrend der parallelen Phase neu entstanden - der Bestand bleibt in $_StageLeaf, nichts wird zusammengefuehrt"
     fi
@@ -2413,7 +2752,7 @@ w2u_stage_out() {
 }
 
 w2u_preflight() {
-    local _Version _VersionAll _Nl _LogAbs _DstAbs _Rc=0
+    local _Version _VersionAll _Nl _LogAbs _DstAbs _Rc=0 _Probe=""
     # _RsyncTimeout war der einzige Zahlen-Regler ohne die case-Pruefung, die
     # die anderen sechs haben. Er landet als "--timeout=$_RsyncTimeout" im argv
     # von w2u_run_chunk, w2u_sweep, w2u_verify UND w2u_count_remote - deshalb
@@ -2439,6 +2778,8 @@ w2u_preflight() {
     _VersionAll="$("$_RsyncBin" --version 2>&1)" || _VersionAll=""
     _Version="${_VersionAll%%"$_Nl"*}"
     w2u_log "rsync: $_RsyncBin ($_Version)"
+    w2u_rsync_extra
+    w2u_log "Zusatz-Argumente: ${_RsyncExtra[*]}"
     case "$_Version" in
         *openrsync*) w2u_log "openrsync erkannt - kein --info=progress2, kein --iconv (beides unkritisch)" ;;
     esac
@@ -2452,8 +2793,8 @@ w2u_preflight() {
     fi
     [ -z "$_ExcludeFrom" ] || [ -r "$_ExcludeFrom" ] || w2u_die "Ausschlussdatei nicht lesbar: $_ExcludeFrom"
 
-    "$_RsyncBin" --list-only -d "$_SrcUrl/" >/dev/null 2>&1 \
-        || w2u_die "Quelle nicht erreichbar: $_SrcUrl (laeuft START-RSYNC-SERVER.cmd? Port 873 offen?)"
+    _Probe="$("$_RsyncBin" ${_XProto:+"$_XProto"} --list-only -d "$_SrcUrl/" 2>&1 >/dev/null)" \
+        || w2u_die "Quelle nicht erreichbar: $_SrcUrl (laeuft START-RSYNC-SERVER.cmd? Port 873 offen?) - rsync sagte: $(printf '%s' "$_Probe" | tail -n 3 | tr '\n' ' ')"
 
     # Verankerte Ausschlussmuster werden ABGELEHNT, nicht
     # umgeschrieben.
@@ -2571,8 +2912,20 @@ w2u_preflight() {
 
     # Angelegt wird nur, wenn wirklich uebertragen wird: ein Trockenlauf, der
     # Verzeichnisse anlegt, ist kein Trockenlauf.
+    # Rechte aus einem Lauf vor dem --chmod-Fix reparieren (siehe
+    # w2u_fix_perms) - vor jedem Transfer und vor jeder Zaehlung, auch im
+    # --verify-only-Lauf: sonst bleibt "lokal ?" das Urteil.
+    if [ "$_DryRun" -eq 0 ]; then
+        w2u_fix_perms "$_DstRoot"
+    fi
+
     if [ "$_VerifyOnly" -eq 0 ] && [ "$_DryRun" -eq 0 ]; then
         mkdir -p "$_DstRoot"
+        if [ -n "$_ChownIds" ]; then
+            # Gleich jetzt, nicht erst nach PASS: der Ordner soll waehrend des
+            # wochenlangen Transfers schon dem Zielbenutzer gehoeren.
+            chown "$_ChownIds" "$_DstRoot" || w2u_warn "chown $_ChownIds $_DstRoot fehlgeschlagen - wird nach PASS erneut versucht"
+        fi
         # Geprueft wird, wo die Worker WIRKLICH schreiben - und das ist
         # $_DstRoot, nicht $_ParDst.
         #
@@ -2645,14 +2998,29 @@ w2u_verify_step() {
 # werden konnte, ist kein PASS. Gedruckt wurde er trotzdem - tee schreibt nach
 # stdout weiter, auch wenn die Datei scheitert.
 w2u_report_step() {
-    local _Rc=0
+    local _Rc=0 _Rep=""
+    # Herzschlag beenden, BEVOR das Urteil geschrieben wird: er liest und
+    # ersetzt die Statusdatei ebenfalls und koennte result= ueberschreiben.
+    if [ -n "$_HbPid" ]; then
+        kill "$_HbPid" 2>/dev/null || true
+        wait "$_HbPid" 2>/dev/null || true
+        _HbPid=""
+    fi
     if [ -n "$_LogDir" ] && [ -d "$_LogDir" ] && [ -w "$_LogDir" ]; then
-        w2u_report | tee "${_LogDir%/}/report.txt" || _Rc=$?
+        _Rep="${_LogDir%/}/report.txt"
+        w2u_report | tee "$_Rep" || _Rc=$?
     else
         # Kein Logverzeichnis (oder nicht beschreibbar): drucken geht vor
         # festhalten. Der Preflight hat die Beschreibbarkeit schon geprueft,
         # dieser Zweig ist der Riegel fuer alles, was danach noch passiert.
         w2u_report || _Rc=$?
+    fi
+    # Das Urteil fuer die TUI. Bewusst aus dem rc von w2u_report, nicht aus
+    # dem Text: rc 0 ist dort PASS, alles andere FAIL.
+    if [ "$_Rc" -eq 0 ]; then
+        w2u_status "phase=done" "result=PASS" "report=$_Rep" "kb_dst=$(w2u_dst_kb)"
+    else
+        w2u_status "phase=done" "result=FAIL" "report=$_Rep" "kb_dst=$(w2u_dst_kb)"
     fi
     return "$_Rc"
 }
@@ -2679,6 +3047,11 @@ w2u_report_step() {
 # zurueck, und die Meldung verspraeche Logs, die es nicht gibt.
 w2u_cleanup() {
     local _Rc=$? _LogEmpty=0
+    if [ -n "$_HbPid" ]; then
+        kill "$_HbPid" 2>/dev/null || true
+        wait "$_HbPid" 2>/dev/null || true
+        _HbPid=""
+    fi
     if [ -n "$_WorkRoot" ]; then
         # Kein Zurueckbenennen hier: es koennen noch rsync-Kinder in den
         # Zwischenordner schreiben. Der naechste Lauf raeumt auf.
@@ -2721,7 +3094,11 @@ w2u_cleanup() {
 # Signal kommt - bash fuehrt den Trap erst danach aus, dann ist das Kind
 # bereits fertig.
 w2u_on_signal() {
+    # Ein zweites Signal (systemd schickt TERM an die ganze cgroup, w2u run
+    # reicht es zusaetzlich weiter) darf das Aufraeumen nicht abbrechen.
+    trap '' INT TERM
     w2u_warn "abgebrochen - derselbe Aufruf setzt fort, bereits uebertragene Dateien bleiben liegen"
+    w2u_status "message=abgebrochen (Signal)"
     if command -v pkill >/dev/null 2>&1; then
         pkill -TERM -P $$ >/dev/null 2>&1 || true
     fi
@@ -2736,7 +3113,17 @@ main() {
     fi
     local _Rc=0 _Cnt=0
     _StartTs="$(date +%s)"
+    _Parsing=1
     w2u_parse_args "$@"
+    _Parsing=0
+    if [ -n "$_StatusFile" ]; then
+        # Frisch anlegen: Werte eines frueheren Laufs (result, message) duerfen
+        # nicht in diesen hineinwirken.
+        : > "$_StatusFile" 2>/dev/null || w2u_die "Statusdatei nicht schreibbar: $_StatusFile"
+        _StatusReady=1
+        w2u_status "phase=preflight" "pid=$$" "started=$(date +%s)" "src=$_SrcUrl" "dst=$_DstRoot" \
+            "result=" "message=" "report=" "chunks_total=0" "chunks_done=0" "kb_dst=" "parallel="
+    fi
 
     # $_TmpDir kommt aus mktemp -d und liegt damit auf einem LOKALEN
     # Dateisystem. Das ist keine Bequemlichkeit: $_ResultFile
@@ -2750,6 +3137,9 @@ main() {
     trap 'w2u_cleanup' EXIT
     trap 'w2u_on_signal' INT TERM
 
+    # Schon vor dem Preflight: auf Millionen Dateien dauern Reparatur der
+    # Rechte, Sperre und Aufraeumen Minuten - die TUI soll sehen, dass er lebt.
+    w2u_heartbeat_start
     w2u_preflight
 
     _ResultFile="$_TmpDir/results"
@@ -2762,6 +3152,7 @@ main() {
 
     if [ "$_VerifyOnly" -eq 1 ]; then
         w2u_log "nur Verifikation - es wird nichts uebertragen"
+        w2u_status "phase=verify"
         w2u_verify_step
         _Rc=0
         w2u_report_step || _Rc=$?
@@ -2769,6 +3160,7 @@ main() {
     fi
 
     if [ "$_ParMode" = "parallel" ]; then
+        w2u_status "phase=decompose"
         w2u_log "zerlege $_SrcUrl"
         w2u_decompose "$_SrcUrl" $((_ThresholdFactor * _PMax)) "$_TmpDir/work"
 
@@ -2807,8 +3199,12 @@ main() {
     fi
 
     if [ "$_ParMode" = "parallel" ]; then
+        if [ "$_NewDays" -gt 0 ]; then
+            w2u_newfirst
+        fi
         mkdir -p "$_TmpDir/chunks"
         w2u_chunk "$_TmpDir/work.par" "$_TmpDir/chunks" "$_PMax" "$_TmpDir/chunks.list"
+        w2u_status "phase=parallel" "chunks_total=$(grep -c . "$_TmpDir/chunks.list" || true)" "chunks_done=0"
         w2u_log "parallele Phase: $_ParSrc/ -> $_ParDst/ (Praefix '${_SrcPrefix:-<keiner>}')"
         # Zwei Messpunkte um die ganze Phase. Sie kosten je ein "du -sk" (dieselbe
         # Funktion, die die Auto-Messung ohnehin benutzt) und sind die Grundlage
@@ -2819,6 +3215,7 @@ main() {
         _ParKbBefore="$(w2u_dst_kb)"
         w2u_run_all "$_TmpDir/chunks.list"
         _ParKbAfter="$(w2u_dst_kb)"
+        w2u_status "chunks_done=$(grep -c . "$_ResultFile" || true)" "kb_dst=$_ParKbAfter"
         w2u_stage_out
     else
         # Einstroemig: kein Zerlegen, keine Chunks, keine Buchfuehrung - der
@@ -2832,6 +3229,7 @@ main() {
         w2u_log "einstroemige Uebertragung (keine Zerlegung, keine Chunk-Buchfuehrung) - der Vergleichslauf urteilt"
     fi
 
+    w2u_status "phase=sweep"
     w2u_log "Sweep-Pass"
     _Rc=0
     w2u_sweep >> "$_LogDir/sweep.log" 2>&1 || _Rc=$?
@@ -2842,11 +3240,26 @@ main() {
     fi
 
     if [ "$_DoVerify" -eq 1 ]; then
+        w2u_status "phase=verify"
         w2u_verify_step
     fi
 
     _Rc=0
     w2u_report_step || _Rc=$?
+    if [ "$_Rc" -eq 0 ] && [ -n "$_ChownIds" ]; then
+        w2u_status "phase=chown"
+        w2u_log "Besitzer setzen: chown -R $_Chown ($_ChownIds) $_DstRoot"
+        if w2u_final_chown; then
+            w2u_log "Besitzer gesetzt: alles unter $_DstRoot gehoert $_Chown"
+            w2u_status "phase=done"
+        else
+            # Der Bestand ist vollstaendig, nur der Besitzer stimmt nicht
+            # ueberall - fuer den Dienst trotzdem kein Erfolg.
+            w2u_warn "chown -R $_ChownIds $_DstRoot fehlgeschlagen - Daten vollstaendig, Besitzer NICHT ueberall gesetzt"
+            w2u_status "phase=done" "result=FAIL" "message=chown -R fehlgeschlagen"
+            _Rc=1
+        fi
+    fi
     exit "$_Rc"
 }
 

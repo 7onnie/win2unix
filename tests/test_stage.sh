@@ -136,13 +136,33 @@ t_assert_eq "nein" "$_Has" "beide mit Inhalt: die eigene Sperre ist wieder frei"
 # ---- 5: Sperre -------------------------------------------------------------
 _Z="$_TmpRoot/z5"
 mkdir -p "$_Z/.w2u-stage-BRIEFE.lock"
-echo "$$" > "$_Z/.w2u-stage-BRIEFE.lock/pid"
+# Ein lebender Prozess, der wie ein pull.sh aussieht (argv enthaelt pull.sh).
+bash -c 'sleep 120; :' pull.sh &
+_LivePull=$!
+echo "$_LivePull" > "$_Z/.w2u-stage-BRIEFE.lock/pid"
 _Out="$(bash "$_Root/pull.sh" --jobs 4 "$_Url" "$_Z" 2>&1)"; _Rc=$?
 t_assert_rc 1 "$_Rc" "lebende Sperre: Abbruch"
-t_assert_contains "$_Out" "$$" "lebende Sperre: die Meldung nennt den haltenden Prozess"
-t_assert_eq "$$" "$(cat "$_Z/.w2u-stage-BRIEFE.lock/pid" 2>/dev/null)" "lebende Sperre: fremde Sperre bleibt unangetastet"
+t_assert_contains "$_Out" "$_LivePull" "lebende Sperre: die Meldung nennt den haltenden Prozess"
+t_assert_eq "$_LivePull" "$(cat "$_Z/.w2u-stage-BRIEFE.lock/pid" 2>/dev/null)" "lebende Sperre: fremde Sperre bleibt unangetastet"
 [ -e "$_Z/BRIEFE" ] && _Has=ja || _Has=nein
 t_assert_eq "nein" "$_Has" "lebende Sperre: nichts uebertragen"
+
+kill "$_LivePull" 2>/dev/null
+wait "$_LivePull" 2>/dev/null
+
+# PID-Wiederverwendung nach Reboot (Review-Fund): die PID in der Sperre gehoert
+# jetzt einem fremden, lebenden Prozess (kein pull.sh) -> Sperre ist verwaist.
+_Z="$_TmpRoot/z5b"
+mkdir -p "$_Z/.w2u-stage-BRIEFE.lock"
+sleep 120 &
+_Fremd=$!
+echo "$_Fremd" > "$_Z/.w2u-stage-BRIEFE.lock/pid"
+_Out="$(bash "$_Root/pull.sh" --jobs 4 "$_Url" "$_Z" 2>&1)"; _Rc=$?
+kill "$_Fremd" 2>/dev/null
+wait "$_Fremd" 2>/dev/null
+t_assert_rc 0 "$_Rc" "PID gehoert einem fremden Prozess (kein pull.sh): Sperre verwaist, Lauf geht"
+t_assert_contains "$_Out" "ERGEBNIS: PASS" "PID-Wiederverwendung: PASS"
+s_clean "$_Z" "PID-Wiederverwendung"
 
 _Z="$_TmpRoot/z6"
 sh -c 'exit 0' &
@@ -218,6 +238,58 @@ t_assert_rc 0 "$_Rc" "Ziel ist Symlink: rc 0"
 t_assert_contains "$_Out" "parallele Phase:" "Ziel ist Symlink: trotzdem parallel"
 s_absent "$_Out" "EINSTROEMIG" "Ziel ist Symlink: kein Rueckfall"
 t_assert_eq "" "$(diff -r "$_SrcB" "$_TmpRoot/gross/BRIEFE" 2>&1)" "Ziel ist Symlink: inhaltlich identisch"
+
+# ---- 7: Symlink waehrend der parallelen Phase (Issue #9) -------------------
+# Die Phase dauert im Ernstfall Tage; so lange soll <ziel>/BRIEFE nutzbar
+# sein. Eine Sonde ersetzt den Sweep und haelt fest, wie <ziel>/BRIEFE direkt
+# nach der parallelen Phase aussah - zu dem Zeitpunkt ist schon zurueck-
+# benannt. Deshalb sondiert sie VOR w2u_stage_out (Wrapper um w2u_run_all).
+_Probe="$_TmpRoot/probe.sh"
+cat > "$_Probe" <<'PROBE'
+set -uo pipefail
+_Pull="$1"; shift
+_State="$1"; shift
+W2U_LIB_ONLY=1 . "$_Pull"
+eval "_orig_run_all() $(declare -f w2u_run_all | tail -n +2)"
+w2u_run_all() {
+    _orig_run_all "$@"
+    {
+        [ -L "$_DstRoot" ] && printf 'LINK=ja\n' || printf 'LINK=nein\n'
+        printf 'ZIEL=%s\n' "$(readlink "$_DstRoot" 2>/dev/null)"
+        printf 'LESBAR=%s\n' "$(cat "$_DstRoot/1/1 AC.DOC" 2>/dev/null)"
+    } >> "$_State"
+}
+main "$@"
+PROBE
+_Z="$_TmpRoot/z11"
+mkdir -p "$_Z"
+_St="$_TmpRoot/state11"
+: > "$_St"
+_Out="$(bash "$_Probe" "$_Root/pull.sh" "$_St" --jobs 2 "$_Url" "$_Z" 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "Symlink-Phase: Lauf endet mit rc 0"
+t_assert_eq "ja" "$(sed -n 's/^LINK=//p' "$_St")" "waehrend der Phase ist <ziel>/BRIEFE ein Symlink"
+t_assert_eq ".w2u-stage-BRIEFE/Konv/Albis/AlbisWin/BRIEFE" "$(sed -n 's/^ZIEL=//p' "$_St")" "der Link ist relativ und zeigt auf das Blatt"
+t_assert_eq "brief 1" "$(sed -n 's/^LESBAR=//p' "$_St")" "Dateien sind ueber den Link lesbar"
+[ -d "$_Z/BRIEFE" ] && [ ! -L "$_Z/BRIEFE" ] && _Has=ja || _Has=nein
+t_assert_eq "ja" "$_Has" "nach PASS ist <ziel>/BRIEFE ein echter Ordner"
+t_assert_eq "" "$(diff -r "$_SrcB" "$_Z/BRIEFE" 2>&1)" "Symlink-Phase: inhaltlich identisch"
+s_clean "$_Z" "Symlink-Phase"
+
+# Absturz mit Link am Platz (kill -9 waehrend der Phase): Link + Blatt im
+# Zwischenordner. Der naechste Lauf raeumt den eigenen Link weg und setzt fort.
+_Z="$_TmpRoot/z12"
+_Leaf="$_Z/.w2u-stage-BRIEFE/Konv/Albis/AlbisWin/BRIEFE"
+mkdir -p "$_Leaf/1"
+cp -p "$_SrcB/1/1 AC.DOC" "$_Leaf/1/"
+ln -s ".w2u-stage-BRIEFE/Konv/Albis/AlbisWin/BRIEFE" "$_Z/BRIEFE"
+_Out="$(bash "$_Root/pull.sh" --jobs 2 "$_Url" "$_Z" 2>&1)"; _Rc=$?
+t_assert_rc 0 "$_Rc" "Absturz mit Link: rc 0"
+t_assert_contains "$_Out" "ERGEBNIS: PASS" "Absturz mit Link: PASS"
+s_absent "$_Out" "EINSTROEMIG" "Absturz mit Link: der eigene Link fuehrt NICHT zum Symlink-Rueckfall"
+[ -d "$_Z/BRIEFE" ] && [ ! -L "$_Z/BRIEFE" ] && _Has=ja || _Has=nein
+t_assert_eq "ja" "$_Has" "Absturz mit Link: danach echter Ordner"
+t_assert_eq "" "$(diff -r "$_SrcB" "$_Z/BRIEFE" 2>&1)" "Absturz mit Link: inhaltlich identisch"
+s_clean "$_Z" "Absturz mit Link"
 
 # ---- 6: Schraegstrich-Form bleibt einstroemig, ohne Zwischenordner ----------
 _Z="$_TmpRoot/z7"

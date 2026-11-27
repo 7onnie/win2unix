@@ -153,6 +153,50 @@ Quell-Platte oder deren CPU (ein einzelner rsync-Prozess auf Windows ist in der 
 CPU-gebunden). Deshalb *misst* das Skript die Parallelität statt sie zu raten. Dazu kommt die
 Verifikation, die es beim blanken rsync nicht gibt.
 
+### Als Dienst auf Linux (Fire & Forget)
+
+Für Transfers über Tage oder Wochen: jeder Transfer läuft als eigener systemd-Dienst, ohne
+Anmeldung, über Neustarts hinweg, und setzt nach jedem Abbruch selbst fort. Die Dateien gehören
+ab dem ersten Byte dem gewünschten Benutzer. Voraussetzung: systemd, Python 3, GNU rsync ≥ 3.1.
+
+Einmal einrichten (danach braucht der Bediener nie wieder ein Passwort):
+
+```bash
+git clone https://github.com/7onnie/win2unix.git /tmp/win2unix
+sudo bash /tmp/win2unix/linux/install.sh
+```
+
+Bedienen, als normaler Benutzer:
+
+```bash
+w2u                                   # TUI: alle Transfers, [n]eu [s]tart [x] stop [r]estart [l]og [b]ericht
+w2u add briefe --ip 192.168.2.3 --pfad 'E:\Konvertierung\S1_S3\BRIEFE' \
+        --ziel /opt/data/files --besitzer tomedo:tomedo --start
+w2u list
+w2u stop briefe ; w2u start briefe    # Stop bleibt auch nach Reboot gestoppt
+```
+
+- **Besitzer:** rsync setzt `BENUTZER:GRUPPE` beim Schreiben (`--chown`), nach dem PASS folgt
+  `chown -R` als Abschluss.
+- **Neue Dateien zuerst:** Vorgabe 365 Tage (`--neu-zuerst`). Was in diesem Zeitraum geändert
+  wurde, kommt vor dem Archiv. Danach folgt der normale Lauf mit voller Prüfung.
+- **Während der Übertragung** zeigt `<ziel>/NAME` per Symlink auf den Zwischenordner. Die
+  Dateien sind dort schon nutzbar.
+- **Fehler:**
+  - Verbindungsabbrüche werden alle 2 Minuten neu versucht, ohne Obergrenze.
+  - Einrichtungsfehler (falsche URL, unbekannter Benutzer) stoppen sofort.
+  - Nach drei echten FAIL-Urteilen hintereinander gilt der Auftrag als „aufgegeben". Die TUI
+    zeigt ihn dann rot, bis du ihn neu startest.
+- **Erledigt (PASS):** Der Dienst wird deaktiviert, ein Reboot prüft also nicht neu.
+- **Ablage:**
+  - Status und Logs: `/var/lib/win2unix/<name>/`
+  - Aufträge: `/etc/win2unix/jobs/<name>.conf`
+  - Journal: `journalctl -u win2unix@<name>`
+- **Laufenden Terminal-Transfer übernehmen:** ihn beenden, dann `w2u add` mit derselben Quelle
+  und demselben Ziel. Der Dienst übernimmt die verwaiste Sperre und setzt am Bestand fort.
+
+Ohne Dienst, von Hand: `sudo bash /tmp/pull.sh --chown tomedo:tomedo --neu-zuerst 365 …`
+
 ### Optionen
 
 | Option | Wirkung |
@@ -165,6 +209,9 @@ Verifikation, die es beim blanken rsync nicht gibt.
 | `--no-verify` | Verifikation überspringen (nicht empfohlen — ein PASS heißt dann nur noch "jeder Chunk hat rc 0 gemeldet") |
 | `--checksum` | Verifikation zusätzlich mit Prüfsummen (`-c`); liest den gesamten Bestand auf **beiden** Seiten erneut, grob 1–2 h pro TB |
 | `--dry-run` | zeigt die Arbeitspakete, überträgt nichts |
+| `--chown U:G` | Besitzer beim Schreiben setzen, nach PASS `chown -R`. Nur als root, nur mit GNU rsync |
+| `--neu-zuerst TAGE` | Dateien der letzten TAGE Tage vorab übertragen (Vorlauf ohne Beweiskraft), 0 = aus |
+| `--status-file PFAD` | Phase, Fortschritt und Urteil als `key=value` (für `w2u`/TUI) |
 | `--version`, `-h` | Version bzw. Hilfe |
 
 Ohne `--jobs` misst das Werkzeug die günstigste Parallelität an echter Arbeit: es fährt die Stufen
