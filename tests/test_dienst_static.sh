@@ -47,8 +47,22 @@ t_assert_eq "ja" "$(has "$_Tpl" '<RunOnlyIfIdle>false</RunOnlyIfIdle>')" "laeuft
 t_assert_eq "ja" "$(has "$_Tpl" '<Priority>4</Priority>')" "normale Prioritaet (Standard 7 drosselt Platte und CPU)"
 t_assert_eq "ja" "$(has "$_Tpl" '<RestartOnFailure>')" "startet nach einem Absturz neu"
 t_assert_eq "ja" "$(has "$_Tpl" '<WorkingDirectory>@WORKDIR@</WorkingDirectory>')" "Arbeitsverzeichnis = Bundle (lock/pid/log stehen relativ)"
-t_assert_eq "ja" "$(has "$_Tpl" '<Command>@WORKDIR@\\bin\\rsync.exe</Command>')" "startet das mitgelieferte rsync.exe"
-t_assert_eq "ja" "$(has "$_Tpl" '<Arguments>--daemon --no-detach --config=rsyncd.conf</Arguments>')" "Daemon mit --no-detach (die Aufgabe IST der Prozess)"
+t_assert_eq "ja" "$(has "$_Tpl" '<Arguments>/c rsyncd-loop.cmd</Arguments>')" "startet die Neustart-Schleife (RestartOnFailure greift nur beim Start)"
+t_assert_eq "ja" "$(has "$_Tpl" '<Count>255</Count>')" "RestartOnFailure-Count im Schema-Bereich (max 255)"
+_Loop="$_Win/rsyncd-loop.cmd"
+t_assert_eq "ja" "$(has "$_Loop" 'bin\\rsync.exe --daemon --no-detach --config=rsyncd.conf')" "Schleife startet den Daemon im Vordergrund"
+t_assert_eq "ja" "$(has "$_Loop" 'goto Loop')" "Schleife startet nach Ende neu"
+_Lf="$(LC_ALL=C grep -c $'[^\r]$' "$_Loop" 2>/dev/null)" || _Lf=0
+t_assert_eq "0" "$_Lf" "Schleife: jede Zeile endet mit CRLF"
+
+# [!] mit verzoegerter Erweiterung: ein einzelnes ! verschwindet, zwei paaren
+# sich mit !var! - die Meldung wird verstuemmelt. Nach setlocal also nur [^^!].
+for _F in "$_Start" "$_Stop"; do
+    _Bad="$(awk '/EnableDelayedExpansion/ { _On = 1 } _On && /echo  \[!\]/ { _N++ } END { print _N + 0 }' "$_F")"
+    t_assert_eq "0" "$_Bad" "${_F##*/}: kein unmaskiertes [!] nach setlocal EnableDelayedExpansion"
+done
+t_assert_eq "ja" "$(has "$_Start" 'schtasks /Query /TN "win2unix-rsyncd"')" "START erkennt einen alten Server im Fenster"
+t_assert_eq "ja" "$(has "$_Start" 'rsync://127.0.0.1/!_FirstDrv!/')" "START liest nach dem Start ein Modul ueber das Netz"
 
 # ---- START -------------------------------------------------------------------
 t_assert_eq "ja" "$(has "$_Start" 'schtasks /Create /TN "win2unix-rsyncd" /XML')" "START registriert die Aufgabe aus XML"

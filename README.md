@@ -24,6 +24,10 @@ Absicht, die Transfers dauern oft Tage. **Beenden und entfernen: `STOP-RSYNC-SER
 (ebenfalls als Administrator, fordert die Rechte selbst an). Laufende Transfers brechen dabei
 ab, `pull.sh` setzt beim nächsten Aufruf fort.
 
+Stürzt `rsync.exe` ab, startet die Aufgabe ihn nach 60 Sekunden neu (`rsyncd-loop.cmd`,
+vermerkt in `rsyncd.log`). Nach dem Start prüft das Skript selbst, dass ein Laufwerk über das
+Netz lesbar ist, nicht nur, dass der Port offen ist.
+
 Ein zweiter Klick auf `START-RSYNC-SERVER.cmd`, während der Server läuft, ändert **nichts**:
 Er meldet „läuft bereits", lässt `rsyncd.conf` stehen und zeigt nur die Befehle erneut an.
 Wer die Konfiguration neu erzeugen will, ruft erst `STOP-RSYNC-SERVER.cmd` auf und dann

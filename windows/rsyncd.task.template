@@ -13,9 +13,10 @@
   - Akku/Leerlauf aus: sonst stoppt Windows die Aufgabe still.
   - Priority 4 = normale CPU- und E/A-Prioritaet. Der Standard 7 drosselt
     beides, und das Lesen der Quellplatte ist hier der Engpass.
-  - RestartOnFailure: stirbt rsync.exe, startet es nach einer Minute neu.
-  - Option no-detach: der Daemon IST der Prozess der Aufgabe. "schtasks /End" und
-    der Status "Wird ausgefuehrt" bedeuten damit wirklich den Server.
+  - RestartOnFailure greift nur, wenn die Aufgabe nicht STARTEN kann. Einen
+    Absturz von rsync.exe mitten im Transfer faengt rsyncd-loop.cmd ab: es
+    startet den Daemon nach 60 s neu, solange die Aufgabe laeuft.
+  - Count 255: das Schema erlaubt hoechstens 255 (unsignedByte).
   - WorkingDirectory: lock/pid/log in rsyncd.conf stehen relativ.
 -->
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -53,13 +54,13 @@
     <Priority>4</Priority>
     <RestartOnFailure>
       <Interval>PT1M</Interval>
-      <Count>999</Count>
+      <Count>255</Count>
     </RestartOnFailure>
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>@WORKDIR@\bin\rsync.exe</Command>
-      <Arguments>--daemon --no-detach --config=rsyncd.conf</Arguments>
+      <Command>%SystemRoot%\System32\cmd.exe</Command>
+      <Arguments>/c rsyncd-loop.cmd</Arguments>
       <WorkingDirectory>@WORKDIR@</WorkingDirectory>
     </Exec>
   </Actions>

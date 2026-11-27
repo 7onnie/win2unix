@@ -29,7 +29,7 @@ if "!_IsAdmin!"=="nein" (
 )
 if "!_IsAdmin!"=="nein" (
     if "%~1"=="elevated" (
-        echo  [!] Auch nach der Rechte-Anfrage keine Administrator-Rechte erkannt.
+        echo  [^^!] Auch nach der Rechte-Anfrage keine Administrator-Rechte erkannt.
         echo      Bitte ein cmd-Fenster als Administrator oeffnen und darin starten.
         echo.
         pause
@@ -37,16 +37,27 @@ if "!_IsAdmin!"=="nein" (
     )
     echo  [i] Keine Administrator-Rechte - fordere sie an ^(UAC-Abfrage^)...
     powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList 'elevated' -WorkingDirectory '%~dp0' -Verb RunAs"
+    if errorlevel 1 (
+        echo  [^^!] Rechte-Anfrage abgebrochen oder fehlgeschlagen - nichts beendet.
+        echo.
+        pause
+    )
     exit /b
 )
 
 echo  [+] Beende und entferne die geplante Aufgabe "win2unix-rsyncd"...
-schtasks /End /TN "win2unix-rsyncd" >nul 2>&1
-schtasks /Delete /TN "win2unix-rsyncd" /F >nul 2>&1
+schtasks /Query /TN "win2unix-rsyncd" >nul 2>&1
 if errorlevel 1 (
     echo  [i]   Es war keine Aufgabe "win2unix-rsyncd" registriert.
 ) else (
-    echo  [+]   Aufgabe entfernt.
+    schtasks /End /TN "win2unix-rsyncd" >nul 2>&1
+    schtasks /Delete /TN "win2unix-rsyncd" /F >nul 2>&1
+    if errorlevel 1 (
+        echo  [^^!]   Aufgabe "win2unix-rsyncd" liess sich nicht entfernen.
+        echo        In der Aufgabenplanung von Hand loeschen.
+    ) else (
+        echo  [+]   Aufgabe entfernt.
+    )
 )
 
 :: Auch ein Daemon aus einer alten Version (im Fenster gestartet) haelt Port
@@ -58,7 +69,7 @@ ping -n 3 127.0.0.1 >nul
 
 call :PortHolder
 if defined _PortPid (
-    echo  [!] Port 873 ist weiter belegt von "!_PortName!" ^(PID !_PortPid!^).
+    echo  [^^!] Port 873 ist weiter belegt von "!_PortName!" ^(PID !_PortPid!^).
     echo      Von Hand beenden:  taskkill /PID !_PortPid! /F
     echo.
     pause
@@ -88,5 +99,6 @@ for /f "tokens=2,3,5" %%A in ('netstat -ano 2^>nul') do (
 )
 if defined _PortPid (
     for /f "tokens=1 delims=," %%N in ('tasklist /FI "PID eq !_PortPid!" /FO CSV /NH 2^>nul') do set "_PortName=%%~N"
+    if /i not "!_PortName:~-4!"==".exe" set "_PortName=?"
 )
 exit /b 0
