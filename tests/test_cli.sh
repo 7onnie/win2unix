@@ -233,7 +233,7 @@ _reset_opts
 # ohne die Ablehnung nicht wirklich 10000 Prozesse entstehen - der Trockenlauf
 # endet ohne die Ablehnung mit rc 0.
 _Out="$(bash "$_Root/pull.sh" --jobs 10000 --dry-run --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp" 2>&1)"; _Rc=$?
-t_assert_rc 1 "$_Rc" "--jobs 10000 wird abgelehnt (ohne die Ablehnung liefe derselbe Aufruf auf rc 0)"
+t_assert_rc 3 "$_Rc" "--jobs 10000 wird abgelehnt (ohne die Ablehnung liefe derselbe Aufruf auf rc 0)"
 t_assert_contains "$_Out" "Obergrenze" "die Ablehnung nennt die Obergrenze"
 _Out="$(bash "$_Root/pull.sh" --jobs 64 --dry-run --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp" 2>&1)"; _Rc=$?
 t_assert_rc 0 "$_Rc" "--jobs 64 (die Grenze selbst) bleibt erlaubt - die Ablehnung greift nicht zu weit"
@@ -254,12 +254,12 @@ rm -rf "$_DstBase"
 # die Option, der eine weitere OPTION folgt (die wuerde sonst stillschweigend
 # als Wert verschluckt). Wer nur eine Form prueft, laesst die andere offen.
 _Out="$(bash "$_Root/pull.sh" rsync://10.0.0.1/e/x /tmp --jobs 2>&1)"; _Rc=$?
-t_assert_rc 1 "$_Rc" "--jobs am Zeilenende bricht kontrolliert ab"
+t_assert_rc 3 "$_Rc" "--jobs am Zeilenende bricht kontrolliert ab"
 t_assert_contains "$_Out" "ABBRUCH" "--jobs am Zeilenende meldet ABBRUCH"
 t_assert_contains "$_Out" "braucht ein Argument" "--jobs am Zeilenende nennt den Grund"
 
 _Out="$(bash "$_Root/pull.sh" --jobs --dry-run rsync://10.0.0.1/e/x /tmp 2>&1)"; _Rc=$?
-t_assert_rc 1 "$_Rc" "--jobs gefolgt von einer Option bricht ab, statt sie zu verschlucken"
+t_assert_rc 3 "$_Rc" "--jobs gefolgt von einer Option bricht ab, statt sie zu verschlucken"
 t_assert_contains "$_Out" "--dry-run" "die verschluckte Option wird beim Namen genannt"
 # Wichtig ist der GRUND: ohne die Pruefung auf ein fuehrendes "-" landete
 # "--dry-run" als WERT in _JobCnt und stuerbe erst an der Zahlenpruefung - mit
@@ -268,25 +268,25 @@ t_assert_contains "$_Out" "--dry-run" "die verschluckte Option wird beim Namen g
 t_assert_contains "$_Out" "braucht ein Argument" "und zwar als fehlendes Argument, nicht als kaputte Zahl"
 
 _Out="$(bash "$_Root/pull.sh" rsync://10.0.0.1/e/x /tmp --log-dir 2>&1)"; _Rc=$?
-t_assert_rc 1 "$_Rc" "auch --log-dir am Zeilenende bricht ab"
+t_assert_rc 3 "$_Rc" "auch --log-dir am Zeilenende bricht ab"
 
 # --- Ungueltige Argumente -----------------------------------------------------
 _Out="$(bash "$_Root/pull.sh" --gibtsnicht rsync://10.0.0.1/e/x /tmp 2>&1)"; _Rc=$?
-t_assert_rc 1 "$_Rc" "unbekannte Option bricht ab"
+t_assert_rc 3 "$_Rc" "unbekannte Option bricht ab"
 t_assert_contains "$_Out" "unbekannte Option" "unbekannte Option wird benannt"
 
 _Out="$(bash "$_Root/pull.sh" rsync://10.0.0.1/e/x /tmp /noch/eins 2>&1)"; _Rc=$?
-t_assert_rc 1 "$_Rc" "drittes Positionsargument bricht ab"
+t_assert_rc 3 "$_Rc" "drittes Positionsargument bricht ab"
 
 _Out="$(bash "$_Root/pull.sh" rsync://10.0.0.1/e/x 2>&1)"; _Rc=$?
 t_assert_rc 2 "$_Rc" "fehlendes Zielverzeichnis-Argument liefert Usage und rc 2"
 t_assert_contains "$_Out" "Aufruf:" "und zwar mit Usage"
 
 _Out="$(bash "$_Root/pull.sh" /lokal/pfad /tmp 2>&1)"; _Rc=$?
-t_assert_rc 1 "$_Rc" "Quelle ohne rsync:// bricht ab"
+t_assert_rc 3 "$_Rc" "Quelle ohne rsync:// bricht ab"
 
 _Out="$(bash "$_Root/pull.sh" rsync://10.0.0.1/ /tmp 2>&1)"; _Rc=$?
-t_assert_rc 1 "$_Rc" "Quelle ohne Modul bricht ab"
+t_assert_rc 3 "$_Rc" "Quelle ohne Modul bricht ab"
 t_assert_contains "$_Out" "Modul" "Quelle ohne Modul nennt den Grund"
 
 # --- Flag-Kombinationen: abgelehnt --------------------------------------------
@@ -303,19 +303,19 @@ printf 'Thumbs.db\n' > "$_Tmp/ex.txt"
 mkdir -p "$_Tmp/dst-comb/Archiv"
 printf 'inhalt\n' > "$_Tmp/dst-comb/Archiv/datei.txt"
 _Out="$(bash "$_Root/pull.sh" --verify-only --no-verify rsync://10.0.0.1/e/x /tmp 2>&1)"; _Rc=$?
-t_assert_rc 1 "$_Rc" "--verify-only + --no-verify wird abgelehnt (Ruling 4.1)"
+t_assert_rc 3 "$_Rc" "--verify-only + --no-verify wird abgelehnt (Ruling 4.1)"
 t_assert_contains "$_Out" "--no-verify" "Ablehnung nennt beide Optionen"
 
 _Out="$(bash "$_Root/pull.sh" --verify-only --exclude-from "$_Tmp/ex.txt" rsync://10.0.0.1/e/x /tmp 2>&1)"; _Rc=$?
-t_assert_rc 1 "$_Rc" "--verify-only + --exclude-from wird sofort abgelehnt (Ruling 5)"
+t_assert_rc 3 "$_Rc" "--verify-only + --exclude-from wird sofort abgelehnt (Ruling 5)"
 t_assert_contains "$_Out" "bindend" "Ablehnung erklaert die fehlende bindende Beweisschicht"
 
 _Out="$(bash "$_Root/pull.sh" --verify-only --dry-run --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp/dst-comb" 2>&1)"; _Rc=$?
-t_assert_rc 1 "$_Rc" "--verify-only + --dry-run wird abgelehnt (zwei Betriebsarten)"
+t_assert_rc 3 "$_Rc" "--verify-only + --dry-run wird abgelehnt (zwei Betriebsarten)"
 t_assert_contains "$_Out" "Betriebsarten" "und nennt den Grund - ohne die Ablehnung liefe derselbe Aufruf auf PASS"
 
 _Out="$(bash "$_Root/pull.sh" --no-verify --checksum --rsync "$_Fake" rsync://10.0.0.1/e/Archiv "$_Tmp/dst-comb" 2>&1)"; _Rc=$?
-t_assert_rc 1 "$_Rc" "--no-verify + --checksum wird abgelehnt (Wirkung widerspricht der Absicht)"
+t_assert_rc 3 "$_Rc" "--no-verify + --checksum wird abgelehnt (Wirkung widerspricht der Absicht)"
 t_assert_contains "$_Out" "bewirkt --checksum NICHTS" "und sagt, warum - ohne die Ablehnung liefe derselbe Aufruf auf PASS"
 
 # --- Flag-Kombinationen: erlaubt ----------------------------------------------
@@ -602,7 +602,7 @@ _reset_opts
 # der AUFRUFFORM als zweitem Faktor. Ohne Chunk-Buchfuehrung traegt nur noch
 # der Dateizahl-Vergleich - faellt der auch weg, kann der Lauf nur FAIL melden.
 _Out="$(bash "$_Root/pull.sh" --no-verify "rsync://10.0.0.1/e/Daten/Archiv/" /tmp 2>&1)"; _Rc=$?
-t_assert_rc 1 "$_Rc" "einstroemig + --no-verify wird abgelehnt"
+t_assert_rc 3 "$_Rc" "einstroemig + --no-verify wird abgelehnt"
 t_assert_contains "$_Out" "einstroemig" "die Ablehnung nennt die Aufrufform"
 
 # Hier kann der rc allein NICHT unterscheiden: ohne die Ablehnung liefe dieser
@@ -612,7 +612,7 @@ t_assert_contains "$_Out" "einstroemig" "die Ablehnung nennt die Aufrufform"
 mkdir -p "$_Tmp/dst-ein-ex/Archiv"
 printf 'inhalt\n' > "$_Tmp/dst-ein-ex/Archiv/datei.txt"
 _Out="$(bash "$_Root/pull.sh" --exclude-from "$_Tmp/ex.txt" --rsync "$_Fake" "rsync://10.0.0.1/e/Daten/Archiv/" "$_Tmp/dst-ein-ex" 2>&1)"; _Rc=$?
-t_assert_rc 1 "$_Rc" "einstroemig + --exclude-from wird abgelehnt"
+t_assert_rc 3 "$_Rc" "einstroemig + --exclude-from wird abgelehnt"
 t_assert_contains "$_Out" "einstroemig" "die Ablehnung nennt die Aufrufform"
 case "$_Out" in
     *Abschlussbericht*) _Has=ja ;;
