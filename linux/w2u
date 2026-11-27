@@ -1,0 +1,667 @@
+#!/usr/bin/env python3
+"""w2u - win2unix-Transfers als systemd-Dienste verwalten (Issue #9).
+
+Ein Auftrag = ein Dienst win2unix@<name>.service, der pull.sh als root
+ausfuehrt, bis PASS. Dieses Programm ist zugleich:
+
+  w2u                 TUI (Liste aller Auftraege, steuern)
+  w2u add ...         Auftrag anlegen
+  w2u list            Auftraege mit Status
+  w2u start|stop|restart|remove|log NAME
+  w2u run NAME        Einstieg der Dienst-Vorlage (nur systemd ruft das auf)
+
+Nur Python-Standardbibliothek, ab 3.9. Pfade per Umgebung ueberschreibbar
+(W2U_ETC, W2U_VAR, W2U_OPT, W2U_PULL) - fuer Tests, nicht fuer den Betrieb.
+"""
+import argparse
+import datetime
+import grp
+import os
+import pwd
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ETC = Path(os.environ.get("W2U_ETC", "/etc/win2unix"))
+VAR = Path(os.environ.get("W2U_VAR", "/var/lib/win2unix"))
+OPT = Path(os.environ.get("W2U_OPT", "/opt/win2unix"))
+PULL = os.environ.get("W2U_PULL", str(OPT / "pull.sh"))
+UNIT = "win2unix@{}.service"
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+GIVE_UP_AFTER = 3          # echte FAIL-Urteile hintereinander, dann "aufgegeben"
+STALE_SECS = 300           # ohne Rueckmeldung, waehrend der Dienst laeuft
+KEEP_RUN_LOGS = 10
+DEFAULT_NEWDAYS = 365
+
+
+# ---------------------------------------------------------------------------
+# Hilfen
+# ---------------------------------------------------------------------------
+def valid_name(name: str) -> bool:
+    return bool(NAME_RE.match(name or ""))
+
+
+def source_url(ip: str, path: str) -> str:
+    """Windows-Pfad (F:\\a\\b oder f:/a/b) plus IP -> rsync://ip/f/a/b.
+
+    Eine fertige rsync://-URL wird unveraendert (ohne Schraegstrich am Ende)
+    zurueckgegeben. Das Laufwerk allein ist kein Auftrag: ohne Ordnernamen
+    gaebe es kein <ziel>/NAME.
+    """
+    path = (path or "").strip()
+    if path.startswith("rsync://"):
+        return path.rstrip("/")
+    ip = (ip or "").strip()
+    if not ip:
+        raise ValueError("Quell-IP fehlt")
+    m = re.match(r"^([A-Za-z]):[\\/]*(.*)$", path)
+    if not m:
+        raise ValueError(f"kein Windows-Pfad mit Laufwerk: {path!r} (Beispiel F:\\Ordner\\BRIEFE)")
+    drive, rest = m.group(1).lower(), m.group(2).replace("\\", "/").strip("/")
+    rest = re.sub(r"/+", "/", rest)
+    if not rest:
+        raise ValueError("nur ein Laufwerk angegeben - welcher Ordner soll geholt werden?")
+    return f"rsync://{ip}/{drive}/{rest}"
+
+
+def read_kv(path: Path) -> dict:
+    out = {}
+    try:
+        for line in Path(path).read_text(errors="replace").splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def write_kv(path: Path, data: dict):
+    path = Path(path)
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    tmp.write_text("".join(f"{k}={v}\n" for k, v in data.items()))
+    os.replace(tmp, path)
+
+
+def job_conf_path(name: str) -> Path:
+    return ETC / "jobs" / f"{name}.conf"
+
+
+def job_dir(name: str) -> Path:
+    return VAR / name
+
+
+def read_job(name: str) -> dict:
+    p = job_conf_path(name)
+    if not p.is_file():
+        raise ValueError(f"Auftrag {name!r} gibt es nicht")
+    return read_kv(p)
+
+
+def list_jobs() -> list:
+    d = ETC / "jobs"
+    if not d.is_dir():
+        return []
+    return sorted(p.stem for p in d.glob("*.conf") if valid_name(p.stem))
+
+
+def target_of(conf: dict) -> str:
+    return str(Path(conf.get("DST", "")) / conf.get("SRC", "").rstrip("/").rsplit("/", 1)[-1])
+
+
+def owner_ok(owner: str) -> bool:
+    if ":" not in owner:
+        return False
+    user, group = owner.split(":", 1)
+    try:
+        if user.isdigit():
+            pwd.getpwuid(int(user))
+        else:
+            pwd.getpwnam(user)
+        if group.isdigit():
+            grp.getgrgid(int(group))
+        else:
+            grp.getgrnam(group)
+    except (KeyError, ValueError):
+        return False
+    return True
+
+
+def sudo(*args) -> subprocess.CompletedProcess:
+    """systemctl ueber die sudo-Regel aus install.sh (ohne Passwort).
+
+    Als root direkt. -n: nie nach einem Passwort fragen - fehlt die Regel,
+    ist das ein Fehler, keine Rueckfrage (Zero-Touch).
+    """
+    cmd = list(args)
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n"] + cmd
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def systemctl_path() -> str:
+    return shutil.which("systemctl") or "/usr/bin/systemctl"
+
+
+def unit_show(name: str) -> dict:
+    r = subprocess.run([systemctl_path(), "show", UNIT.format(name),
+                        "-p", "ActiveState,SubState,NRestarts,UnitFileState,ExecMainStatus"],
+                       capture_output=True, text=True)
+    out = {}
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k] = v
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Auftraege
+# ---------------------------------------------------------------------------
+def add(name, src, dst, owner, jobs=0, newdays=DEFAULT_NEWDAYS):
+    if not valid_name(name):
+        raise ValueError("Name: nur a-z, 0-9, - und _, hoechstens 40 Zeichen, beginnt mit Buchstabe/Ziffer")
+    if job_conf_path(name).exists():
+        raise ValueError(f"Auftrag {name!r} gibt es schon")
+    if not src.startswith("rsync://"):
+        raise ValueError("Quelle muss eine rsync://-URL sein (oder IP + Windows-Pfad)")
+    if src.endswith("/"):
+        raise ValueError("Quelle ohne Schraegstrich am Ende angeben - sonst gaebe es kein <ziel>/NAME")
+    if not Path(dst).is_dir():
+        raise ValueError(f"Zielverzeichnis {dst} existiert nicht")
+    if not owner_ok(owner):
+        raise ValueError(f"Besitzer {owner!r} unbekannt (Format BENUTZER:GRUPPE)")
+    new = {"SRC": src, "DST": str(Path(dst)), "OWNER": owner}
+    tgt = target_of(new)
+    for other in list_jobs():
+        if target_of(read_job(other)) == tgt:
+            raise ValueError(f"Auftrag {other!r} schreibt schon nach {tgt}")
+    conf = {
+        "SRC": src,
+        "DST": str(Path(dst)),
+        "OWNER": owner,
+        "JOBS": str(int(jobs or 0)),
+        "NEWDAYS": str(int(newdays or 0)),
+        "CREATED": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    (ETC / "jobs").mkdir(parents=True, exist_ok=True)
+    write_kv(job_conf_path(name), conf)
+    return conf
+
+
+def _runs(name) -> dict:
+    return read_kv(job_dir(name) / "runs")
+
+
+def _set_runs(name, **kv):
+    jd = job_dir(name)
+    jd.mkdir(parents=True, exist_ok=True)
+    runs = _runs(name)
+    runs.update({k: str(v) for k, v in kv.items()})
+    write_kv(jd / "runs", runs)
+    try:
+        os.chmod(jd / "runs", 0o664)
+    except OSError:
+        pass
+
+
+def cmd_start(name):
+    read_job(name)
+    if (job_dir(name)).exists():
+        _set_runs(name, fail_streak=0, given_up=0)
+    sudo(systemctl_path(), "reset-failed", UNIT.format(name))
+    r = sudo(systemctl_path(), "enable", "--now", UNIT.format(name))
+    if r.returncode != 0:
+        raise ValueError(f"Start fehlgeschlagen: {r.stderr.strip()}")
+
+
+def cmd_stop(name):
+    read_job(name)
+    r = sudo(systemctl_path(), "disable", "--now", UNIT.format(name))
+    if r.returncode != 0:
+        raise ValueError(f"Stop fehlgeschlagen: {r.stderr.strip()}")
+
+
+def cmd_restart(name):
+    read_job(name)
+    r = sudo(systemctl_path(), "restart", UNIT.format(name))
+    if r.returncode != 0:
+        raise ValueError(f"Neustart fehlgeschlagen: {r.stderr.strip()}")
+
+
+def cmd_remove(name):
+    read_job(name)
+    st = unit_show(name)
+    if st.get("ActiveState") in ("active", "activating", "reloading", "deactivating"):
+        raise ValueError("Auftrag laeuft noch - erst stoppen")
+    job_conf_path(name).unlink()
+    # Status und Logs des Auftrags; NIE Zieldaten.
+    shutil.rmtree(job_dir(name), ignore_errors=True)
+
+
+def cmd_log(name, lines=200) -> str:
+    r = subprocess.run(["journalctl", "-u", UNIT.format(name), "-n", str(lines), "--no-pager",
+                        "-o", "short-iso"], capture_output=True, text=True)
+    return r.stdout or r.stderr
+
+
+# ---------------------------------------------------------------------------
+# run: Einstieg des Dienstes (als root, von systemd)
+# ---------------------------------------------------------------------------
+def _prune_logs(base: Path):
+    runs = sorted((p for p in base.iterdir() if p.is_dir()), key=lambda p: p.name)
+    for old in runs[:-KEEP_RUN_LOGS]:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def _group_writable(path: Path):
+    """Status und Logs gehoeren root, der Bediener muss sie lesen und beim
+    Entfernen loeschen koennen - Gruppe von /var/lib/win2unix, g+rwX."""
+    subprocess.run(["chmod", "-R", "g+rwX", str(path)], capture_output=True)
+
+
+def cmd_run(name) -> int:
+    """Fuehrt pull.sh einmal aus und uebersetzt das Ergebnis in die
+    Exit-Politik des Dienstes:
+
+      0  PASS -> Dienst endet, wird disabled (Reboot prueft nicht neu)
+      3  Einrichtungsfehler oder aufgegeben -> systemd startet NICHT neu
+         (RestartPreventExitStatus=3)
+      1  voruebergehend -> systemd startet nach RestartSec neu, pull.sh setzt fort
+    """
+    if not valid_name(name):
+        print(f"ungueltiger Auftragsname: {name!r}", file=sys.stderr)
+        return 3
+    try:
+        conf = read_job(name)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 3
+    jd = job_dir(name)
+    logs = jd / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    run_log = logs / datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_log.mkdir(exist_ok=True)
+    status = jd / "status"
+    pull = os.environ.get("W2U_PULL", PULL)
+    cmd = ["bash", pull, "--status-file", str(status), "--log-dir", str(run_log)]
+    if conf.get("OWNER"):
+        cmd += ["--chown", conf["OWNER"]]
+    if int(conf.get("JOBS") or 0) > 0:
+        cmd += ["--jobs", conf["JOBS"]]
+    if int(conf.get("NEWDAYS") or 0) > 0:
+        cmd += ["--neu-zuerst", conf["NEWDAYS"]]
+    cmd += [conf["SRC"], conf["DST"]]
+
+    runs = _runs(name)
+    attempts = int(runs.get("attempts") or 0) + 1
+    _set_runs(name, attempts=attempts, last_start=int(time.time()))
+    print("w2u run:", " ".join(cmd), flush=True)
+
+    # SIGTERM von systemd an das Kind weiterreichen (KillMode=control-group
+    # erreicht es ohnehin; so endet auch dieser Prozess sauber).
+    proc = subprocess.Popen(cmd)
+
+    def _forward(sig, _frm):
+        try:
+            proc.send_signal(sig)
+        except ProcessLookupError:
+            pass
+    signal.signal(signal.SIGTERM, _forward)
+    rc = proc.wait()
+
+    result = read_kv(status).get("result", "")
+    streak = int(_runs(name).get("fail_streak") or 0)
+    if rc == 0:
+        _set_runs(name, fail_streak=0, given_up=0, last_rc=0, last_end=int(time.time()))
+        subprocess.run([systemctl_path(), "disable", UNIT.format(name)], capture_output=True)
+        out = 0
+    elif rc in (2, 3):
+        _set_runs(name, last_rc=rc, last_end=int(time.time()))
+        out = 3
+    elif rc == 1 and result == "FAIL":
+        streak += 1
+        given_up = streak >= GIVE_UP_AFTER
+        _set_runs(name, fail_streak=streak, given_up=int(given_up), last_rc=rc,
+                  last_end=int(time.time()))
+        out = 3 if given_up else 1
+    else:
+        # Abbruch ohne Urteil (Netz, Quelle weg, Signal): der Zaehler der
+        # FAIL-Urteile bleibt, wie er ist - endlos neu versuchen.
+        _set_runs(name, fail_streak=streak, last_rc=rc, last_end=int(time.time()))
+        out = 1
+    _prune_logs(logs)
+    _group_writable(jd)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Status fuer Liste und TUI
+# ---------------------------------------------------------------------------
+def _gb(kb: str) -> str:
+    try:
+        return f"{int(kb) / 1048576:.1f} GB"
+    except (TypeError, ValueError):
+        return ""
+
+
+def job_state(name) -> dict:
+    conf = read_job(name)
+    st = read_kv(job_dir(name) / "status")
+    runs = _runs(name)
+    unit = unit_show(name)
+    active, sub = unit.get("ActiveState", ""), unit.get("SubState", "")
+    now = int(time.time())
+    try:
+        age = now - int(st.get("updated", ""))
+    except ValueError:
+        age = None
+    if active == "active" and sub == "running":
+        label = "keine Rückmeldung" if (age is not None and age > STALE_SECS) else "läuft"
+    elif active == "activating" or sub == "auto-restart":
+        label = "wartet auf Neustart"
+    elif active == "failed" or unit.get("ExecMainStatus") == "3":
+        label = "aufgegeben" if runs.get("given_up") == "1" else "Einrichtungsfehler"
+    elif st.get("result") == "PASS":
+        label = "erledigt"
+    elif not st and not runs:
+        label = "neu"
+    else:
+        label = "gestoppt"
+    total, done = st.get("chunks_total", ""), st.get("chunks_done", "")
+    progress = f"{done}/{total}" if total not in ("", "0") else ""
+    return {
+        "name": name,
+        "src": conf.get("SRC", ""),
+        "dst": conf.get("DST", ""),
+        "target": target_of(conf),
+        "owner": conf.get("OWNER", ""),
+        "label": label,
+        "phase": st.get("phase", ""),
+        "progress": progress,
+        "gb": _gb(st.get("kb_dst", "")),
+        "kb": st.get("kb_dst", ""),
+        "restarts": unit.get("NRestarts", "0"),
+        "fail_streak": runs.get("fail_streak", "0"),
+        "message": st.get("message", ""),
+        "result": st.get("result", ""),
+        "report": st.get("report", ""),
+        "started": st.get("started", ""),
+        "updated": st.get("updated", ""),
+        "age": age,
+    }
+
+
+def short_src(url: str, width: int) -> str:
+    m = re.match(r"^rsync://([^/]+)/([^/]+)/?(.*)$", url)
+    if not m:
+        return url[:width]
+    host, mod, rest = m.groups()
+    parts = rest.split("/") if rest else []
+    tail = parts[-1] if parts else ""
+    mid = "/…/" if len(parts) > 1 else "/"
+    s = f"{host} {mod}:{mid}{tail}" if tail else f"{host} {mod}:/"
+    return s if len(s) <= width else s[: width - 1] + "…"
+
+
+# ---------------------------------------------------------------------------
+# TUI
+# ---------------------------------------------------------------------------
+COLS = [("NAME", 14), ("QUELLE", 30), ("STATUS", 20), ("PHASE", 11), ("FORTSCHRITT", 28), ("NEUSTARTS", 9)]
+
+
+def render_rows(states: list, rates: dict) -> list:
+    """Reine Funktion: Zustaende -> Tabellenzeilen (Text). Testbar ohne curses."""
+    rows = []
+    for s in states:
+        prog = " ".join(x for x in (s["progress"], s["gb"], rates.get(s["name"], "")) if x)
+        label = s["label"] + (" ✓" if s["label"] == "erledigt" else "")
+        cells = [s["name"], short_src(s["src"], 30), label, s["phase"] or "–", prog or "–",
+                 s["restarts"]]
+        rows.append("  ".join(str(c)[:w].ljust(w) for c, (_, w) in zip(cells, COLS)))
+    return rows
+
+
+def _color_for(label: str) -> int:
+    return {"läuft": 2, "erledigt": 2, "wartet auf Neustart": 3, "keine Rückmeldung": 3,
+            "aufgegeben": 1, "Einrichtungsfehler": 1}.get(label, 0)
+
+
+def _form(stdscr, curses):
+    """Eingabeformular fuer einen neuen Auftrag. Gibt dict oder None zurueck."""
+    fields = [("Name (a-z0-9-_)", ""), ("Quell-IP", ""), ("Quellpfad (F:\\...\\ORDNER)", ""),
+              ("Zielverzeichnis", "/opt/data/files"), ("Besitzer (U:G)", "tomedo:tomedo"),
+              ("Parallelität (0 = messen)", "0"), ("Neue Dateien zuerst: Tage (0 = aus)", str(DEFAULT_NEWDAYS))]
+    values = []
+    curses.echo()
+    curses.curs_set(1)
+    try:
+        for i, (label, default) in enumerate(fields):
+            stdscr.move(3 + i, 2)
+            stdscr.clrtoeol()
+            stdscr.addstr(3 + i, 2, f"{label} [{default}]: ")
+            stdscr.refresh()
+            raw = stdscr.getstr(3 + i, 4 + len(label) + len(default) + 4, 200)
+            v = raw.decode("utf-8", "replace").strip() if raw else ""
+            values.append(v or default)
+    finally:
+        curses.noecho()
+        curses.curs_set(0)
+    name, ip, path, dst, owner, jobs, newdays = values
+    return {"name": name, "src": source_url(ip, path), "dst": dst, "owner": owner,
+            "jobs": int(jobs or 0), "newdays": int(newdays or 0)}
+
+
+def _probe_source(src: str) -> str:
+    m = re.match(r"^(rsync://[^/]+/)", src)
+    if not m:
+        return "keine rsync-URL"
+    r = subprocess.run(["rsync", "--protocol=30", "--list-only", m.group(1)],
+                       capture_output=True, text=True, timeout=20)
+    return "" if r.returncode == 0 else (r.stderr.strip().splitlines() or ["rc %d" % r.returncode])[-1]
+
+
+def _pager(stdscr, curses, title, text):
+    lines = text.splitlines() or ["(leer)"]
+    top = max(0, len(lines) - (curses.LINES - 3))
+    while True:
+        stdscr.erase()
+        stdscr.addstr(0, 0, title[: curses.COLS - 1], curses.A_BOLD)
+        for i, line in enumerate(lines[top: top + curses.LINES - 3]):
+            stdscr.addstr(1 + i, 0, line[: curses.COLS - 1])
+        stdscr.addstr(curses.LINES - 1, 0, "[↑↓ PgUp PgDn] blättern  [q] zurück"[: curses.COLS - 1])
+        k = stdscr.getch()
+        if k in (ord("q"), 27):
+            return
+        if k == curses.KEY_UP:
+            top = max(0, top - 1)
+        elif k == curses.KEY_DOWN:
+            top = min(max(0, len(lines) - 1), top + 1)
+        elif k == curses.KEY_PPAGE:
+            top = max(0, top - (curses.LINES - 3))
+        elif k == curses.KEY_NPAGE:
+            top = min(max(0, len(lines) - 1), top + (curses.LINES - 3))
+
+
+def tui():
+    import curses
+    import locale
+    locale.setlocale(locale.LC_ALL, "")
+
+    def main(stdscr):
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_RED, -1)
+        curses.init_pair(2, curses.COLOR_GREEN, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        stdscr.timeout(2000)
+        sel = 0
+        msg = ""
+        last_kb = {}
+        rates = {}
+        while True:
+            names = list_jobs()
+            states = []
+            for n in names:
+                try:
+                    states.append(job_state(n))
+                except ValueError:
+                    pass
+            now = time.time()
+            for s in states:
+                try:
+                    kb = int(s["kb"])
+                except ValueError:
+                    continue
+                prev = last_kb.get(s["name"])
+                if prev and kb != prev[1] and now > prev[0]:
+                    rates[s["name"]] = f"{(kb - prev[1]) / 1024 / (now - prev[0]):.0f} MB/s"
+                if not prev or kb != prev[1]:
+                    last_kb[s["name"]] = (now, kb)
+            sel = min(sel, max(0, len(states) - 1))
+            stdscr.erase()
+            w = curses.COLS - 1
+            head = f" win2unix – {len(states)} Transfer(s)"
+            clock = time.strftime("%a %d.%m. %H:%M ")
+            stdscr.addstr(0, 0, (head + " " * w)[: w - len(clock)] + clock, curses.A_BOLD)
+            stdscr.addstr(1, 0, ("  " + "  ".join(t.ljust(wd) for t, wd in COLS))[:w], curses.A_UNDERLINE)
+            rows = render_rows(states, rates)
+            for i, (row, s) in enumerate(zip(rows, states)):
+                if 2 + i >= curses.LINES - 6:
+                    break
+                attr = curses.color_pair(_color_for(s["label"]))
+                if i == sel:
+                    attr |= curses.A_REVERSE
+                stdscr.addstr(2 + i, 0, (("> " if i == sel else "  ") + row)[:w], attr)
+            if states:
+                s = states[sel]
+                y = curses.LINES - 5
+                stdscr.addstr(y, 0, f" Ziel: {s['target']}   Besitzer: {s['owner']}   FAIL in Folge: {s['fail_streak']}"[:w])
+                stdscr.addstr(y + 1, 0, f" Quelle: {s['src']}"[:w])
+                stdscr.addstr(y + 2, 0, f" Meldung: {s['message'] or '–'}"[:w],
+                              curses.color_pair(1) if s["label"] in ("aufgegeben", "Einrichtungsfehler") else 0)
+            else:
+                stdscr.addstr(3, 2, "Noch kein Auftrag - [n] legt einen an.")
+            stdscr.addstr(curses.LINES - 2, 0, (" " + msg)[:w], curses.A_BOLD)
+            stdscr.addstr(curses.LINES - 1, 0,
+                          " [n]eu  [s]tart  [x] stop  [r]estart  [l]og  [b]ericht  [d] entfernen  [q]uit"[:w])
+            stdscr.refresh()
+            k = stdscr.getch()
+            if k == -1:
+                continue
+            msg = ""
+            cur = states[sel]["name"] if states else None
+            try:
+                if k in (ord("q"), 27):
+                    return
+                elif k in (curses.KEY_UP, ord("k")):
+                    sel = max(0, sel - 1)
+                elif k in (curses.KEY_DOWN, ord("j")):
+                    sel = min(len(states) - 1, sel + 1)
+                elif k == ord("n"):
+                    stdscr.erase()
+                    stdscr.addstr(1, 2, "Neuer Auftrag (Enter übernimmt [Vorgabe])", curses.A_BOLD)
+                    f = _form(stdscr, curses)
+                    problem = _probe_source(f["src"])
+                    if problem:
+                        msg = f"Quelle nicht erreichbar ({problem}) - nicht angelegt"
+                    else:
+                        add(f["name"], f["src"], f["dst"], f["owner"], f["jobs"], f["newdays"])
+                        cmd_start(f["name"])
+                        msg = f"{f['name']} angelegt und gestartet"
+                elif cur and k == ord("s"):
+                    cmd_start(cur)
+                    msg = f"{cur} gestartet"
+                elif cur and k == ord("x"):
+                    cmd_stop(cur)
+                    msg = f"{cur} gestoppt"
+                elif cur and k == ord("r"):
+                    cmd_restart(cur)
+                    msg = f"{cur} neu gestartet"
+                elif cur and k == ord("l"):
+                    _pager(stdscr, curses, f"Log {cur}", cmd_log(cur))
+                elif cur and k == ord("b"):
+                    rep = states[sel]["report"]
+                    text = Path(rep).read_text(errors="replace") if rep and Path(rep).is_file() else "(noch kein Bericht)"
+                    _pager(stdscr, curses, f"Bericht {cur}", text)
+                elif cur and k == ord("d"):
+                    stdscr.addstr(curses.LINES - 2, 0, f" {cur} entfernen (Zieldaten bleiben)? [j/N] "[:w])
+                    stdscr.timeout(-1)
+                    yes = stdscr.getch() in (ord("j"), ord("y"))
+                    stdscr.timeout(2000)
+                    if yes:
+                        cmd_remove(cur)
+                        msg = f"{cur} entfernt"
+            except (ValueError, subprocess.SubprocessError, OSError) as e:
+                msg = f"Fehler: {e}"
+
+    curses.wrapper(main)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def cmd_list():
+    names = list_jobs()
+    if not names:
+        print("keine Auftraege")
+        return
+    print("  ".join(t.ljust(w) for t, w in COLS))
+    for line in render_rows([job_state(n) for n in names], {}):
+        print(line)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="w2u", description="win2unix-Transfers als Dienste")
+    sub = ap.add_subparsers(dest="cmd")
+    a = sub.add_parser("add", help="Auftrag anlegen")
+    a.add_argument("name")
+    a.add_argument("--ip", default="", help="Quell-IP (mit --pfad)")
+    a.add_argument("--pfad", default="", help="Windows-Pfad, z.B. F:\\Ordner\\BRIEFE, oder rsync://-URL")
+    a.add_argument("--ziel", required=True, help="Zielverzeichnis, darunter entsteht NAME")
+    a.add_argument("--besitzer", required=True, help="BENUTZER:GRUPPE")
+    a.add_argument("--jobs", type=int, default=0)
+    a.add_argument("--neu-zuerst", type=int, default=DEFAULT_NEWDAYS, dest="newdays")
+    a.add_argument("--start", action="store_true", help="gleich starten")
+    sub.add_parser("list", help="Auftraege mit Status")
+    for c in ("start", "stop", "restart", "remove", "log", "run"):
+        sub.add_parser(c).add_argument("name")
+    args = ap.parse_args(argv)
+    try:
+        if args.cmd is None:
+            tui()
+            return 0
+        if args.cmd == "add":
+            conf = add(args.name, source_url(args.ip, args.pfad), args.ziel, args.besitzer,
+                       args.jobs, args.newdays)
+            print(f"angelegt: {args.name}: {conf['SRC']} -> {target_of(conf)}")
+            if args.start:
+                cmd_start(args.name)
+                print("gestartet")
+        elif args.cmd == "list":
+            cmd_list()
+        elif args.cmd == "start":
+            cmd_start(args.name)
+        elif args.cmd == "stop":
+            cmd_stop(args.name)
+        elif args.cmd == "restart":
+            cmd_restart(args.name)
+        elif args.cmd == "remove":
+            cmd_remove(args.name)
+        elif args.cmd == "log":
+            print(cmd_log(args.name))
+        elif args.cmd == "run":
+            return cmd_run(args.name)
+    except ValueError as e:
+        print(f"Fehler: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
