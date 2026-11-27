@@ -484,6 +484,10 @@ def _form(stdscr, curses):
     values = []
     curses.echo()
     curses.curs_set(1)
+    # Die Liste fragt alle 2 s nach Tasten (stdscr.timeout(2000)), damit sie
+    # sich aktualisiert. Im Formular wuerde getstr dann nach 2 s mit leerer
+    # Eingabe zurueckkehren und den Vorgabewert nehmen - also hier: warten.
+    stdscr.timeout(-1)
     try:
         for i, (label, default) in enumerate(fields):
             stdscr.move(3 + i, 2)
@@ -496,6 +500,7 @@ def _form(stdscr, curses):
     finally:
         curses.noecho()
         curses.curs_set(0)
+        stdscr.timeout(2000)
     name, ip, path, dst, owner, jobs, newdays = values
     return {"name": name, "src": source_url(ip, path), "dst": dst, "owner": owner,
             "jobs": int(jobs or 0), "newdays": int(newdays or 0)}
