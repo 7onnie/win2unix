@@ -312,10 +312,12 @@ w2u_heartbeat_start() {
             if [ -n "$_ResultFile" ] && [ -f "$_ResultFile" ]; then
                 _Done="$(grep -c . "$_ResultFile" 2>/dev/null)"
             fi
+            # Vorlauf "neue Dateien zuerst": eigene Ergebnisdatei, eigener Zaehler.
+            _NewDone="$(grep -c . "$_TmpDir/results.newfirst" 2>/dev/null)" || _NewDone=""
             if [ $((_Tick % 4)) -eq 0 ]; then
-                w2u_status "chunks_done=${_Done:-0}" "kb_dst=$(w2u_dst_kb)"
+                w2u_status "chunks_done=${_Done:-0}" "new_done=${_NewDone:-0}" "kb_dst=$(w2u_dst_kb)"
             else
-                w2u_status "chunks_done=${_Done:-0}"
+                w2u_status "chunks_done=${_Done:-0}" "new_done=${_NewDone:-0}"
             fi
         done
     ) &
@@ -899,7 +901,11 @@ w2u_dst_kb() {
     local _Kb
     # Waehrend der parallelen Phase liegt der Bestand im Zwischenordner
     # (_WorkRoot, Issue #7) - unter _DstRoot gibt es dann nichts zu messen.
-    _Kb="$(du -sk "${_WorkRoot:-$_DstRoot}" 2>/dev/null | awk 'NR == 1 { print $1 }')" || _Kb=""
+    # -H: einem Symlink AUF DER KOMMANDOZEILE folgen - waehrend der Phase ist
+    # <ziel>/NAME ein Link auf den Zwischenordner (der Herzschlag kennt
+    # _WorkRoot nicht, er laeuft seit vor w2u_stage_in). Links im Baum bleiben
+    # Links; GNU und BSD du kennen -H.
+    _Kb="$(du -skH "${_WorkRoot:-$_DstRoot}" 2>/dev/null | awk 'NR == 1 { print $1 }')" || _Kb=""
     case "$_Kb" in
         ''|*[!0-9]*) _Kb="" ;;
     esac
@@ -2449,6 +2455,7 @@ w2u_newfirst() {
     fi
     mkdir -p "$_TmpDir/newchunks"
     w2u_chunk "$_TmpDir/newfirst.par" "$_TmpDir/newchunks" "$_PMax" "$_TmpDir/newchunks.list"
+    w2u_status "new_chunks=$(grep -c . "$_TmpDir/newchunks.list" || true)" "new_done=0"
     if [ "$_JobCnt" -gt 0 ]; then
         _Jobs="$_JobCnt"
     fi

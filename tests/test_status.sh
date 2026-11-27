@@ -88,4 +88,18 @@ t_assert_rc 1 "$_Rc" "FAIL-Urteil: Exit 1"
 t_assert_eq "FAIL" "$(sval "$_St" result)" "result=FAIL"
 t_assert_eq "done" "$(sval "$_St" phase)" "Endphase done auch bei FAIL"
 
+# ---- du durch den Symlink der Zwischenordner-Phase ---------------------------
+# Der Herzschlag laeuft in einer Subshell, die vor w2u_stage_in startet - er
+# sieht _WorkRoot nicht und misst <ziel>/NAME, waehrend dort der Symlink steht.
+# Gemessen auf dem Zielrechner: kb_dst=4 bei 33 GB im Zwischenordner.
+W2U_LIB_ONLY=1 . "$_Root/pull.sh"
+mkdir -p "$_TmpRoot/kb/echt"
+dd if=/dev/zero of="$_TmpRoot/kb/echt/f" bs=1024 count=2048 2>/dev/null
+ln -s echt "$_TmpRoot/kb/link"
+_DstRoot="$_TmpRoot/kb/link"
+_WorkRoot=""
+_Kb="$(w2u_dst_kb)"
+[ -n "$_Kb" ] && [ "$_Kb" -ge 2000 ] && _Ok=ja || _Ok=nein
+t_assert_eq "ja" "$_Ok" "w2u_dst_kb misst durch einen Symlink am Ziel (bekam ${_Kb:-leer} KB)"
+
 t_summary

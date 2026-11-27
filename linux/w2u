@@ -388,6 +388,12 @@ def job_state(name) -> dict:
         label = "gestoppt"
     total, done = st.get("chunks_total", ""), st.get("chunks_done", "")
     progress = f"{done}/{total}" if total not in ("", "0") else ""
+    if st.get("phase") == "neu-zuerst":
+        # Im Vorlauf zaehlen Chunks der neuen Dateien (Chunk = ein Paket aus
+        # Dateien), angezeigt mit der Zahl neuer Dateien.
+        nt = st.get("new_total", "")
+        progress = (f"neu {st.get('new_done', '0')}/{st.get('new_chunks', '?')} ({nt} Dat.)"
+                    if nt else "")
     return {
         "name": name,
         "src": conf.get("SRC", ""),
