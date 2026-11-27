@@ -1,4 +1,16 @@
 @echo off
+:: Ein ! im Pfad frisst die verzoegerte Erweiterung bei jedem %~dp0, ein ' bricht
+:: jedes PowerShell-'%~dp0...'. Geprueft wird VOR setlocal, solange ! noch
+:: ein gewoehnliches Zeichen ist.
+echo "%~dp0" | findstr /C:"!" /C:"'" >nul
+if not errorlevel 1 (
+    echo.
+    echo  [!] Der Ordnerpfad enthaelt ! oder ' - damit funktioniert dieses Skript nicht.
+    echo      Den Ordner umbenennen oder z.B. nach C:\win2unix\ kopieren.
+    echo.
+    pause
+    exit /b 1
+)
 setlocal EnableExtensions EnableDelayedExpansion
 title win2unix - rsync-Server
 
@@ -12,7 +24,13 @@ title win2unix - rsync-Server
 :: Bewusst dauerhafte Aenderungen an dieser Maschine (sie wird verschrottet):
 ::   - Firewall-Regel "win2unix rsync" fuer TCP 873 eingehend, bleibt stehen
 ::   - Energiesparen/Standby/Platten-Timeout im aktiven Schema auf "nie"
-:: Beides wird im Fenster angezeigt, wenn es passiert.
+::   - geplante Aufgabe "win2unix-rsyncd" (SYSTEM, startet auch nach einem
+::     Neustart) - DAS ist der Server. Entfernen: STOP-RSYNC-SERVER.cmd
+:: Alles wird im Fenster angezeigt, wenn es passiert.
+::
+:: Der Server haengt NICHT an diesem Fenster und nicht an der Anmeldung
+:: (Issue #13): die Transfers dauern Tage, die Kisten werden per RDP bedient,
+:: und Abmelden beendete frueher den Server samt aller Transfers.
 ::
 :: Argumente (normalerweise keine - Doppelklick):
 ::   elevated         setzt die .cmd selbst beim Neustart mit Adminrechten
@@ -45,7 +63,7 @@ echo.
 ::        weil eine UAC-Abfrage fuer einen Ordner, in dem es sowieso nicht
 ::        weitergeht, nur Zeit kostet. Gelesen wird hier, geaendert nichts.
 if not exist "bin\rsync.exe" (
-    echo  [!] bin\rsync.exe wurde nicht gefunden.
+    echo  [^^!] bin\rsync.exe wurde nicht gefunden.
     echo      Diesen Ordner KOMPLETT auf eine lokale Festplatte kopieren
     echo      ^(nicht direkt von \\Server\Freigabe starten^) und erneut anklicken.
     echo.
@@ -68,7 +86,7 @@ if not exist "bin\rsync.exe" (
 set "_IsAdmin=nein"
 if /i "%~1"=="ohne-admin-test" (
     set "_IsAdmin=ja"
-    echo  [!] Rechte-Pruefung per Argument uebersprungen. Laeuft dieses Fenster
+    echo  [^^!] Rechte-Pruefung per Argument uebersprungen. Laeuft dieses Fenster
     echo      NICHT als Administrator, fehlen im Ergebnis still fremde
     echo      Benutzerprofile - danach ist die Quelle verschrottet.
 ) else (
@@ -85,7 +103,7 @@ if "!_IsAdmin!"=="nein" (
     rem Rechteerkennung auf dieser Maschine kaputt, wuerde sich das Skript
     rem sonst unbegrenzt selbst neu starten.
     if "%~1"=="elevated" (
-        echo  [!] Auch nach der Rechte-Anfrage keine Administrator-Rechte erkannt.
+        echo  [^^!] Auch nach der Rechte-Anfrage keine Administrator-Rechte erkannt.
         echo      Bitte ein cmd-Fenster per Rechtsklick als Administrator oeffnen
         echo      und darin starten:  START-RSYNC-SERVER.cmd ohne-admin-test
         echo      Das ueberspringt die Pruefung, nicht die Rechte: ohne Adminrechte
@@ -99,7 +117,7 @@ if "!_IsAdmin!"=="nein" (
     rem Verzeichnis des Aufrufers NICHT, es startet in C:\Windows\system32.
     powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList 'elevated' -WorkingDirectory '%~dp0' -Verb RunAs"
     if errorlevel 1 (
-        echo  [!] Rechte-Anfrage abgebrochen oder fehlgeschlagen - nichts gestartet.
+        echo  [^^!] Rechte-Anfrage abgebrochen oder fehlgeschlagen - nichts gestartet.
         echo.
         pause
     )
@@ -114,7 +132,7 @@ echo  [+] Administrator-Rechte vorhanden.
 del /q "w2u-write.tmp" >nul 2>&1
 echo test> "w2u-write.tmp" 2>nul
 if not exist "w2u-write.tmp" (
-    echo  [!] Dieser Ordner ist nicht beschreibbar.
+    echo  [^^!] Dieser Ordner ist nicht beschreibbar.
     echo      Bundle auf eine lokale Festplatte kopieren, z.B. C:\win2unix\.
     echo.
     pause
@@ -134,7 +152,7 @@ if "!_HasPs!"=="nein" (
     if not errorlevel 1 set "_HasPs=ja"
 )
 if "!_HasPs!"=="nein" (
-    echo  [!] powershell.exe nicht gefunden - diese Windows-Version ist zu alt.
+    echo  [^^!] powershell.exe nicht gefunden - diese Windows-Version ist zu alt.
     echo      Fallback ohne Skript: bin\rsync.exe --daemon --config=... mit einer
     echo      handgeschriebenen rsyncd.conf ^(Vorlagen: rsyncd.*.template^).
     echo.
@@ -152,6 +170,7 @@ echo  [+] Ermittle IPv4-Adressen...
 del /q "w2u-ips.tmp" >nul 2>&1
 powershell -NoProfile -Command "$ips = @(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=true' | ForEach-Object { $_.IPAddress } | Where-Object { $_ -like '*.*.*.*' -and $_ -ne '127.0.0.1' -and $_ -notlike '169.254.*' }); [IO.File]::WriteAllText('%~dp0w2u-ips.tmp', [string]::Join([string][char]10, $ips) + [string][char]10)"
 
+set "_IsTask=ja"
 set "_IpCnt=0"
 if exist "w2u-ips.tmp" (
     for /f "usebackq delims=" %%I in ("w2u-ips.tmp") do (
@@ -160,7 +179,7 @@ if exist "w2u-ips.tmp" (
     )
 )
 if "!_IpCnt!"=="0" (
-    echo  [!] Keine IPv4-Adresse erkannt - die Befehle unten zeigen einen
+    echo  [^^!] Keine IPv4-Adresse erkannt - die Befehle unten zeigen einen
     echo      Platzhalter statt der IP dieses Rechners.
 )
 :: hosts allow ist IMMER offen (Issue #8). Frueher standen hier die lokalen
@@ -171,6 +190,42 @@ if "!_IpCnt!"=="0" (
 :: Neustart dieses Skripts wuerde sie dagegen neu erzeugen.
 set "_Allow=0.0.0.0/0"
 echo  [+] hosts allow = !_Allow! ^(jeder, der Port 873 erreicht, darf lesen^)
+
+:: --- 4b. Laeuft schon ein Server? (Issue #11) Frueher startete jeder weitere
+::         Klick einen Daemon, der an "Address already in use" starb, waehrend
+::         das Fenster "Server laeuft" meldete - und die rsyncd.conf des ALTEN,
+::         noch laufenden Daemons war ueberschrieben (er liest sie bei jeder
+::         Verbindung neu). Laeuft schon ein rsync, wird deshalb NICHTS
+::         angefasst: keine Config, keine Aufgabe, laufende Transfers bleiben.
+call :PortHolder
+if defined _PortPid (
+    if /i "!_PortName!"=="rsync.exe" (
+        echo.
+        echo  [+] Ein rsync-Server laeuft bereits ^(PID !_PortPid!^). Es wird NICHTS
+        echo      veraendert - rsyncd.conf bleibt, laufende Transfers laufen weiter.
+        echo      Neu aufsetzen: STOP-RSYNC-SERVER.cmd, danach diese Datei erneut.
+        rem Laeuft er als Aufgabe oder noch im Fenster einer alten Version? Nur
+        rem die Aufgabe ueberlebt das Abmelden - genau darum geht es (#13).
+        schtasks /Query /TN "win2unix-rsyncd" >nul 2>&1
+        if errorlevel 1 (
+            set "_IsTask=nein"
+            echo.
+            echo  [^^!] Dieser rsync laeuft NICHT als geplante Aufgabe ^(alte Version im
+            echo      Fenster^). Abmelden beendet ihn. Jetzt STOP-RSYNC-SERVER.cmd,
+            echo      danach diese Datei erneut - dann ueberlebt er das Abmelden.
+        )
+        call :ShowHints
+        del /q "w2u-ips.tmp" >nul 2>&1
+        pause
+        exit /b 0
+    )
+    echo  [^^!] Port 873 ist belegt von "!_PortName!" ^(PID !_PortPid!^), nicht von
+    echo      rsync. Dieses Programm beenden, dann diese Datei erneut starten.
+    echo.
+    del /q "w2u-ips.tmp" >nul 2>&1
+    pause
+    exit /b 1
+)
 
 :: --- 5. Laufwerke ermitteln. DriveType=3 sind die fest eingebauten Platten.
 ::        Volume-Labels werden auf ASCII-Grundzeichen reduziert: sie landen in
@@ -191,7 +246,7 @@ if "!_DrvCnt!"=="0" (
     rem auch USB- oder optische Laufwerke auftauchen. Ein Modul zu viel ist
     rem read only und harmlos; eine Maschine, die nichts anbietet, ist der
     rem Totalausfall.
-    echo  [!] WMI lieferte kein Laufwerk - probiere Laufwerksbuchstaben durch.
+    echo  [^^!] WMI lieferte kein Laufwerk - probiere Laufwerksbuchstaben durch.
     echo      Achtung: dabei koennen auch USB-/CD-Laufwerke als Modul erscheinen.
     for %%D in (c d e f g h i j k l m n o p q r s t u v w x y z) do (
         if exist %%D:\ (
@@ -208,7 +263,7 @@ if "!_DrvCnt!"=="0" (
     rem Kein Modul heisst: der Daemon startet, das Fenster sagt "laeuft", und
     rem die Gegenseite bekommt eine leere Liste. Dieser stille Erfolg wird
     rem hier bewusst zum Abbruch.
-    echo  [!] Kein einziges Laufwerk gefunden - es gibt nichts anzubieten.
+    echo  [^^!] Kein einziges Laufwerk gefunden - es gibt nichts anzubieten.
     echo      Der Server wird NICHT gestartet.
     echo.
     pause
@@ -239,7 +294,7 @@ if errorlevel 1 (
     rem selbst nicht existiert, also der /cygdrive-Prefix falsch ist.
     findstr /L /C:"change_dir" "w2u-probe.tmp" >nul
     if not errorlevel 1 (
-        echo  [!] /cygdrive/!_FirstDrv!/ existiert fuer rsync.exe nicht. Die Module
+        echo  [^^!] /cygdrive/!_FirstDrv!/ existiert fuer rsync.exe nicht. Die Module
         echo      waeren leer, deshalb wird NICHTS gestartet. rsync sagte:
         type "w2u-probe.tmp"
         echo.
@@ -281,7 +336,7 @@ echo  [+] Erzeuge rsyncd.conf ^(!_DrvCnt! Laufwerk^(e^)^)...
 del /q "rsyncd.conf" >nul 2>&1
 powershell -NoProfile -Command "$t = [IO.File]::ReadAllText('%~dp0rsyncd.head.template') -replace '@HOSTSALLOW@', '!_Allow!'; [IO.File]::WriteAllText('%~dp0rsyncd.conf', ($t -replace ([string][char]13), ''))"
 if not exist "rsyncd.conf" (
-    echo  [!] rsyncd.conf konnte nicht erzeugt werden - fehlt rsyncd.head.template?
+    echo  [^^!] rsyncd.conf konnte nicht erzeugt werden - fehlt rsyncd.head.template?
     echo.
     pause
     exit /b 1
@@ -301,7 +356,7 @@ for /f "usebackq tokens=1,2,3 delims=|" %%A in ("w2u-drives.tmp") do (
 )
 
 if defined _ConfBad (
-    echo  [!] Mindestens ein Modul fehlt in rsyncd.conf - Server wird NICHT
+    echo  [^^!] Mindestens ein Modul fehlt in rsyncd.conf - Server wird NICHT
     echo      gestartet. Bitte rsyncd.conf und rsyncd.module.template pruefen.
     echo.
     pause
@@ -314,7 +369,7 @@ if defined _ConfBad (
 echo  [+] AENDERT DIESE MASCHINE: Firewall-Regel "win2unix rsync", TCP 873 eingehend.
 netsh advfirewall firewall add rule name="win2unix rsync" dir=in action=allow protocol=TCP localport=873 >nul 2>&1
 if errorlevel 1 (
-    echo  [!]   Firewall-Regel fehlgeschlagen. Falls die Gegenseite nicht
+    echo  [^^!]   Firewall-Regel fehlgeschlagen. Falls die Gegenseite nicht
     echo        durchkommt, ist Port 873 hier zu oeffnen.
 )
 
@@ -323,15 +378,133 @@ if errorlevel 1 (
 echo  [+] AENDERT DIESE MASCHINE: Standby, Ruhezustand, Platten- und
 echo      Bildschirm-Timeout im aktiven Energieschema auf "nie".
 powercfg /change standby-timeout-ac 0 >nul 2>&1
-if errorlevel 1 echo  [!]   powercfg standby-timeout-ac fehlgeschlagen - Maschine kann einschlafen.
+if errorlevel 1 echo  [^^!]   powercfg standby-timeout-ac fehlgeschlagen - Maschine kann einschlafen.
 powercfg /change hibernate-timeout-ac 0 >nul 2>&1
 powercfg /change disk-timeout-ac 0 >nul 2>&1
 powercfg /change monitor-timeout-ac 0 >nul 2>&1
 
-:: --- 9. Adressen und fertige Befehle fuer die Gegenseite.
+:: --- 9. Server als geplante Aufgabe starten (Issue #13). Laeuft als SYSTEM,
+::        unabhaengig von diesem Fenster und von der Anmeldung, startet nach
+::        einem Neustart wieder. Die Vorlage ist rsyncd.task.template (dort
+::        steht, warum jede Einstellung da ist); der Pfad wird XML-escaped
+::        eingesetzt, die Datei als UTF-16 geschrieben, wie schtasks /XML sie
+::        erwartet. schtasks statt Register-ScheduledTask: das Cmdlet gibt es
+::        erst ab Windows 8.
+echo  [+] AENDERT DIESE MASCHINE: geplante Aufgabe "win2unix-rsyncd" ^(SYSTEM,
+echo      startet auch nach einem Neustart^). Entfernen: STOP-RSYNC-SERVER.cmd
+del /q "w2u-task.xml" >nul 2>&1
+powershell -NoProfile -Command "$d = '%~dp0'; if ($d.Length -gt 3) { $d = $d.TrimEnd([char]92) }; $e = [Security.SecurityElement]::Escape($d).Replace('$', '$$'); $t = [IO.File]::ReadAllText('%~dp0rsyncd.task.template') -replace '@WORKDIR@', $e; [IO.File]::WriteAllText('%~dp0w2u-task.xml', $t, [Text.Encoding]::Unicode)"
+if not exist "w2u-task.xml" (
+    echo  [^^!] Aufgabe konnte nicht vorbereitet werden - fehlt rsyncd.task.template?
+    echo.
+    pause
+    exit /b 1
+)
+schtasks /Create /TN "win2unix-rsyncd" /XML "%~dp0w2u-task.xml" /F >"w2u-schtasks.tmp" 2>&1
+if errorlevel 1 (
+    echo  [^^!] schtasks konnte die Aufgabe nicht anlegen:
+    type "w2u-schtasks.tmp"
+    echo.
+    pause
+    exit /b 1
+)
+schtasks /Run /TN "win2unix-rsyncd" >"w2u-schtasks.tmp" 2>&1
+if errorlevel 1 (
+    echo  [^^!] schtasks konnte die Aufgabe nicht starten:
+    type "w2u-schtasks.tmp"
+    echo.
+    pause
+    exit /b 1
+)
+del /q "w2u-schtasks.tmp" >nul 2>&1
+del /q "w2u-task.xml" >nul 2>&1
+
+:: Erst "laeuft" melden, wenn der Port wirklich lauscht. Frueher stand hier
+:: "Server laeuft", auch wenn der Daemon eine Sekunde spaeter starb.
+:: ping als Wartezeit: "timeout" bricht ohne Konsole ab, ping gibt es ueberall.
+echo  [+] Warte, bis der Server auf Port 873 lauscht...
+set "_Up=nein"
+for /l %%W in (1,1,30) do (
+    if "!_Up!"=="nein" (
+        call :PortHolder
+        if defined _PortPid set "_Up=ja"
+        if "!_Up!"=="nein" ping -n 2 127.0.0.1 >nul
+    )
+)
+if "!_Up!"=="nein" (
+    echo  [^^!] Der Server lauscht nach 30 s nicht auf Port 873. Ende von rsyncd.log:
+    powershell -NoProfile -Command "Get-Content '%~dp0rsyncd.log' -ErrorAction SilentlyContinue | Select-Object -Last 15"
+    echo.
+    echo      Aufgabe entfernen mit STOP-RSYNC-SERVER.cmd.
+    del /q "w2u-ips.tmp" >nul 2>&1
+    pause
+    exit /b 1
+)
+if /i not "!_PortName!"=="rsync.exe" (
+    echo  [^^!] Port 873 lauscht, aber der Prozess heisst "!_PortName!" ^(PID !_PortPid!^).
+)
+:: Lauscht der Port, heisst das noch nicht, dass ein Modul lesbar ist: der
+:: Daemon laeuft jetzt als SYSTEM, nicht als der angemeldete Administrator.
+:: Wuerde rsync das als root deuten und auf "nobody" wechseln, liefe das
+:: Listing der Wurzel weiter, jedes Modul aber stuerbe an "@ERROR". Deshalb
+:: hier EIN Modul ueber das Netz lesen, wie es die Gegenseite tut.
+del /q "w2u-probe.tmp" >nul 2>&1
+bin\rsync.exe --list-only "rsync://127.0.0.1/!_FirstDrv!/" >"w2u-probe.tmp" 2>&1
+findstr /L /C:"@ERROR" "w2u-probe.tmp" >nul
+if not errorlevel 1 (
+    echo  [^^!] Der Server lauscht, aber Modul [!_FirstDrv!] ist nicht lesbar:
+    type "w2u-probe.tmp"
+    echo.
+    echo      Aufgabe entfernen mit STOP-RSYNC-SERVER.cmd.
+    del /q "w2u-ips.tmp" >nul 2>&1
+    pause
+    exit /b 1
+)
+del /q "w2u-probe.tmp" >nul 2>&1
+echo  [+] Server laeuft ^(PID !_PortPid!^), Modul [!_FirstDrv!] ueber das Netz lesbar.
+call :ShowHints
+del /q "w2u-ips.tmp" >nul 2>&1
+del /q "w2u-drives.tmp" >nul 2>&1
+pause
+exit /b 0
+
+:: ===========================================================================
+:: Unterprogramme
+:: ===========================================================================
+
+:: Wer lauscht auf TCP 873? Setzt _PortPid und _PortName (leer = niemand).
+:: Erkannt an Spalte 3 "0.0.0.0:0" bzw. "[::]:0" (IPv6) statt am Statustext: der ist lokalisiert
+:: (englisch "Listening", deutsch "ABHOEREN"). Auf einem lauschenden IPv4-Socket ist die
+:: Gegenadresse immer 0.0.0.0:0, auf einer bestehenden Verbindung nie - die
+:: Zeilen der laufenden Transfers (lokal :873, Gegenseite echte IP) fallen
+:: also heraus. Dieselbe Funktion steht in STOP-RSYNC-SERVER.cmd.
+:PortHolder
+set "_PortPid="
+set "_PortName="
+for /f "tokens=2,3,5" %%A in ('netstat -ano 2^>nul') do (
+    set "_Lsn=nein"
+    if "%%B"=="0.0.0.0:0" set "_Lsn=ja"
+    if "%%B"=="[::]:0" set "_Lsn=ja"
+    if "!_Lsn!"=="ja" (
+        set "_Loc=%%A"
+        if "!_Loc:~-4!"==":873" (
+            if not defined _PortPid set "_PortPid=%%C"
+        )
+    )
+)
+if defined _PortPid (
+    for /f "tokens=1 delims=," %%N in ('tasklist /FI "PID eq !_PortPid!" /FO CSV /NH 2^>nul') do set "_PortName=%%~N"
+    rem Ist der Prozess inzwischen weg, liefert tasklist eine lokalisierte
+    rem Meldung statt eines Namens - die soll nicht als Prozessname erscheinen.
+    if /i not "!_PortName:~-4!"==".exe" set "_PortName=?"
+)
+exit /b 0
+
+:: Adressen und fertige Befehle fuer die Gegenseite.
+:ShowHints
 echo.
 echo  ========================================================
-echo   Server laeuft. Auf dem Mac/Linux-Rechner ausfuehren:
+echo   Auf dem Mac/Linux-Rechner ausfuehren:
 echo.
 if "!_IpCnt!"=="0" (
     echo     rsync rsync://IP-DIESES-RECHNERS/
@@ -348,19 +521,13 @@ echo.
 echo   Mehrere IPv4-Adressen oben heissen: mehrere Netzwerkkarten. Die nehmen,
 echo   die im selben Netz wie der Mac/Linux-Rechner liegt.
 echo.
-echo   Dieses Fenster schliessen beendet den Server.
+if "!_IsTask!"=="ja" (
+    echo   Der Server laeuft als geplante Aufgabe "win2unix-rsyncd" unter SYSTEM.
+    echo   Dieses Fenster schliessen, abmelden ^(auch RDP^) und Neustart beenden
+    echo   ihn NICHT. Beenden und entfernen: STOP-RSYNC-SERVER.cmd
+) else (
+    echo   ACHTUNG: alter Server im Fenster - Abmelden beendet ihn ^(siehe oben^).
+)
 echo  ========================================================
 echo.
-
-del /q "w2u-ips.tmp" >nul 2>&1
-del /q "w2u-drives.tmp" >nul 2>&1
-
-:: --no-detach: der Daemon bleibt Kind dieses Fensters, Fenster zu = Server aus.
-:: Ohne das liefe er unsichtbar weiter, auf einer Maschine, die niemand mehr
-:: anfasst. Die relativen lock/pid/log-Pfade der Config beziehen sich auf das
-:: Arbeitsverzeichnis - das ist dieser Ordner (cd /d oben).
-bin\rsync.exe --daemon --no-detach --config=rsyncd.conf
-echo.
-echo  [i] Server beendet ^(Exit-Code %ERRORLEVEL%^). Protokoll: rsyncd.log
-echo.
-pause
+exit /b 0

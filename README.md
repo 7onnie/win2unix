@@ -15,8 +15,24 @@ haben.
    gestartet findet das Skript seine eigenen Dateien nicht.
 2. `START-RSYNC-SERVER.cmd` **als Administrator** ausführen (Doppelklick genügt — das Skript
    fordert die Rechte selbst an).
-3. Das Fenster offen lassen. Es zeigt die IP-Adressen an, unter denen der Server erreichbar ist,
-   und den fertigen Befehl für die Gegenseite. **Fenster schließen = Server aus.**
+3. Das Fenster zeigt die IP-Adressen an, unter denen der Server erreichbar ist, und den
+   fertigen Befehl für die Gegenseite. Danach darf es zu.
+
+Der Server läuft als **geplante Aufgabe `win2unix-rsyncd` unter SYSTEM**, nicht im Fenster.
+Fenster schließen, von RDP abmelden und ein Neustart von Windows beenden ihn nicht. Das ist
+Absicht, die Transfers dauern oft Tage. **Beenden und entfernen: `STOP-RSYNC-SERVER.cmd`**
+(ebenfalls als Administrator, fordert die Rechte selbst an). Laufende Transfers brechen dabei
+ab, `pull.sh` setzt beim nächsten Aufruf fort.
+
+Stürzt `rsync.exe` ab, startet die Aufgabe ihn nach 60 Sekunden neu (`rsyncd-loop.cmd`,
+vermerkt in `rsyncd.log`). Nach dem Start prüft das Skript selbst, dass ein Laufwerk über das
+Netz lesbar ist, nicht nur, dass der Port offen ist.
+
+Ein zweiter Klick auf `START-RSYNC-SERVER.cmd`, während der Server läuft, ändert **nichts**:
+Er meldet „läuft bereits", lässt `rsyncd.conf` stehen und zeigt nur die Befehle erneut an.
+Wer die Konfiguration neu erzeugen will, ruft erst `STOP-RSYNC-SERVER.cmd` auf und dann
+`START-RSYNC-SERVER.cmd`. Ist Port 873 von einem anderen Programm belegt, bricht der Start
+mit dessen Namen und PID ab.
 
 Administrator-Rechte sind nicht optional: ohne sie kann der Server fremde Benutzerprofile nicht
 lesen und lässt still Dateien aus — und "still" ist in diesem Werkzeug der einzige Fehler, der
@@ -27,14 +43,16 @@ Laufwerksbuchstaben und **read only**: `C:` wird `rsync://<IP>/c/`, `E:` wird `r
 
 ### Was das Skript dauerhaft ändert
 
-Zwei Dinge, beide im Fenster als `AENDERT DIESE MASCHINE` angesagt:
+Drei Dinge, alle im Fenster als `AENDERT DIESE MASCHINE` angesagt:
 
+- die geplante Aufgabe `win2unix-rsyncd` (SYSTEM, startet bei jedem Systemstart, ohne
+  Laufzeitgrenze). Sie ist der Server und wird mit `STOP-RSYNC-SERVER.cmd` entfernt,
 - eine Firewall-Regel `win2unix rsync` (TCP 873 eingehend),
 - Standby, Ruhezustand, Platten- und Bildschirm-Timeout im aktiven Energieschema auf "nie"
   (`powercfg /change standby-timeout-ac 0` und die drei Geschwister `hibernate-`, `disk-`,
   `monitor-timeout-ac`).
 
-Beides bleibt bewusst stehen: die Maschine wird verschrottet, und ein Rechner, der mitten im
+Firewall-Regel und Energieschema bleiben bewusst stehen, auch nach `STOP-RSYNC-SERVER.cmd`: die Maschine wird verschrottet, und ein Rechner, der mitten im
 TB-Transfer einschläft, ist das größere Problem. Überlebt die Kiste doch — siehe
 [Aufräumen](#aufräumen-falls-die-maschine-doch-weiterlebt).
 
@@ -59,7 +77,15 @@ die internen Dateilisten des Werkzeugs würden den restlichen Skriptcode lesen. 
 die Form `bash -c "$(curl …)"`: `pull.sh` ist größer als die 128 KB, die Linux einem einzelnen
 Argument erlaubt, und scheitert dort mit „Argumentliste ist zu lang".
 
-Bricht der Transfer ab — Netzwerk, Strom, versehentlich geschlossenes Fenster, Ctrl-C —, einfach
+Läuft der Transfer über Tage, gehört `pull.sh` in eine `tmux`-Sitzung (oder
+`nohup … > ~/pull.log 2>&1 &`), sonst endet er mit der SSH-Sitzung:
+
+```bash
+tmux new -s briefe
+bash /tmp/pull.sh rsync://<WINDOWS-IP>/e/Archiv /opt/data/files   # Ctrl-b d trennt, tmux attach -t briefe holt zurueck
+```
+
+Bricht der Transfer ab — Netzwerk, Strom, Neustart einer der beiden Seiten, Ctrl-C —, einfach
 **denselben Befehl erneut ausführen**. Es wird nur geholt, was fehlt; bereits übertragene Dateien
 bleiben liegen.
 
@@ -198,7 +224,7 @@ fehlende Administrator-Rechte auf der Windows-Seite. Programme schließen, Lauf 
 
 ## Aufräumen, falls die Maschine doch weiterlebt
 
-`START-RSYNC-SERVER.cmd` lässt seine zwei dauerhaften Änderungen bewusst stehen — "wird
+Erst `STOP-RSYNC-SERVER.cmd` (entfernt Aufgabe und Server). `START-RSYNC-SERVER.cmd` lässt seine zwei übrigen dauerhaften Änderungen bewusst stehen — "wird
 verschrottet" ist aber eine Annahme, keine Garantie. Wird der Transfer abgebrochen, die
 Entscheidung geändert oder die falsche Maschine erwischt, bleibt sie mit offenem Port 873 und
 abgeschaltetem Energiesparen zurück. In einem Administrator-`cmd`:
@@ -233,7 +259,8 @@ Flaschenhals machen, also genau das kaputtmachen, wofür dieses Werkzeug existie
 Abgesichert ist es durch drei Dinge:
 
 - `read only` in jedem Modul — es lässt sich nichts auf die Quelle schreiben,
-- der Server läuft nur, solange das Fenster offen ist.
+- der Server läuft, bis `STOP-RSYNC-SERVER.cmd` ihn entfernt — **auch über Neustarts hinweg**.
+  Nach dem letzten PASS also nicht vergessen.
 
 `hosts allow` steht bewusst auf `0.0.0.0/0`: jeder, der Port 873 erreicht, darf lesen. Früher
 waren es die lokalen /24-Netze der Maschine — das hat im ersten Ernstfall den Client ausgesperrt,
