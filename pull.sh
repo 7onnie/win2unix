@@ -131,6 +131,10 @@ _StatusFile=""        # leer = keine Statusdatei
 _StatusReady=0        # 1, sobald sie angelegt ist (w2u_die schreibt erst dann)
 _Parsing=0            # 1 waehrend w2u_parse_args -> w2u_die endet mit Exit 3
 _HbPid=""             # Hintergrund-Herzschlag, der Fortschritt nachtraegt
+# --chown U:G (Issue #12): Besitzer schon beim Schreiben, nach PASS chown -R.
+_Chown=""             # wie angegeben, z.B. tomedo:tomedo
+_ChownIds=""          # numerisch aufgeloest, uid:gid (pull.sh nutzt --numeric-ids)
+_XChown=""            # --chown=uid:gid an Worker und Sweep
 _ParMode="parallel"   # Vorgabe bewusst "parallel": w2u_report wertet eine
                       # FEHLENDE Chunkliste nur im einstroemigen Lauf als
                       # zulaessig. Die strenge Vorgabe heisst also, dass ein
@@ -715,8 +719,7 @@ w2u_run_chunk() {
     # steht und deren Ausgabe niemand auswertet, ist ein Versprechen an den
     # naechsten Leser, das nicht gehalten wird.
     _Args=( -rlt -W --partial --numeric-ids "--timeout=$_RsyncTimeout" )
-    [ -n "$_XChmod" ] && _Args=( "${_Args[@]}" "$_XChmod" )
-    [ -n "$_XProto" ] && _Args=( "${_Args[@]}" "$_XProto" )
+    w2u_xfer_args
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     _Args=( "${_Args[@]}" "--files-from=$_ChunkFile" )
 
@@ -834,8 +837,8 @@ w2u_run_list() {
     # MODULWURZEL aus (siehe w2u_run_chunk). Fehlten sie in dieser Liste, waeren
     # sie im Kind leer - dort gilt kein "set -u" - und der Guard in
     # w2u_run_chunk laesse jeden Chunk ohne Ergebniszeile scheitern.
-    export _RsyncBin _ParSrc _ParDst _LogDir _ResultFile _MaxRetry _RetryPause _ExcludeFrom _RsyncTimeout _XChmod _XProto
-    export -f w2u_run_chunk w2u_die w2u_log
+    export _RsyncBin _ParSrc _ParDst _LogDir _ResultFile _MaxRetry _RetryPause _ExcludeFrom _RsyncTimeout _XChmod _XProto _XChown
+    export -f w2u_run_chunk w2u_die w2u_log w2u_xfer_args
     # "$0" der Worker-Shell = "w2u-worker:<tmp>": damit steht das TMP-Verzeichnis
     # dieses Laufs im argv von XARGS SELBST (dessen Befehlsvorlage), nicht nur
     # in dem seiner Kinder. Ueberlebt xargs einen kill -9 des Hauptprozesses,
@@ -1179,8 +1182,7 @@ w2u_run_all() {
 w2u_sweep() {
     local _Args
     _Args=( -rlt -W --partial --numeric-ids "--timeout=$_RsyncTimeout" )
-    [ -n "$_XChmod" ] && _Args=( "${_Args[@]}" "$_XChmod" )
-    [ -n "$_XProto" ] && _Args=( "${_Args[@]}" "$_XProto" )
+    w2u_xfer_args
     [ -n "$_ExcludeFrom" ] && _Args=( "${_Args[@]}" "--exclude-from=$_ExcludeFrom" )
     "$_RsyncBin" "${_Args[@]}" "$_SrcUrl/" "$_DstRoot/"
 }
@@ -2117,6 +2119,7 @@ w2u_parse_args() {
             --checksum)     _DoChecksum=1; shift ;;
             --dry-run)      _DryRun=1; shift ;;
             --status-file)  w2u_take_arg "$1" "${2-}"; _StatusFile="$_ArgVal"; shift 2 ;;
+            --chown)        w2u_take_arg "$1" "${2-}"; _Chown="$_ArgVal"; shift 2 ;;
             --version)      printf 'win2unix pull.sh %s\n' "$W2U_VERSION"; exit 0 ;;
             -h|--help)      w2u_usage; exit 0 ;;
             -*)             w2u_die "unbekannte Option: $1" ;;
@@ -2326,6 +2329,62 @@ w2u_parse_args() {
     if [ "$_VerifyOnly" -eq 0 ] && [ "$_DryRun" -eq 0 ] && [ "$_DoVerify" -eq 0 ]; then
         w2u_warn "--no-verify: der Vergleich mit der Quelle entfaellt. Ein PASS heisst dann nur noch 'jeder Chunk hat rc 0 gemeldet' - nicht 'Quelle und Ziel sind gleich'."
     fi
+
+    # ---- --chown: alles hier, beim Parsen, damit ein Fehler Exit 3 ist ----
+    if [ -n "$_Chown" ]; then
+        w2u_resolve_owner "$_Chown"
+        if [ "$(id -u)" -ne 0 ]; then
+            w2u_die "--chown $_Chown braucht root: nur root darf Dateien einem anderen Benutzer geben. Als Dienst (w2u) laeuft pull.sh als root; von Hand: sudo bash pull.sh --chown ..."
+        fi
+        w2u_find_rsync
+        if ! "$_RsyncBin" --help 2>&1 | grep -q -- '--chown'; then
+            w2u_die "--chown: $_RsyncBin kennt die Option --chown nicht (openrsync?). GNU rsync ab 3.1 benutzen (--rsync PFAD)."
+        fi
+        _XChown="--chown=$_ChownIds"
+    fi
+}
+
+# Loest U:G in uid:gid auf und setzt _ChownIds. pull.sh uebertraegt mit
+# --numeric-ids - ein Name an rsync koennte dort anders gedeutet werden als
+# gemeint. Unbekannte Namen sind ein Einrichtungsfehler (w2u_die beim Parsen).
+w2u_resolve_owner() {
+    local _Spec="$1" _User _Group _Uid _Gid=""
+    case "$_Spec" in
+        *:*) ;;
+        *) w2u_die "--chown erwartet BENUTZER:GRUPPE, bekam: $_Spec" ;;
+    esac
+    _User="${_Spec%%:*}"
+    _Group="${_Spec#*:}"
+    [ -n "$_User" ] && [ -n "$_Group" ] || w2u_die "--chown erwartet BENUTZER:GRUPPE, bekam: $_Spec"
+    _Uid="$(id -u "$_User" 2>/dev/null)" || _Uid=""
+    case "$_Uid" in
+        ''|*[!0-9]*) w2u_die "--chown: Benutzer '$_User' gibt es auf diesem Rechner nicht" ;;
+    esac
+    case "$_Group" in
+        *[!0-9]*)
+            if command -v getent >/dev/null 2>&1; then
+                _Gid="$(getent group "$_Group" 2>/dev/null | cut -d: -f3)"
+            elif command -v dscl >/dev/null 2>&1; then
+                _Gid="$(dscl . -read "/Groups/$_Group" PrimaryGroupID 2>/dev/null | awk '{ print $2 }')"
+            fi
+            ;;
+        *) _Gid="$_Group" ;;
+    esac
+    case "$_Gid" in
+        ''|*[!0-9]*) w2u_die "--chown: Gruppe '$_Group' gibt es auf diesem Rechner nicht" ;;
+    esac
+    _ChownIds="$_Uid:$_Gid"
+    return 0
+}
+
+# Haengt die Zusatz-Argumente an _Args an, die JEDE uebertragende rsync-Instanz
+# bekommt (Worker und Sweep; NICHT der Verify-Lauf mit -n, der nichts aendert).
+# Eine Stelle statt zwei, damit Worker und Sweep nie auseinanderlaufen.
+w2u_xfer_args() {
+    [ -n "$_XChmod" ] && _Args=( "${_Args[@]}" "$_XChmod" )
+    [ -n "$_XProto" ] && _Args=( "${_Args[@]}" "$_XProto" )
+    [ -n "$_XChown" ] && _Args=( "${_Args[@]}" "$_XChown" )
+    return 0
 }
 
 # Loest einen Pfad zu einem absoluten Pfad OHNE "." und ".." auf, und ohne ihn
@@ -2731,6 +2790,11 @@ w2u_preflight() {
 
     if [ "$_VerifyOnly" -eq 0 ] && [ "$_DryRun" -eq 0 ]; then
         mkdir -p "$_DstRoot"
+        if [ -n "$_ChownIds" ]; then
+            # Gleich jetzt, nicht erst nach PASS: der Ordner soll waehrend des
+            # wochenlangen Transfers schon dem Zielbenutzer gehoeren.
+            chown "$_ChownIds" "$_DstRoot" || w2u_warn "chown $_ChownIds $_DstRoot fehlgeschlagen - wird nach PASS erneut versucht"
+        fi
         # Geprueft wird, wo die Worker WIRKLICH schreiben - und das ist
         # $_DstRoot, nicht $_ParDst.
         #
@@ -3036,6 +3100,20 @@ main() {
 
     _Rc=0
     w2u_report_step || _Rc=$?
+    if [ "$_Rc" -eq 0 ] && [ -n "$_ChownIds" ]; then
+        w2u_status "phase=chown"
+        w2u_log "Besitzer setzen: chown -R $_Chown ($_ChownIds) $_DstRoot"
+        if chown -R -H "$_ChownIds" "$_DstRoot"; then
+            w2u_log "Besitzer gesetzt: alles unter $_DstRoot gehoert $_Chown"
+            w2u_status "phase=done"
+        else
+            # Der Bestand ist vollstaendig, nur der Besitzer stimmt nicht
+            # ueberall - fuer den Dienst trotzdem kein Erfolg.
+            w2u_warn "chown -R $_ChownIds $_DstRoot fehlgeschlagen - Daten vollstaendig, Besitzer NICHT ueberall gesetzt"
+            w2u_status "phase=done" "result=FAIL" "message=chown -R fehlgeschlagen"
+            _Rc=1
+        fi
+    fi
     exit "$_Rc"
 }
 
