@@ -126,6 +126,11 @@ _WorkRoot=""          # wo der Bestand GERADE liegt, wenn nicht unter _DstRoot
 _XChmod=""            # --chmod=Du+rwx,Fu+rw an Worker und Sweep
 _XProto=""            # --protocol=30 an JEDEN Aufruf gegen den Daemon (GNU >= 31)
 _RsyncExtra=( )       # beides zusammen, fuer Tests und Logzeile
+# Statusdatei (Issue #9): key=value, atomar ersetzt; die TUI liest sie.
+_StatusFile=""        # leer = keine Statusdatei
+_StatusReady=0        # 1, sobald sie angelegt ist (w2u_die schreibt erst dann)
+_Parsing=0            # 1 waehrend w2u_parse_args -> w2u_die endet mit Exit 3
+_HbPid=""             # Hintergrund-Herzschlag, der Fortschritt nachtraegt
 _ParMode="parallel"   # Vorgabe bewusst "parallel": w2u_report wertet eine
                       # FEHLENDE Chunkliste nur im einstroemigen Lauf als
                       # zulaessig. Die strenge Vorgabe heisst also, dass ein
@@ -171,7 +176,19 @@ _ArgVal=""            # Rueckgabekanal von w2u_take_arg - eine Variable statt
 
 w2u_log()  { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
 w2u_warn() { printf '[%s] WARNUNG: %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
-w2u_die()  { printf '[%s] ABBRUCH: %s\n' "$(date '+%H:%M:%S')" "$*" >&2; exit 1; }
+# Exit 3 = Einrichtungsfehler (Abbruch waehrend w2u_parse_args): ein Neuversuch
+# aendert daran nichts, der Dienst (w2u run / systemd) startet dann NICHT neu.
+# Alles andere ist Exit 1 - voruebergehend, ein Neuversuch setzt fort.
+w2u_die()  {
+    printf '[%s] ABBRUCH: %s\n' "$(date '+%H:%M:%S')" "$*" >&2
+    if [ -n "${_StatusFile:-}" ] && [ "${_StatusReady:-0}" -eq 1 ]; then
+        w2u_status "message=ABBRUCH: $*"
+    fi
+    if [ "${_Parsing:-0}" -eq 1 ]; then
+        exit 3
+    fi
+    exit 1
+}
 
 w2u_usage() {
     cat >&2 <<'EOF'
@@ -228,6 +245,74 @@ w2u_parse_listing() {
 
 # Sucht ein brauchbares rsync. Auf den Ziel-Macs ist das Apple-openrsync
 # (Protokoll 29) - das reicht als CLIENT vollstaendig aus (Spec 2.2).
+# Schreibt key=value-Paare in die Statusdatei. Vorhandene Schluessel werden
+# ersetzt, "updated" immer neu gesetzt. Atomar: erst eine Zwischendatei im
+# selben Verzeichnis, dann mv - die TUI liest nie eine halbe Datei.
+# Zeilenumbrueche in Werten werden zu Leerzeichen (eine Zeile = ein Schluessel).
+# Testhaken: W2U_STATUS_TRACE bekommt jeden Phasenwechsel angehaengt.
+w2u_status() {
+    [ -n "$_StatusFile" ] || return 0
+    local _Tmp="${_StatusFile}.tmp.$$.${BASHPID:-0}" _Pair _Keys="|" _Line _Key
+    for _Pair in "$@"; do
+        _Keys="${_Keys}${_Pair%%=*}|"
+    done
+    {
+        if [ -f "$_StatusFile" ]; then
+            while IFS= read -r _Line; do
+                _Key="${_Line%%=*}"
+                case "$_Keys" in
+                    *"|$_Key|"*) ;;
+                    *)
+                        [ "$_Key" = "updated" ] || printf '%s\n' "$_Line"
+                        ;;
+                esac
+            done < "$_StatusFile"
+        fi
+        for _Pair in "$@"; do
+            printf '%s\n' "$(printf '%s' "$_Pair" | tr '\n\r' '  ')"
+        done
+        printf 'updated=%s\n' "$(date +%s)"
+    } > "$_Tmp" 2>/dev/null && mv -f "$_Tmp" "$_StatusFile" 2>/dev/null
+    rm -f "$_Tmp" 2>/dev/null
+    if [ -n "${W2U_STATUS_TRACE:-}" ]; then
+        for _Pair in "$@"; do
+            case "$_Pair" in
+                phase=*) printf '%s\n' "${_Pair#phase=}" >> "$W2U_STATUS_TRACE" ;;
+            esac
+        done
+    fi
+    return 0
+}
+
+# Herzschlag: alle 30 s den Fortschritt nachtragen (erledigte Chunks), alle
+# 2 min die belegten KB am Ziel (du ist auf grossen Baeumen teuer). Laeuft als
+# Hintergrundprozess bis w2u_cleanup ihn beendet. So sieht die TUI auch in
+# langen Phasen (ein Sweep ueber Stunden), dass der Lauf lebt.
+w2u_heartbeat_start() {
+    [ -n "$_StatusFile" ] || return 0
+    (
+        set +e
+        _Tick=0
+        while sleep 30; do
+            # $$ ist im Subshell der Hauptprozess. Ist er tot (kill -9), darf
+            # der Herzschlag nicht weiter "lebt" melden.
+            kill -0 $$ 2>/dev/null || exit 0
+            _Tick=$((_Tick + 1))
+            _Done=""
+            if [ -n "$_ResultFile" ] && [ -f "$_ResultFile" ]; then
+                _Done="$(grep -c . "$_ResultFile" 2>/dev/null)"
+            fi
+            if [ $((_Tick % 4)) -eq 0 ]; then
+                w2u_status "chunks_done=${_Done:-0}" "kb_dst=$(w2u_dst_kb)"
+            else
+                w2u_status "chunks_done=${_Done:-0}"
+            fi
+        done
+    ) &
+    _HbPid=$!
+    return 0
+}
+
 w2u_find_rsync() {
     if [ -n "$_RsyncBin" ]; then
         [ -x "$_RsyncBin" ] || w2u_die "kein ausfuehrbares rsync unter $_RsyncBin"
@@ -1043,6 +1128,7 @@ w2u_run_all() {
     if [ "$_JobCnt" -gt 0 ]; then
         _Jobs="$_JobCnt"
         w2u_log "feste Parallelitaet: $_Jobs (Auto-Messung uebersprungen)"
+        w2u_status "parallel=$_Jobs"
         w2u_run_list "$_ListFile" "$_Jobs"
     else
         # Kein Fallback auf einen Ersatzwert: unter dem errexit aus main() reisst
@@ -1053,6 +1139,7 @@ w2u_run_all() {
         # je etwas Ungueltiges durch, faengt es der Guard in w2u_run_list.
         _Jobs="$(w2u_autotune "$_ListFile")"
         w2u_log "gewaehlte Parallelitaet: $_Jobs"
+        w2u_status "parallel=$_Jobs"
         w2u_run_list "$_TmpDir/chunks.rest" "$_Jobs"
     fi
     _JobCnt="$_Jobs"
@@ -2029,6 +2116,7 @@ w2u_parse_args() {
             --no-verify)    _DoVerify=0; shift ;;
             --checksum)     _DoChecksum=1; shift ;;
             --dry-run)      _DryRun=1; shift ;;
+            --status-file)  w2u_take_arg "$1" "${2-}"; _StatusFile="$_ArgVal"; shift 2 ;;
             --version)      printf 'win2unix pull.sh %s\n' "$W2U_VERSION"; exit 0 ;;
             -h|--help)      w2u_usage; exit 0 ;;
             -*)             w2u_die "unbekannte Option: $1" ;;
@@ -2715,14 +2803,22 @@ w2u_verify_step() {
 # werden konnte, ist kein PASS. Gedruckt wurde er trotzdem - tee schreibt nach
 # stdout weiter, auch wenn die Datei scheitert.
 w2u_report_step() {
-    local _Rc=0
+    local _Rc=0 _Rep=""
     if [ -n "$_LogDir" ] && [ -d "$_LogDir" ] && [ -w "$_LogDir" ]; then
-        w2u_report | tee "${_LogDir%/}/report.txt" || _Rc=$?
+        _Rep="${_LogDir%/}/report.txt"
+        w2u_report | tee "$_Rep" || _Rc=$?
     else
         # Kein Logverzeichnis (oder nicht beschreibbar): drucken geht vor
         # festhalten. Der Preflight hat die Beschreibbarkeit schon geprueft,
         # dieser Zweig ist der Riegel fuer alles, was danach noch passiert.
         w2u_report || _Rc=$?
+    fi
+    # Das Urteil fuer die TUI. Bewusst aus dem rc von w2u_report, nicht aus
+    # dem Text: rc 0 ist dort PASS, alles andere FAIL.
+    if [ "$_Rc" -eq 0 ]; then
+        w2u_status "phase=done" "result=PASS" "report=$_Rep" "kb_dst=$(w2u_dst_kb)"
+    else
+        w2u_status "phase=done" "result=FAIL" "report=$_Rep" "kb_dst=$(w2u_dst_kb)"
     fi
     return "$_Rc"
 }
@@ -2749,6 +2845,11 @@ w2u_report_step() {
 # zurueck, und die Meldung verspraeche Logs, die es nicht gibt.
 w2u_cleanup() {
     local _Rc=$? _LogEmpty=0
+    if [ -n "$_HbPid" ]; then
+        kill "$_HbPid" 2>/dev/null || true
+        wait "$_HbPid" 2>/dev/null || true
+        _HbPid=""
+    fi
     if [ -n "$_WorkRoot" ]; then
         # Kein Zurueckbenennen hier: es koennen noch rsync-Kinder in den
         # Zwischenordner schreiben. Der naechste Lauf raeumt auf.
@@ -2792,6 +2893,7 @@ w2u_cleanup() {
 # bereits fertig.
 w2u_on_signal() {
     w2u_warn "abgebrochen - derselbe Aufruf setzt fort, bereits uebertragene Dateien bleiben liegen"
+    w2u_status "message=abgebrochen (Signal)"
     if command -v pkill >/dev/null 2>&1; then
         pkill -TERM -P $$ >/dev/null 2>&1 || true
     fi
@@ -2806,7 +2908,17 @@ main() {
     fi
     local _Rc=0 _Cnt=0
     _StartTs="$(date +%s)"
+    _Parsing=1
     w2u_parse_args "$@"
+    _Parsing=0
+    if [ -n "$_StatusFile" ]; then
+        # Frisch anlegen: Werte eines frueheren Laufs (result, message) duerfen
+        # nicht in diesen hineinwirken.
+        : > "$_StatusFile" 2>/dev/null || w2u_die "Statusdatei nicht schreibbar: $_StatusFile"
+        _StatusReady=1
+        w2u_status "phase=preflight" "pid=$$" "started=$(date +%s)" "src=$_SrcUrl" "dst=$_DstRoot" \
+            "result=" "message=" "report=" "chunks_total=0" "chunks_done=0" "kb_dst=" "parallel="
+    fi
 
     # $_TmpDir kommt aus mktemp -d und liegt damit auf einem LOKALEN
     # Dateisystem. Das ist keine Bequemlichkeit: $_ResultFile
@@ -2829,9 +2941,11 @@ main() {
     # fiele jeder Verify-Only-Lauf falsch auf FAIL. Das ">" leert sie zugleich:
     # Reste aus einem frueheren Lauf waeren fremde Namen im Abgleich.
     : > "$_ResultFile"
+    w2u_heartbeat_start
 
     if [ "$_VerifyOnly" -eq 1 ]; then
         w2u_log "nur Verifikation - es wird nichts uebertragen"
+        w2u_status "phase=verify"
         w2u_verify_step
         _Rc=0
         w2u_report_step || _Rc=$?
@@ -2839,6 +2953,7 @@ main() {
     fi
 
     if [ "$_ParMode" = "parallel" ]; then
+        w2u_status "phase=decompose"
         w2u_log "zerlege $_SrcUrl"
         w2u_decompose "$_SrcUrl" $((_ThresholdFactor * _PMax)) "$_TmpDir/work"
 
@@ -2879,6 +2994,7 @@ main() {
     if [ "$_ParMode" = "parallel" ]; then
         mkdir -p "$_TmpDir/chunks"
         w2u_chunk "$_TmpDir/work.par" "$_TmpDir/chunks" "$_PMax" "$_TmpDir/chunks.list"
+        w2u_status "phase=parallel" "chunks_total=$(grep -c . "$_TmpDir/chunks.list" || true)" "chunks_done=0"
         w2u_log "parallele Phase: $_ParSrc/ -> $_ParDst/ (Praefix '${_SrcPrefix:-<keiner>}')"
         # Zwei Messpunkte um die ganze Phase. Sie kosten je ein "du -sk" (dieselbe
         # Funktion, die die Auto-Messung ohnehin benutzt) und sind die Grundlage
@@ -2889,6 +3005,7 @@ main() {
         _ParKbBefore="$(w2u_dst_kb)"
         w2u_run_all "$_TmpDir/chunks.list"
         _ParKbAfter="$(w2u_dst_kb)"
+        w2u_status "chunks_done=$(grep -c . "$_ResultFile" || true)" "kb_dst=$_ParKbAfter"
         w2u_stage_out
     else
         # Einstroemig: kein Zerlegen, keine Chunks, keine Buchfuehrung - der
@@ -2902,6 +3019,7 @@ main() {
         w2u_log "einstroemige Uebertragung (keine Zerlegung, keine Chunk-Buchfuehrung) - der Vergleichslauf urteilt"
     fi
 
+    w2u_status "phase=sweep"
     w2u_log "Sweep-Pass"
     _Rc=0
     w2u_sweep >> "$_LogDir/sweep.log" 2>&1 || _Rc=$?
@@ -2912,6 +3030,7 @@ main() {
     fi
 
     if [ "$_DoVerify" -eq 1 ]; then
+        w2u_status "phase=verify"
         w2u_verify_step
     fi
 
