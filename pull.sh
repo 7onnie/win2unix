@@ -733,12 +733,17 @@ w2u_run_chunk() {
 
     while [ "$_Try" -le "$_MaxRetry" ]; do
         _Rc=0
+        # Abbruch (#14): Flag vom Trap des Hauptprozesses => nichts mehr starten
+        if [ -n "${_AbortFlag:-}" ] && [ -e "$_AbortFlag" ]; then _Rc=143; break; fi
         "$_RsyncBin" "${_Args[@]}" "${_ParSrc%/}/" "${_ParDst%/}/" > "$_LogDir/$_Name.$_Try.log" 2>&1 || _Rc=$?
         [ "$_Rc" -eq 0 ] && break
+        case "$_Rc" in 20|130|143) break ;; esac    # Signal-Exit: nicht wiederholen
         [ "$_Try" -lt "$_MaxRetry" ] && sleep $((_RetryPause * _Try))
         _Try=$((_Try + 1))
     done
     [ "$_Try" -gt "$_MaxRetry" ] && _Try="$_MaxRetry"
+    # Abgebrochen: keine Ergebniszeile - der Chunk gilt als nicht uebertragen
+    case "$_Rc" in 20|130|143) return 0 ;; esac
 
     # Dieses ">>" laeuft aus bis zu _PMax parallelen Prozessen gleichzeitig und
     # ist die EINZIGE Stelle, an der ein fehlgeschlagener Chunk sichtbar wird.
@@ -845,7 +850,7 @@ w2u_run_list() {
     # MODULWURZEL aus (siehe w2u_run_chunk). Fehlten sie in dieser Liste, waeren
     # sie im Kind leer - dort gilt kein "set -u" - und der Guard in
     # w2u_run_chunk laesse jeden Chunk ohne Ergebniszeile scheitern.
-    export _RsyncBin _ParSrc _ParDst _LogDir _ResultFile _MaxRetry _RetryPause _ExcludeFrom _RsyncTimeout _XChmod _XProto _XChown
+    export _AbortFlag _RsyncBin _ParSrc _ParDst _LogDir _ResultFile _MaxRetry _RetryPause _ExcludeFrom _RsyncTimeout _XChmod _XProto _XChown
     export -f w2u_run_chunk w2u_die w2u_log w2u_xfer_args
     # "$0" der Worker-Shell = "w2u-worker:<tmp>": damit steht das TMP-Verzeichnis
     # dieses Laufs im argv von XARGS SELBST (dessen Befehlsvorlage), nicht nur
@@ -860,7 +865,9 @@ w2u_run_list() {
     if printf 'x\n' | xargs -S 4096 -I {} true >/dev/null 2>&1; then
         _XargsRepl=( -S 4096 )      # BSD: hebt die 255-Byte-Grenze der -I-Ersetzung
     fi                              # GNU: kennt -S nicht und hat die Grenze nicht
-    xargs -P "$_Jobs" ${_XargsRepl[@]+"${_XargsRepl[@]}"} -I {} "${BASH:-bash}" -c 'w2u_run_chunk "$1"' "w2u-worker:$_TmpDir" {} < "$_ListFile" || _Rc=$?
+    # Im Hintergrund + wait: ein Vordergrund-Kind verzoegert den Trap bis zu seinem Ende (#14)
+    xargs -P "$_Jobs" ${_XargsRepl[@]+"${_XargsRepl[@]}"} -I {} "${BASH:-bash}" -c 'w2u_run_chunk "$1"' "w2u-worker:$_TmpDir" {} < "$_ListFile" &
+    wait "$!" || _Rc=$?
     if [ "$_Rc" -ne 0 ]; then
         w2u_warn "xargs endete mit rc $_Rc - w2u_run_chunk selbst liefert immer 0, also ist mindestens ein Worker vorzeitig gestorben. Bei Signal-Tod (z.B. OOM) und bei Exit 255 liest xargs die Liste danach NICHT weiter."
         # Der Abgleich gehoert hierher und nirgendwo sonst: dies ist die einzige
@@ -3093,16 +3100,24 @@ w2u_cleanup() {
 # Aufraeumen. WAS SIE BRICHT: ein Vordergrund-Kind laeuft noch, waehrend das
 # Signal kommt - bash fuehrt den Trap erst danach aus, dann ist das Kind
 # bereits fertig.
+w2u_tree() {    # alle Nachkommen von $1, Eltern vor Kindern
+    local _K
+    for _K in $(pgrep -P "$1" 2>/dev/null); do printf '%s\n' "$_K"; w2u_tree "$_K"; done
+}
 w2u_on_signal() {
+    local _P
     # Ein zweites Signal (systemd schickt TERM an die ganze cgroup, w2u run
     # reicht es zusaetzlich weiter) darf das Aufraeumen nicht abbrechen.
     trap '' INT TERM
+    [ -n "${_AbortFlag:-}" ] && : > "$_AbortFlag" 2>/dev/null
     w2u_warn "abgebrochen - derselbe Aufruf setzt fort, bereits uebertragene Dateien bleiben liegen"
     w2u_status "message=abgebrochen (Signal)"
-    if command -v pkill >/dev/null 2>&1; then
-        pkill -TERM -P $$ >/dev/null 2>&1 || true
+    if command -v pgrep >/dev/null 2>&1; then
+        # Ganzer Baum (xargs, Worker, rsync); Liste VOR dem Beenden, sonst
+        # werden Enkel zu Waisen und sind nicht mehr auffindbar.
+        for _P in $(w2u_tree $$); do kill -TERM "$_P" 2>/dev/null || true; done
     fi
-    exit 130
+    exit "${1:-130}"
 }
 
 main() {
@@ -3135,7 +3150,9 @@ main() {
     # unter $_DstRoot, auch nicht "zu den Logs".
     _TmpDir="$(mktemp -d "${TMPDIR:-/tmp}/win2unix.XXXXXXXX")"
     trap 'w2u_cleanup' EXIT
-    trap 'w2u_on_signal' INT TERM
+    _AbortFlag="$_TmpDir/abort"
+    trap 'w2u_on_signal 130' INT
+    trap 'w2u_on_signal 143' TERM
 
     # Schon vor dem Preflight: auf Millionen Dateien dauern Reparatur der
     # Rechte, Sperre und Aufraeumen Minuten - die TUI soll sehen, dass er lebt.
